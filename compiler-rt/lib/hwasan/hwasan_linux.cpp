@@ -101,7 +101,7 @@ static uptr GetHighMemEnd() {
   uptr max_address = GetMaxUserVirtualAddress();
   // Adjust max address to make sure that kHighMemEnd and kHighMemStart are
   // properly aligned:
-  max_address |= (GetMmapGranularity() << kShadowScale) - 1;
+  max_address |= (GetMmapGranularity()) - 1;
   return max_address;
 }
 
@@ -119,8 +119,7 @@ static void InitializeShadowBaseAddress(uptr shadow_size_bytes) {
       CHECK(MemoryRangeIsAvailable(beg, end));
     }
   } else {
-    __hwasan_shadow_memory_dynamic_address =
-        FindDynamicShadowStart(shadow_size_bytes);
+    __hwasan_shadow_memory_dynamic_address = 0x400000000000;
   }
 }
 
@@ -231,25 +230,17 @@ void InitializeOsSupport() {
 bool InitShadow() {
   // Define the entire memory range.
   kHighMemEnd = GetHighMemEnd();
-
   // Determine shadow memory base offset.
-  InitializeShadowBaseAddress(MemToShadowSize(kHighMemEnd));
-
-  // Place the low memory first.
-  kLowMemEnd = __hwasan_shadow_memory_dynamic_address - 1;
+  InitializeShadowBaseAddress(MemToShadowSize(kHighMemEnd)>>1); // @ale: shrink shadow memory size
+  VPrintf(1, "HWASan hardcoded shadow base address: %p\n", (void *)__hwasan_shadow_memory_dynamic_address);
+  uptr sizeOfInterval = 0x3fffffffffff + 1;
   kLowMemStart = 0;
-
-  // Define the low shadow based on the already placed low memory.
-  kLowShadowEnd = MemToShadow(kLowMemEnd);
-  kLowShadowStart = __hwasan_shadow_memory_dynamic_address;
-
-  // High shadow takes whatever memory is left up there (making sure it is not
-  // interfering with low memory in the fixed case).
-  kHighShadowEnd = MemToShadow(kHighMemEnd);
-  kHighShadowStart = Max(kLowMemEnd, MemToShadow(kHighShadowEnd)) + 1;
-
-  // High memory starts where allocated shadow allows.
-  kHighMemStart = ShadowToMem(kHighShadowStart);
+  kLowMemEnd =  sizeOfInterval - 1; 
+  kLowShadowStart = sizeOfInterval;
+  kLowShadowEnd = kLowShadowStart + sizeOfInterval - 1;
+  kHighShadowStart = 0xb00000000000; // @ale: create a gap
+  kHighShadowEnd = kHighShadowStart + sizeOfInterval - 1;
+  kHighMemStart = 0xf00000010000;
 
   // Check the sanity of the defined memory ranges (there might be gaps).
   CHECK_EQ(kHighMemStart % GetMmapGranularity(), 0);
@@ -261,17 +252,17 @@ bool InitShadow() {
   CHECK_GT(kLowShadowStart, kLowMemEnd);
 
   // Reserve shadow memory.
-  ReserveShadowMemoryRange(kLowShadowStart, kLowShadowEnd, "low shadow");
-  ReserveShadowMemoryRange(kHighShadowStart, kHighShadowEnd, "high shadow");
+  ReserveShadowMemoryRange(kLowShadowStart, kLowShadowEnd, "low shadow");     // @ale: this should be shadow heap
+  ReserveShadowMemoryRange(kHighShadowStart, kHighShadowEnd, "high shadow");  // @ale: this should be shadow stack
 
-  // Protect all the gaps.
-  ProtectGap(0, Min(kLowMemStart, kLowShadowStart));
-  if (kLowMemEnd + 1 < kLowShadowStart)
-    ProtectGap(kLowMemEnd + 1, kLowShadowStart - kLowMemEnd - 1);
-  if (kLowShadowEnd + 1 < kHighShadowStart)
-    ProtectGap(kLowShadowEnd + 1, kHighShadowStart - kLowShadowEnd - 1);
-  if (kHighShadowEnd + 1 < kHighMemStart)
-    ProtectGap(kHighShadowEnd + 1, kHighMemStart - kHighShadowEnd - 1);
+  // Protect all the gaps. TODO: establish sanity checks
+  // ProtectGap(0, Min(kLowMemStart, kLowShadowStart));
+  // if (kLowMemEnd + 1 < kLowShadowStart)
+  //   ProtectGap(kLowMemEnd + 1, kLowShadowStart - kLowMemEnd - 1);
+  // if (kLowShadowEnd + 1 < kHighShadowStart)
+  //   ProtectGap(kLowShadowEnd + 1, kHighShadowStart - kLowShadowEnd - 1);
+  // if (kHighShadowEnd + 1 < kHighMemStart)
+  //   ProtectGap(kHighShadowEnd + 1, kHighMemStart - kHighShadowEnd - 1);
 
   if (Verbosity())
     PrintAddressSpaceLayout();
@@ -504,6 +495,7 @@ void Thread::InitStackAndTls(const InitState *) {
 }
 
 uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
+  VPrintf(1, "{HWASAN] TagMemoryAligned: p=%p size=%p tag=%02x\n", (void *)p, (void *)size, tag);
   CHECK(IsAligned(p, kShadowAlignment));
   CHECK(IsAligned(size, kShadowAlignment));
   uptr shadow_start = MemToShadow(p);
@@ -524,7 +516,9 @@ uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
   } else {
     internal_memset((void *)shadow_start, tag, shadow_size);
   }
-  return AddTagToPointer(p, tag);
+  uptr tagged = AddTagToPointer(p, tag);
+  VPrintf(1, "TagMemoryAligned: return %p\n", (void *)tagged);
+  return tagged;
 }
 
 static void BeforeFork() {

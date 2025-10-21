@@ -182,6 +182,7 @@ static uptr TaggedSize(uptr size) {
 
 static void *HwasanAllocate(StackTrace *stack, uptr orig_size, uptr alignment,
                             bool zeroise) {
+  VPrintf(1 , "[HWASAN] HwasanAllocate: size=%zx align=%zx\n", orig_size, alignment);
   // Keep this consistent with LSAN and ASAN behavior.
   if (UNLIKELY(orig_size == 0))
     orig_size = 1;

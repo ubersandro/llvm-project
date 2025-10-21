@@ -81,7 +81,7 @@ const char kHwasanShadowMemoryDynamicAddress[] =
 // Accesses sizes are powers of two: 1, 2, 4, 8, 16.
 static const size_t kNumberOfAccessSizes = 5;
 
-static const size_t kDefaultShadowScale = 4;
+static const size_t kDefaultShadowScale = 0; // HWAsanIO 0
 
 static const unsigned kShadowBaseAlignment = 32;
 
@@ -107,7 +107,7 @@ static cl::opt<bool> ClKasanMemIntrinCallbackPrefix(
 static cl::opt<bool> ClInstrumentWithCalls(
     "hwasan-instrument-with-calls",
     cl::desc("instrument reads and writes with callbacks"), cl::Hidden,
-    cl::init(false));
+    cl::init(false)); // HWAsanIO does this, no idea why - maybe debugging?
 
 static cl::opt<bool> ClInstrumentReads("hwasan-instrument-reads",
                                        cl::desc("instrument read instructions"),
@@ -150,7 +150,7 @@ static cl::opt<size_t> ClMaxLifetimes(
 static cl::opt<bool>
     ClUseAfterScope("hwasan-use-after-scope",
                     cl::desc("detect use after scope within function"),
-                    cl::Hidden, cl::init(true));
+                    cl::Hidden, cl::init(false)); // fuck this
 
 static cl::opt<bool> ClGenerateTagsWithCalls(
     "hwasan-generate-tags-with-calls",
@@ -163,7 +163,7 @@ static cl::opt<bool> ClGlobals("hwasan-globals", cl::desc("Instrument globals"),
 static cl::opt<int> ClMatchAllTag(
     "hwasan-match-all-tag",
     cl::desc("don't report bad accesses via pointers with this tag"),
-    cl::Hidden, cl::init(-1));
+    cl::Hidden, cl::init(-1)); // TODO look into this, might come in very handy
 
 static cl::opt<bool>
     ClEnableKhwasan("hwasan-kernel",
@@ -244,7 +244,7 @@ static cl::opt<bool>
 static cl::opt<bool> ClUseShortGranules(
     "hwasan-use-short-granules",
     cl::desc("use short granules in allocas and outlined checks"), cl::Hidden,
-    cl::init(false));
+    cl::init(false)); // this is disabled so it shouldn't be a problem
 
 static cl::opt<bool> ClInstrumentPersonalityFunctions(
     "hwasan-instrument-personality-functions",
@@ -291,7 +291,7 @@ bool shouldUseStackSafetyAnalysis(const Triple &TargetTriple,
          mightUseStackSafetyAnalysis(DisableOptimization);
 }
 
-bool shouldDetectUseAfterScope(const Triple &TargetTriple) {
+bool shouldDetectUseAfterScope(const Triple &TargetTriple) { // TODO remove this
   return ClUseAfterScope && shouldInstrumentStack(TargetTriple);
 }
 
@@ -402,7 +402,7 @@ private:
   ///   extern char __hwasan_shadow[];
   ///   shadow = (mem >> Scale) + &__hwasan_shadow
   /// If `kTls`, then
-  ///   extern char *__hwasan_tls;
+  ///   extern char *__hwasan_tls ; // THIS IS USED BY DEFAULT @ale
   ///   shadow = (mem>>Scale) + align_up(__hwasan_shadow, kShadowBaseAlignment)
   ///
   /// If WithFrameRecord is true, then __hwasan_tls will be used to access the
@@ -421,13 +421,16 @@ private:
   public:
     void init(Triple &TargetTriple, bool InstrumentWithCalls,
               bool CompileKernel);
-    Align getObjectAlignment() const { return Align(1ULL << Scale); }
+    Align getObjectAlignment() const { return Align(1ULL << 3); } // this is broken!
     bool isInGlobal() const { return Kind == OffsetKind::kGlobal; }
     bool isInIfunc() const { return Kind == OffsetKind::kIfunc; }
     bool isInTls() const { return Kind == OffsetKind::kTls; }
     bool isFixed() const { return Kind == OffsetKind::kFixed; }
     uint8_t scale() const { return Scale; };
     uint64_t offset() const {
+      errs() << "HWAddressSanitizer::ShadowMapping::offset: Offset=" << Offset << "\n";
+      errs() << "Is fixed? " << isFixed() << "\n";
+      errs() << "Kind=" << (int)Kind << "\n";
       assert(isFixed());
       return Offset;
     };
@@ -497,6 +500,7 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
   for (Function &F : M)
     HWASan.sanitizeFunction(F, FAM);
+  errs() << "After HWASan.sanitizeFunction\n";
 
   PreservedAnalyses PA = PreservedAnalyses::none();
   // DominatorTreeAnalysis, PostDominatorTreeAnalysis, and LoopAnalysis
@@ -929,12 +933,17 @@ void HWAddressSanitizer::untagPointerOperand(Instruction *I, Value *Addr) {
 }
 
 Value *HWAddressSanitizer::memToShadow(Value *Mem, IRBuilder<> &IRB) {
-  // Mem >> Scale
-  Value *Shadow = IRB.CreateLShr(Mem, Mapping.scale());
-  if (Mapping.isFixed() && Mapping.offset() == 0)
-    return IRB.CreateIntToPtr(Shadow, PtrTy);
-  // (Mem >> Scale) + Offset
-  return IRB.CreatePtrAdd(ShadowBase, Shadow);
+  // Mem >> Scale NOT ANYMORE
+  // Value *Shadow = IRB.CreateLShr(Mem, Mapping.scale());
+  // if (Mapping.isFixed() && Mapping.offset() == 0)
+  //   return IRB.CreateIntToPtr(Shadow, PtrTy);
+  // // (Mem >> Scale) + Offset
+  // return IRB.CreatePtrAdd(ShadowBase, Shadow);
+  // NEW 
+  // CURRENT: mem ^ 0x400000000000
+  Value *XorVal =
+      IRB.CreateXor(Mem, ConstantInt::get(IntptrTy, 0x400000000000ULL));
+  return IRB.CreateIntToPtr(XorVal, PtrTy);
 }
 
 int64_t HWAddressSanitizer::getAccessInfo(bool IsWrite,
@@ -1104,6 +1113,7 @@ bool HWAddressSanitizer::ignoreMemIntrinsic(OptimizationRemarkEmitter &ORE,
 }
 
 void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
+  errs() << "Instrumenting memory intrinsic: " << *MI << "\n";
   IRBuilder<> IRB(MI);
   if (isa<MemTransferInst>(MI)) {
     SmallVector<Value *, 4> Args{
@@ -1191,7 +1201,12 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, Value *Tag,
                    {IRB.CreatePointerCast(AI, PtrTy), Tag,
                     ConstantInt::get(IntptrTy, AlignedSize)});
   } else {
-    size_t ShadowSize = Size >> Mapping.scale();
+    errs() << "Not instrumenting with calls\n";
+    size_t ShadowSize = Size; // Mapping.scale();
+    errs() << "Shadow size : " << ShadowSize << "\n";
+    errs() << "Aligned size : " << AlignedSize << "\n";
+    errs() << "Size : " << Size << "\n";
+    errs() << "Mapping scale : " << Mapping.scale() << "\n";
     Value *AddrLong = untagPointer(IRB, IRB.CreatePointerCast(AI, IntptrTy));
     Value *ShadowPtr = memToShadow(AddrLong, IRB);
     // If this memset is not inlined, it will be intercepted in the hwasan
@@ -1443,6 +1458,7 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
   unsigned int I = 0;
 
   for (auto &KV : SInfo.AllocasToInstrument) {
+    errs() << "Instrumenting alloca: " << *(KV.first) << "\n"; // show me the instruction
     auto N = I++;
     auto *AI = KV.first;
     memtag::AllocaInfo &Info = KV.second;
@@ -1455,11 +1471,11 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     Value *Replacement = tagPointer(IRB, AI->getType(), AINoTagLong, Tag);
     std::string Name =
         AI->hasName() ? AI->getName().str() : "alloca." + itostr(N);
-    Replacement->setName(Name + ".hwasan");
+    Replacement->setName(Name + ".hwasan"); // interesting
 
     size_t Size = memtag::getAllocaSizeInBytes(*AI);
-    size_t AlignedSize = alignTo(Size, Mapping.getObjectAlignment());
-
+    size_t AlignedSize = alignTo(Size, Mapping.getObjectAlignment());// WATCH OUT
+    errs() << "Alloca size: " << Size << ", aligned size: " << AlignedSize << "\n"; // show me the size
     Value *AICast = IRB.CreatePointerCast(AI, PtrTy);
 
     auto HandleLifetime = [&](IntrinsicInst *II) {
@@ -1619,8 +1635,21 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
       if (!ignoreMemIntrinsic(ORE, MI))
         IntrinToInstrument.push_back(MI);
-  }
+  } // instrument stack to build lifetime info, find memset/memcpy calls, get
+    // info on how to instrument for exception handling (landing pads)
+  // Dump interesting memory operands iterating over InterestingMemoryOperand
 
+  if (F.getName() == "main") {
+
+    for (auto &Op : OperandsToInstrument) {
+      errs() << "HWAddressSanitizer::sanitizeFunction: sanitizing op at "
+                "instruction "
+             << *(Op).getInsn() << "\n";
+    }
+  }
+  // EXP TODO @ale: look for GEPs, dump them at every optimization level to figure out how pointers are retrieved
+  // TODO: instrument mallocs
+  // Q: HWasanIO adds HWTestFreedFunc for operands -> does this mean they check whether a function frees a pointer? They insert a call to hwasan_test_free to detect invalid free, maybe they left it there by mistake?
   memtag::StackInfo &SInfo = SIB.get();
 
   initializeCallbacks(*F.getParent());
@@ -1690,6 +1719,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 }
 
 void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV, uint8_t Tag) {
+  // TODO check whether globals include structs and, eventually, instrument the struct GEPs
   assert(!UsePageAliases);
   Constant *Initializer = GV->getInitializer();
   uint64_t SizeInBytes =

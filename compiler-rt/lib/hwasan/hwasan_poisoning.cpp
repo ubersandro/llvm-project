@@ -20,6 +20,7 @@
 namespace __hwasan {
 
 uptr TagMemory(uptr p, uptr size, tag_t tag) {
+  Printf("TagMemory: p=%p size=%zu tag=0x%x\n", (void*)p, size, tag);
   uptr start = RoundDownTo(p, kShadowAlignment);
   uptr end = RoundUpTo(p + size, kShadowAlignment);
   return TagMemoryAligned(start, end - start, tag);

@@ -154,6 +154,7 @@ template <ErrorAction EA, AccessType AT, unsigned LogSize>
 __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   if (!InTaggableRegion(p))
     return;
+  VPrintf(1, "[HWASAN] CheckAddress addr=%p size=%u\n", (void *)p, 1 << LogSize);
   uptr ptr_raw = p & ~kAddressTagMask;
   tag_t mem_tag = *(tag_t *)MemToShadow(ptr_raw);
   if (UNLIKELY(!PossiblyShortTagMatches(mem_tag, p, 1 << LogSize))) {
@@ -168,6 +169,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
                                                                       uptr sz) {
   if (sz == 0 || !InTaggableRegion(p))
     return;
+  VPrintf(1, "[HWASAN] CheckAddressSized addr=%p size=%u\n", (void *)p, sz);
   tag_t ptr_tag = GetTagFromPointer(p);
   uptr ptr_raw = p & ~kAddressTagMask;
   tag_t *shadow_first = (tag_t *)MemToShadow(ptr_raw);
