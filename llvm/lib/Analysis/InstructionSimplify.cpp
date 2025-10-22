@@ -7184,10 +7184,11 @@ static Value *simplifyInstructionWithOperands(Instruction *I,
   case Instruction::Select:
     return simplifySelectInst(NewOps[0], NewOps[1], NewOps[2], Q, MaxRecurse);
   case Instruction::GetElementPtr: {
-    auto *GEPI = cast<GetElementPtrInst>(I);
-    return simplifyGEPInst(GEPI->getSourceElementType(), NewOps[0],
-                           ArrayRef(NewOps).slice(1), GEPI->getNoWrapFlags(), Q,
-                           MaxRecurse);
+    return nullptr;
+    // auto *GEPI = cast<GetElementPtrInst>(I);
+    // return simplifyGEPInst(GEPI->getSourceElementType(), NewOps[0],
+    //                        ArrayRef(NewOps).slice(1), GEPI->getNoWrapFlags(), Q,
+    //                        MaxRecurse);
   }
   case Instruction::InsertValue: {
     InsertValueInst *IV = cast<InsertValueInst>(I);

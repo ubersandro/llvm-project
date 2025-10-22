@@ -182,7 +182,6 @@ static uptr TaggedSize(uptr size) {
 
 static void *HwasanAllocate(StackTrace *stack, uptr orig_size, uptr alignment,
                             bool zeroise) {
-  VPrintf(1 , "[HWASAN] HwasanAllocate: size=%zx align=%zx\n", orig_size, alignment);
   // Keep this consistent with LSAN and ASAN behavior.
   if (UNLIKELY(orig_size == 0))
     orig_size = 1;
@@ -262,6 +261,7 @@ static void *HwasanAllocate(StackTrace *stack, uptr orig_size, uptr alignment,
 #endif
   meta->SetAllocated(StackDepotPut(*stack), orig_size);
   RunMallocHooks(user_ptr, orig_size);
+  VPrintf(1 , "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n", orig_size, alignment, user_ptr);
   return user_ptr;
 }
 

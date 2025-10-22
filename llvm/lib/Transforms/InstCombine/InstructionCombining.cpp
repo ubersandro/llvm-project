@@ -3077,6 +3077,7 @@ static Instruction *foldGEPOfPhi(GetElementPtrInst &GEP, PHINode *PN,
 }
 
 Instruction *InstCombinerImpl::visitGetElementPtrInst(GetElementPtrInst &GEP) {
+  return nullptr;
   Value *PtrOp = GEP.getOperand(0);
   SmallVector<Value *, 8> Indices(GEP.indices());
   Type *GEPType = GEP.getType();
