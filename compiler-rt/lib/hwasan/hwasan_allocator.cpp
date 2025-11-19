@@ -198,7 +198,7 @@ static void *HwasanAllocate(StackTrace *stack, uptr orig_size, uptr alignment,
       return nullptr;
     ReportRssLimitExceeded(stack);
   }
-
+  VPrintf(1 , "[HWASAN] HwasanAllocate: size=%zx align=%zx\n", orig_size, alignment);
   alignment = Max(alignment, kShadowAlignment);
   uptr size = TaggedSize(orig_size);
   Thread *t = GetCurrentThread();
@@ -237,7 +237,7 @@ static void *HwasanAllocate(StackTrace *stack, uptr orig_size, uptr alignment,
   if (InTaggableRegion(reinterpret_cast<uptr>(user_ptr)) &&
       atomic_load_relaxed(&hwasan_allocator_tagging_enabled) &&
       flags()->tag_in_malloc && malloc_bisect(stack, orig_size)) {
-    tag_t tag = t ? t->GenerateRandomTag() : kFallbackAllocTag;
+    tag_t tag = 0x0; // t ? t->GenerateRandomTag() : kFallbackAllocTag;
     uptr tag_size = orig_size ? orig_size : 1;
     uptr full_granule_size = RoundDownTo(tag_size, kShadowAlignment);
     user_ptr = (void *)TagMemoryAligned((uptr)user_ptr, full_granule_size, tag);

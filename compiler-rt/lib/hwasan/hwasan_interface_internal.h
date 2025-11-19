@@ -155,7 +155,7 @@ SANITIZER_INTERFACE_ATTRIBUTE
 void __hwasan_store16_match_all_noabort(uptr, u8);
 
 SANITIZER_INTERFACE_ATTRIBUTE
-void __hwasan_tag_memory(uptr p, u8 tag, uptr sz);
+void __hwasan_tag_memory(uptr p, u8 tag, uptr sz, uptr type_descriptor);
 
 SANITIZER_INTERFACE_ATTRIBUTE
 uptr __hwasan_tag_pointer(uptr p, u8 tag);

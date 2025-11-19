@@ -63,6 +63,7 @@
 #include "llvm/Transforms/Utils/MemoryTaggingSupport.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include <deque>
 #include <optional>
 #include <random>
 
@@ -107,7 +108,7 @@ static cl::opt<bool> ClKasanMemIntrinCallbackPrefix(
 static cl::opt<bool> ClInstrumentWithCalls(
     "hwasan-instrument-with-calls",
     cl::desc("instrument reads and writes with callbacks"), cl::Hidden,
-    cl::init(false)); // HWAsanIO does this, no idea why - maybe debugging?
+    cl::init(true)); // HWAsanIO does this, no idea why - maybe debugging?
 
 static cl::opt<bool> ClInstrumentReads("hwasan-instrument-reads",
                                        cl::desc("instrument read instructions"),
@@ -205,7 +206,7 @@ static cl::opt<float>
 STATISTIC(NumTotalFuncs, "Number of total funcs");
 STATISTIC(NumInstrumentedFuncs, "Number of instrumented funcs");
 STATISTIC(NumNoProfileSummaryFuncs, "Number of funcs without PS");
-
+// STATISTIC(NumGEPInstrumented, "Number of GEPs instrumented");
 // Mode for selecting how to insert frame record info into the stack ring
 // buffer.
 enum RecordStackHistoryMode {
@@ -320,7 +321,18 @@ private:
     Value *PtrTag = nullptr;
     Value *MemTag = nullptr;
   };
+  // FieldArmor
+  // SetVector<GetElementPtrInst *> GEPsToInstrument; // TODO handle ConstGEPs?
+  void InstrumentGEP(GetElementPtrInst *GEPI);    // TODO
+  Value *isMemoryTagged(GetElementPtrInst *GEPI); // TODO
+  Value *getAllocaTagRootPtr(IRBuilder<> &IRB, Value *StackTag,
+                             unsigned AllocaNo); // TODO
+  void
+  ApplyRLT(IRBuilder<> &IRB, Instruction *AI, Type *rootType, Value *Tag,
+           const DataLayout &DL); // should AI be a Value or an instruction?
 
+  unsigned long long instrumentedGEPs = 0;
+  // END FieldArmor
   bool selectiveInstrumentationShouldSkip(Function &F,
                                           FunctionAnalysisManager &FAM) const;
   void initializeModule();
@@ -360,12 +372,13 @@ private:
       const TargetLibraryInfo &TLI,
       SmallVectorImpl<InterestingMemoryOperand> &Interesting);
 
-  void tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, Value *Tag, size_t Size);
+  void tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, Value *Tag, size_t Size,
+                 const DataLayout &DL);
   Value *tagPointer(IRBuilder<> &IRB, Type *Ty, Value *PtrLong, Value *Tag);
   Value *untagPointer(IRBuilder<> &IRB, Value *PtrLong);
-  bool instrumentStack(memtag::StackInfo &Info, Value *StackTag, Value *UARTag,
+  bool instrumentStack(memtag::StackInfo &Info, Value *StackTag,
                        const DominatorTree &DT, const PostDominatorTree &PDT,
-                       const LoopInfo &LI);
+                       const LoopInfo &LI, const DataLayout &DL);
   bool instrumentLandingPads(SmallVectorImpl<Instruction *> &RetVec);
   Value *getNextTagWithCall(IRBuilder<> &IRB);
   Value *getStackBaseTag(IRBuilder<> &IRB);
@@ -379,6 +392,8 @@ private:
   void emitPrologue(IRBuilder<> &IRB, bool WithFrameRecord);
 
   void instrumentGlobal(GlobalVariable *GV, uint8_t Tag);
+  void instrumentGlobalAggregate(GlobalVariable *GV, uint8_t Tag,
+                                 const DataLayout &DL);
   void instrumentGlobals();
 
   Value *getCachedFP(IRBuilder<> &IRB);
@@ -414,6 +429,8 @@ private:
     bool WithFrameRecord;
 
     void SetFixed(uint64_t O) {
+      errs() << "HWAddressSanitizer::ShadowMapping::SetFixed: O=" << O
+             << "\n"; // this should not be the case
       Kind = OffsetKind::kFixed;
       Offset = O;
     }
@@ -421,14 +438,17 @@ private:
   public:
     void init(Triple &TargetTriple, bool InstrumentWithCalls,
               bool CompileKernel);
-    Align getObjectAlignment() const { return Align(1ULL << 3); } // this is broken!
+    Align getObjectAlignment() const {
+      return Align(1ULL << Scale);
+    } // TODO: wtf does this do?
     bool isInGlobal() const { return Kind == OffsetKind::kGlobal; }
     bool isInIfunc() const { return Kind == OffsetKind::kIfunc; }
     bool isInTls() const { return Kind == OffsetKind::kTls; }
     bool isFixed() const { return Kind == OffsetKind::kFixed; }
     uint8_t scale() const { return Scale; };
     uint64_t offset() const {
-      errs() << "HWAddressSanitizer::ShadowMapping::offset: Offset=" << Offset << "\n";
+      errs() << "HWAddressSanitizer::ShadowMapping::offset: Offset=" << Offset
+             << "\n";
       errs() << "Is fixed? " << isFixed() << "\n";
       errs() << "Kind=" << (int)Kind << "\n";
       assert(isFixed());
@@ -455,6 +475,7 @@ private:
   bool InstrumentWithCalls;
   bool InstrumentStack;
   bool InstrumentGlobals;
+  bool globalsInstrumented = false; // FieldArmor
   bool DetectUseAfterScope;
   bool UsePageAliases;
   bool UseMatchAllCallback;
@@ -498,10 +519,10 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
 
   HWAddressSanitizer HWASan(M, Options.CompileKernel, Options.Recover, SSI);
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+
   for (Function &F : M)
     HWASan.sanitizeFunction(F, FAM);
-  errs() << "After HWASan.sanitizeFunction\n";
-
+  LLVM_DEBUG(dbgs() << "HWAddressSanitizer: done instrumenting module\n");
   PreservedAnalyses PA = PreservedAnalyses::none();
   // DominatorTreeAnalysis, PostDominatorTreeAnalysis, and LoopAnalysis
   // are incrementally updated throughout this pass whenever
@@ -646,6 +667,16 @@ void HWAddressSanitizer::initializeModule() {
   DetectUseAfterScope = shouldDetectUseAfterScope(TargetTriple);
   PointerTagShift = IsX86_64 ? 57 : 56;
   TagMaskByte = IsX86_64 ? 0x3F : 0xFF;
+  errs() << "[+++] Summary of the initialization of HWAddressSanitizer\n";
+  errs() << "TargetTriple: " << TargetTriple.str() << "\n";
+  errs() << "IsX86_64: " << IsX86_64 << "\n";
+  errs() << "UsePageAliases: " << UsePageAliases << "\n";
+  errs() << "InstrumentWithCalls: " << InstrumentWithCalls << "\n";
+  errs() << "InstrumentStack: " << InstrumentStack << "\n";
+  errs() << "DetectUseAfterScope: " << DetectUseAfterScope << "\n";
+  errs() << "PointerTagShift: " << PointerTagShift << "\n";
+  errs() << "TagMaskByte: " << (unsigned)TagMaskByte << "\n";
+  errs() << "______________________________________________________\n";
 
   Mapping.init(TargetTriple, InstrumentWithCalls, CompileKernel);
 
@@ -660,7 +691,8 @@ void HWAddressSanitizer::initializeModule() {
   bool NewRuntime =
       !TargetTriple.isAndroid() || !TargetTriple.isAndroidVersionLT(30);
 
-  UseShortGranules = optOr(ClUseShortGranules, NewRuntime);
+  // UseShortGranules = optOr(ClUseShortGranules, NewRuntime);
+  UseShortGranules = false; // TODO CHECK
   OutlinedChecks = (TargetTriple.isAArch64() || TargetTriple.isRISCV64()) &&
                    TargetTriple.isOSBinFormatELF() &&
                    !optOr(ClInlineAllChecks, Recover);
@@ -685,10 +717,11 @@ void HWAddressSanitizer::initializeModule() {
       !CompileKernel && !UsePageAliases && optOr(ClGlobals, NewRuntime);
 
   if (!CompileKernel) {
-    createHwasanCtorComdat();
+    createHwasanCtorComdat(); // creates the routine ctor with a call into the
+                              // runtime function __hwasan_init
 
     if (InstrumentGlobals)
-      instrumentGlobals();
+      instrumentGlobals(); // sets up global instrumentation
 
     bool InstrumentPersonalityFunctions =
         optOr(ClInstrumentPersonalityFunctions, NewRuntime);
@@ -764,8 +797,8 @@ void HWAddressSanitizer::initializeCallbacks(Module &M) {
   HwasanMemset = M.getOrInsertFunction(
       MemIntrinCallbackPrefix + "memset" + MatchAllStr, HwasanMemsetFnTy);
 
-  HwasanTagMemoryFunc = M.getOrInsertFunction("__hwasan_tag_memory", VoidTy,
-                                              PtrTy, Int8Ty, IntptrTy);
+  HwasanTagMemoryFunc = M.getOrInsertFunction(
+      "__hwasan_tag_memory", VoidTy, PtrTy, Int8Ty, IntptrTy, IntptrTy);
   HwasanGenerateTagFunc =
       M.getOrInsertFunction("__hwasan_generate_tag", Int8Ty);
 
@@ -939,7 +972,7 @@ Value *HWAddressSanitizer::memToShadow(Value *Mem, IRBuilder<> &IRB) {
   //   return IRB.CreateIntToPtr(Shadow, PtrTy);
   // // (Mem >> Scale) + Offset
   // return IRB.CreatePtrAdd(ShadowBase, Shadow);
-  // NEW 
+  // NEW
   // CURRENT: mem ^ 0x400000000000
   Value *XorVal =
       IRB.CreateXor(Mem, ConstantInt::get(IntptrTy, 0x400000000000ULL));
@@ -972,6 +1005,8 @@ HWAddressSanitizer::insertShadowTagCheck(Value *Ptr, Instruction *InsertBefore,
   Value *TagMismatch = IRB.CreateICmpNE(R.PtrTag, R.MemTag);
 
   if (MatchAllTag.has_value()) {
+    LLVM_DEBUG(dbgs() << "Inserting match-all tag check for tag="
+                      << (unsigned)(*MatchAllTag) << "\n");
     Value *TagNotIgnored = IRB.CreateICmpNE(
         R.PtrTag, ConstantInt::get(R.PtrTag->getType(), *MatchAllTag));
     TagMismatch = IRB.CreateAnd(TagMismatch, TagNotIgnored);
@@ -991,13 +1026,16 @@ void HWAddressSanitizer::instrumentMemAccessOutline(Value *Ptr, bool IsWrite,
                                                     LoopInfo *LI) {
   assert(!UsePageAliases);
   const int64_t AccessInfo = getAccessInfo(IsWrite, AccessSizeIndex);
+  LLVM_DEBUG(dbgs() << "REMOVING INLINE CHECKS SINCE THEY BREAK EVERYTHING\n");
 
-  if (InlineFastPath)
-    InsertBefore =
-        insertShadowTagCheck(Ptr, InsertBefore, DTU, LI).TagMismatchTerm;
+  // if (InlineFastPath) // @ale: this function short circuits checks if
+  // inlineFastPath is true
+  //   InsertBefore =
+  //       insertShadowTagCheck(Ptr, InsertBefore, DTU, LI).TagMismatchTerm; //
+  //       DONT DONT DONT
 
   IRBuilder<> IRB(InsertBefore);
-  bool UseFixedShadowIntrinsic = false;
+  bool UseFixedShadowIntrinsic = false; // TODO: properly fix this @ale
   // The memaccess fixed shadow intrinsic is only supported on AArch64,
   // which allows a 16-bit immediate to be left-shifted by 32.
   // Since kShadowBaseAlignment == 32, and Linux by default will not
@@ -1011,7 +1049,7 @@ void HWAddressSanitizer::instrumentMemAccessOutline(Value *Ptr, bool IsWrite,
         static_cast<uint64_t>(OffsetShifted) << 32 == Mapping.offset();
   }
 
-  if (UseFixedShadowIntrinsic) {
+  if (UseFixedShadowIntrinsic) { /* THIS IS STILL A MISTERY TO DATE */
     IRB.CreateIntrinsic(
         UseShortGranules
             ? Intrinsic::hwasan_check_memaccess_shortgranules_fixedshadow
@@ -1113,9 +1151,9 @@ bool HWAddressSanitizer::ignoreMemIntrinsic(OptimizationRemarkEmitter &ORE,
 }
 
 void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
-  errs() << "Instrumenting memory intrinsic: " << *MI << "\n";
+  errs() << "[++] Instrumenting memory intrinsic: " << *MI << "\n";
   IRBuilder<> IRB(MI);
-  if (isa<MemTransferInst>(MI)) {
+  if (isa<MemTransferInst>(MI)) { /*memcpy, memmove*/
     SmallVector<Value *, 4> Args{
         MI->getOperand(0), MI->getOperand(1),
         IRB.CreateIntCast(MI->getOperand(2), IntptrTy, false)};
@@ -1140,7 +1178,25 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
                                              const DataLayout &DL) {
   Value *Addr = O.getPtr();
 
-  LLVM_DEBUG(dbgs() << "Instrumenting: " << O.getInsn() << "\n");
+  LLVM_DEBUG(dbgs() << "{++] Instrumenting MEMACCESS ");
+  LLVM_DEBUG(O.getInsn()->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\n");
+  LLVM_DEBUG(O.OpType->print(dbgs()));
+
+  if (O.OpType->isPointerTy()) {
+    auto instruction = O.getInsn();
+    if (dyn_cast<LoadInst>(instruction)) {
+      LoadInst *LI = cast<LoadInst>(instruction);
+      LLVM_DEBUG(dbgs() << " -> load instruction\n");
+      LLVM_DEBUG(dbgs() << "load type: ");
+      LLVM_DEBUG(LI->getType()->print(dbgs()));
+    } else if (dyn_cast<StoreInst>(instruction)) {
+      LLVM_DEBUG(dbgs() << " -> store instruction\n");
+    } else {
+      LLVM_DEBUG(dbgs() << " -> other instruction\n");
+    }
+  }
+  LLVM_DEBUG(dbgs() << "\n");
 
   // If the pointer is statically known to be zero, the tag check will pass
   // since:
@@ -1163,19 +1219,23 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
        *O.Alignment >= O.TypeStoreSize / 8)) {
     size_t AccessSizeIndex = TypeSizeToSizeIndex(O.TypeStoreSize);
     if (InstrumentWithCalls) {
+      LLVM_DEBUG(dbgs() << "Using call-based instrumentation\n");
       SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
       if (UseMatchAllCallback)
         Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
       IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
                      Args);
     } else if (OutlinedChecks) {
+      LLVM_DEBUG(dbgs() << "Outlining the check\n");
       instrumentMemAccessOutline(Addr, O.IsWrite, AccessSizeIndex, O.getInsn(),
                                  DTU, LI);
     } else {
+      LLVM_DEBUG(dbgs() << "Inlining the check\n");
       instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, O.getInsn(),
                                 DTU, LI);
     }
   } else {
+    LLVM_DEBUG(dbgs() << "Using call-based instrumentation, else case\n");
     SmallVector<Value *, 3> Args{
         IRB.CreatePointerCast(Addr, IntptrTy),
         IRB.CreateUDiv(IRB.CreateTypeSize(IntptrTy, O.TypeStoreSize),
@@ -1189,58 +1249,221 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
   return true;
 }
 
+uint8_t rotateOn4bits(uint8_t val, uint8_t positions) {
+  positions = positions % 4;
+  LLVM_DEBUG(dbgs() << " Rotating value: 0x" << utohexstr((unsigned)val)
+                    << " by " << (unsigned)positions << " positions\n");
+  val = ((val << positions) | (val >> (4 - positions)));
+  LLVM_DEBUG(dbgs() << " Rotated value: 0x" << utohexstr((unsigned)val)
+                    << "\n");
+  assert(val >> 4 == 0 && "Rotation on 4 bits failed");
+  return val;
+}
+
+void debugAggregateVisit(Type *sonType, uint8_t currNestingLevel,
+                         uint8_t expectedTag, uint8_t typeMask,
+                         uint8_t newBaseTag) {
+  LLVM_DEBUG(dbgs() << " [RLT-DBG] AGGREGATE VISIT: ");
+  LLVM_DEBUG(sonType->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\n\tnesting level -> : " << (unsigned)currNestingLevel
+                    << "\n");
+  LLVM_DEBUG(dbgs() << "\texpected tag: 0x" << utohexstr((unsigned)expectedTag)
+                    << "\n");
+  LLVM_DEBUG(dbgs() << " \ttype mask: 0x" << utohexstr((unsigned)typeMask)
+                    << "\n");
+  LLVM_DEBUG(dbgs() << " \tnew base tag/expected pointer tag: 0x"
+                    << utohexstr((unsigned)newBaseTag) << "\n");
+}
+/**
+ * Applies RLT to memory
+ */
+void HWAddressSanitizer::ApplyRLT(IRBuilder<> &IRB, Instruction *AI,
+                                  Type *rootType, Value *Tag,
+                                  const DataLayout &DL) {
+
+  assert(rootType->isAggregateType() && !rootType->isArrayTy() &&
+         "RLT can be applied only to non-array aggregate types");
+
+  llvm::DIType *typeDescriptor =
+      nullptr; // lookup IR metadata for DI (Local/Global)
+
+  Value *RootAddrLong = untagPointer(IRB, IRB.CreatePointerCast(AI, IntptrTy));
+  Value *PaddingTag = Tag; // TODO: handle padding tags
+
+  std::deque<std::tuple<Type *, uint8_t, uint8_t, uint8_t, size_t>> AggQueue;
+
+  auto rootTypeMemberOffsets =
+      DL.getStructLayout(cast<StructType>(rootType))->getMemberOffsets();
+
+  uint8_t fatherT = 0;
+  uint8_t fatherL = 0;
+  uint8_t sonIdx = 1; // NOTE: indexes start at 1
+
+  for (auto subtype : rootType->subtypes()) {
+    AggQueue.push_back(std::make_tuple(subtype, fatherT, fatherL, sonIdx,
+                                       rootTypeMemberOffsets[sonIdx - 1]));
+    sonIdx++;
+  } // init for
+
+  while (!AggQueue.empty()) {
+
+    /**
+     * UNIONs
+     *  1 - layout seems to be inferred by the compiler -> maybe based on
+     * first use? 2 - size seems to be 0 when called upon the union itself 3 -
+     * in presence of padding in the union, compiler assumes it an i8 array
+     * FLEX MEMBERS 1 - their size is 0 --> just don't tag them
+     * INSTRUMENTATION 1 - I suspect compiler will still optimize away tag
+     * stores 2 - does it have to be so horribly inefficient?
+     */
+
+    auto el_pair = AggQueue.front();
+    AggQueue.pop_front();
+
+    Type *sonType = std::get<0>(el_pair); // GEP
+
+    // my father's tag
+    fatherT = std::get<1>(el_pair); // from top-byte
+
+    // level of nesting wrt to the top aggregate
+    fatherL = std::get<2>(el_pair); // GEP
+
+    // index of the (sub) field in the (sub)type
+    sonIdx = std::get<3>(el_pair); // GEPs provide you with this info
+
+    // offset of the field from the beginning of the aggregate in memory
+    size_t sonOffset = std::get<4>(el_pair); // current offset from the root ptr
+
+    if (sonType->isAggregateType() &&
+        !sonType->isArrayTy()) { /*either struct or union */
+      // TAG memory associated to nested aggregate type
+      // TODO: should sonIdx be %'ed???
+      uint8_t sonT =
+          (fatherT + sonIdx) % 16; // tag of ptr to this field, expected tag
+
+      uint8_t sonMask = sonType->getNumContainedTypes() % 16u;
+      auto rotatedMask = rotateOn4bits(sonMask, sonIdx);
+      auto newBaseTag = (rotatedMask ^ sonT);
+      // fields tags will be newBaseTag + field index
+
+      debugAggregateVisit(sonType, fatherL, sonT, sonMask, newBaseTag);
+
+      uint8_t count = 0;
+      auto sonSubfieldsCount = sonType->getNumContainedTypes();
+
+      auto sonSubfieldsOffsets =
+          DL.getStructLayout(cast<StructType>(sonType))->getMemberOffsets();
+      size_t currSonSubfieldOffset = 0;
+
+      for (Type *subtype : llvm::reverse(sonType->subtypes())) {
+        currSonSubfieldOffset =
+            sonSubfieldsOffsets[sonSubfieldsCount - count - 1] + sonOffset;
+        AggQueue.push_front(
+            std::make_tuple(subtype, newBaseTag, (fatherL + 1) % 8,
+                            sonSubfieldsCount - count, currSonSubfieldOffset));
+        count++;
+      } // visits the elements of the sonType if this is an aggregate and
+        // establishes tags
+
+    } else {
+      /*Visit memory location and tag it */
+      assert(sonType->isSized() && "Type must be sized"); // CHECK
+      uint8_t sonT = (fatherT + sonIdx) % 16;
+      uint8_t sonTag = sonT | (fatherL << 4);
+      assert((sonT & 0x80) == 0 &&
+             "ROOT POINTER BIT must be set to 0 in memory tags");
+
+      IRB.CreateCall(
+          HwasanTagMemoryFunc,
+          {IRB.CreateIntToPtr(
+               IRB.CreateAdd(IRB.CreatePtrToInt(RootAddrLong, IntptrTy),
+                             ConstantInt::get(IntptrTy, sonOffset)),
+               PtrTy),
+           ConstantInt::get(Int8Ty, sonTag),
+           ConstantInt::get(IntptrTy, DL.getTypeAllocSize(sonType)),
+           ConstantInt::get(
+               IntptrTy, typeDescriptor
+                             ? typeDescriptor->getLine()
+                             : 0)}); // NOTE: this is a bogus parameter for now
+      LLVM_DEBUG(dbgs() << " [++] TAG MEM @ offset " << sonOffset << " -> 0x"
+                        << utohexstr((unsigned)sonTag) << "\n");
+    } // else ->visit memory location
+  } // while agg queue not empty
+} // ApplyRLT
+
+void debugTagAlloca(AllocaInst *AI, size_t Size, size_t AlignedSize,
+                    size_t scale, Value *Tag) {
+  LLVM_DEBUG(dbgs() << " [++] tagAlloca: not instrumenting with calls\n");
+  // shadowSize = size
+  LLVM_DEBUG(dbgs() << " [++] Aligned size : " << AlignedSize << "\n");
+  LLVM_DEBUG(dbgs() << " [++] Size : " << Size << "\n");
+  LLVM_DEBUG(dbgs() << " [++] Mapping scale : " << scale << "\n");
+  LLVM_DEBUG(dbgs() << " [++]   Tag value : ");
+  LLVM_DEBUG(Tag->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\n");
+  AI->getAllocatedType()->print(dbgs());
+  LLVM_DEBUG(dbgs() << "\n");
+  LLVM_DEBUG(dbgs() << " [++] Num contained types : "
+                    << AI->getAllocatedType()->getNumContainedTypes());
+  LLVM_DEBUG(dbgs() << "\n");
+  // print contained types
+  for (Type *contType : AI->getAllocatedType()->subtypes()) {
+    LLVM_DEBUG(dbgs() << " \t[++] Contained type: ");
+    LLVM_DEBUG(contType->print(dbgs()));
+    LLVM_DEBUG(dbgs() << "\n");
+  }
+  LLVM_DEBUG(dbgs() << "\n");
+}
+
+void pokeIntoAggregate(Type *sonType, unsigned currNestingLevel,
+                       uint8_t expectedTag, uint8_t typeMask,
+                       uint8_t newBaseTag, size_t numElementsInSubtype) {
+  LLVM_DEBUG(dbgs() << " [++] POKING INTO AGGREGATE: ");
+  LLVM_DEBUG(dbgs() << sonType->getStructName());
+  LLVM_DEBUG(dbgs() << " at nesting level: " << (unsigned)currNestingLevel
+                    << "\n");
+  LLVM_DEBUG(dbgs() << " \texpected tag: 0x" << utohexstr((unsigned)expectedTag)
+                    << "\n");
+  LLVM_DEBUG(dbgs() << " \ttype mask: 0x" << utohexstr((unsigned)typeMask)
+                    << "\n");
+  LLVM_DEBUG(dbgs() << " \tnew base tag: 0x" << utohexstr((unsigned)newBaseTag)
+                    << "\n");
+  LLVM_DEBUG(dbgs() << " \tnumber of elements in subtype: "
+                    << numElementsInSubtype << "\n");
+  LLVM_DEBUG(dbgs() << "\n");
+}
+
 void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, Value *Tag,
-                                   size_t Size) {
+                                   size_t Size, const DataLayout &DL) {
   size_t AlignedSize = alignTo(Size, Mapping.getObjectAlignment());
   if (!UseShortGranules)
     Size = AlignedSize;
+  debugTagAlloca(AI, Size, AlignedSize, Mapping.scale(), Tag);
 
   Tag = IRB.CreateTrunc(Tag, Int8Ty);
-  if (InstrumentWithCalls) {
-    IRB.CreateCall(HwasanTagMemoryFunc,
-                   {IRB.CreatePointerCast(AI, PtrTy), Tag,
-                    ConstantInt::get(IntptrTy, AlignedSize)});
-  } else {
-    errs() << "Not instrumenting with calls\n";
-    size_t ShadowSize = Size; // Mapping.scale();
-    errs() << "Shadow size : " << ShadowSize << "\n";
-    errs() << "Aligned size : " << AlignedSize << "\n";
-    errs() << "Size : " << Size << "\n";
-    errs() << "Mapping scale : " << Mapping.scale() << "\n";
-    Value *AddrLong = untagPointer(IRB, IRB.CreatePointerCast(AI, IntptrTy));
-    Value *ShadowPtr = memToShadow(AddrLong, IRB);
-    // If this memset is not inlined, it will be intercepted in the hwasan
-    // runtime library. That's OK, because the interceptor skips the checks if
-    // the address is in the shadow region.
-    // FIXME: the interceptor is not as fast as real memset. Consider lowering
-    // llvm.memset right here into either a sequence of stores, or a call to
-    // hwasan_tag_memory.
-    if (ShadowSize)
-      IRB.CreateMemSet(ShadowPtr, Tag, ShadowSize, Align(1));
-    if (Size != AlignedSize) {
-      const uint8_t SizeRemainder = Size % Mapping.getObjectAlignment().value();
-      IRB.CreateStore(ConstantInt::get(Int8Ty, SizeRemainder),
-                      IRB.CreateConstGEP1_32(Int8Ty, ShadowPtr, ShadowSize));
-      IRB.CreateStore(
-          Tag, IRB.CreateConstGEP1_32(Int8Ty, IRB.CreatePointerCast(AI, PtrTy),
-                                      AlignedSize - 1));
-    }
-  }
-}
+  // if (InstrumentWithCalls) {
+  //   LLVM_DEBUG(dbgs() << " [++] tagAlloca: instrumenting with calls\n");
+  //   IRB.CreateCall(HwasanTagMemoryFunc,
+  //                  {IRB.CreatePointerCast(AI, PtrTy), Tag,
+  //                   ConstantInt::get(IntptrTy, AlignedSize)});
+  // } else {
+  ApplyRLT(IRB, AI, AI->getAllocatedType(), Tag, DL);
+  // } // if not instrumenting with calls
+} // tagAlloca
 
 unsigned HWAddressSanitizer::retagMask(unsigned AllocaNo) {
   if (TargetTriple.getArch() == Triple::x86_64)
     return AllocaNo & TagMaskByte;
 
   // A list of 8-bit numbers that have at most one run of non-zero bits.
-  // x = x ^ (mask << 56) can be encoded as a single armv8 instruction for these
-  // masks.
-  // The list does not include the value 255, which is used for UAR.
+  // x = x ^ (mask << 56) can be encoded as a single armv8 instruction for
+  // these masks. The list does not include the value 255, which is used for
+  // UAR.
   //
-  // Because we are more likely to use earlier elements of this list than later
-  // ones, it is sorted in increasing order of probability of collision with a
-  // mask allocated (temporally) nearby. The program that generated this list
-  // can be found at:
+  // Because we are more likely to use earlier elements of this list than
+  // later ones, it is sorted in increasing order of probability of collision
+  // with a mask allocated (temporally) nearby. The program that generated
+  // this list can be found at:
   // https://github.com/google/sanitizers/blob/master/hwaddress-sanitizer/sort_masks.py
   static const unsigned FastMasks[] = {
       0,   128, 64, 192, 32,  96,  224, 112, 240, 48, 16,  120,
@@ -1313,7 +1536,8 @@ Value *HWAddressSanitizer::tagPointer(IRBuilder<> &IRB, Type *Ty,
 }
 
 // Remove tag from an address.
-Value *HWAddressSanitizer::untagPointer(IRBuilder<> &IRB, Value *PtrLong) {
+inline Value *HWAddressSanitizer::untagPointer(IRBuilder<> &IRB,
+                                               Value *PtrLong) {
   assert(!UsePageAliases);
   Value *UntaggedPtrLong;
   if (CompileKernel) {
@@ -1445,11 +1669,9 @@ bool HWAddressSanitizer::instrumentLandingPads(
   return true;
 }
 
-bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
-                                         Value *StackTag, Value *UARTag,
-                                         const DominatorTree &DT,
-                                         const PostDominatorTree &PDT,
-                                         const LoopInfo &LI) {
+bool HWAddressSanitizer::instrumentStack(
+    memtag::StackInfo &SInfo, Value *StackTag, const DominatorTree &DT,
+    const PostDominatorTree &PDT, const LoopInfo &LI, const DataLayout &DL) {
   // Ideally, we want to calculate tagged stack base pointer, and rewrite all
   // alloca addresses using that. Unfortunately, offsets are not known yet
   // (unless we use ASan-style mega-alloca). Instead we keep the base tag in a
@@ -1458,14 +1680,15 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
   unsigned int I = 0;
 
   for (auto &KV : SInfo.AllocasToInstrument) {
-    errs() << "Instrumenting alloca: " << *(KV.first) << "\n"; // show me the instruction
+    errs() << "Instrumenting alloca: " << *(KV.first)
+           << "\n"; // show me the instruction
     auto N = I++;
     auto *AI = KV.first;
     memtag::AllocaInfo &Info = KV.second;
     IRBuilder<> IRB(AI->getNextNonDebugInstruction());
 
     // Replace uses of the alloca with tagged address.
-    Value *Tag = getAllocaTag(IRB, StackTag, N);
+    Value *Tag = getAllocaTagRootPtr(IRB, StackTag, N);
     Value *AILong = IRB.CreatePointerCast(AI, IntptrTy);
     Value *AINoTagLong = untagPointer(IRB, AILong);
     Value *Replacement = tagPointer(IRB, AI->getType(), AINoTagLong, Tag);
@@ -1474,17 +1697,19 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     Replacement->setName(Name + ".hwasan"); // interesting
 
     size_t Size = memtag::getAllocaSizeInBytes(*AI);
-    size_t AlignedSize = alignTo(Size, Mapping.getObjectAlignment());// WATCH OUT
-    errs() << "Alloca size: " << Size << ", aligned size: " << AlignedSize << "\n"; // show me the size
+    size_t AlignedSize =
+        alignTo(Size, Mapping.getObjectAlignment()); // WATCH OUT
+    errs() << "Alloca size: " << Size << ", aligned size: " << AlignedSize
+           << "\n"; // show me the size
     Value *AICast = IRB.CreatePointerCast(AI, PtrTy);
 
     auto HandleLifetime = [&](IntrinsicInst *II) {
-      // Set the lifetime intrinsic to cover the whole alloca. This reduces the
-      // set of assumptions we need to make about the lifetime. Without this we
-      // would need to ensure that we can track the lifetime pointer to a
-      // constant offset from the alloca, and would still need to change the
-      // size to include the extra alignment we use for the untagging to make
-      // the size consistent.
+      // Set the lifetime intrinsic to cover the whole alloca. This reduces
+      // the set of assumptions we need to make about the lifetime. Without
+      // this we would need to ensure that we can track the lifetime pointer
+      // to a constant offset from the alloca, and would still need to change
+      // the size to include the extra alignment we use for the untagging to
+      // make the size consistent.
       //
       // The check for standard lifetime below makes sure that we have exactly
       // one set of start / end in any execution (i.e. the ends are not
@@ -1502,43 +1727,50 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
 
     memtag::annotateDebugRecords(Info, retagMask(N));
 
-    auto TagEnd = [&](Instruction *Node) {
-      IRB.SetInsertPoint(Node);
-      // When untagging, use the `AlignedSize` because we need to set the tags
-      // for the entire alloca to original. If we used `Size` here, we would
-      // keep the last granule tagged, and store zero in the last byte of the
-      // last granule, due to how short granules are implemented.
-      tagAlloca(IRB, AI, UARTag, AlignedSize);
-    };
+    // auto TagEnd = [&](Instruction *Node) {
+    //   IRB.SetInsertPoint(Node);
+    //   // When untagging, use the `AlignedSize` because we need to set the
+    //   tags
+    //   // for the entire alloca to original. If we used `Size` here, we
+    //   would
+    //   // keep the last granule tagged, and store zero in the last byte of
+    //   the
+    //   // last granule, due to how short granules are implemented.
+    //   tagAlloca(IRB, AI, UARTag, AlignedSize, DL);
+    // };
     // Calls to functions that may return twice (e.g. setjmp) confuse the
     // postdominator analysis, and will leave us to keep memory tagged after
     // function return. Work around this by always untagging at every return
     // statement if return_twice functions are called.
-    bool StandardLifetime =
-        !SInfo.CallsReturnTwice &&
-        SInfo.UnrecognizedLifetimes.empty() &&
-        memtag::isStandardLifetime(Info.LifetimeStart, Info.LifetimeEnd, &DT,
-                                   &LI, ClMaxLifetimes);
-    if (DetectUseAfterScope && StandardLifetime) {
-      IntrinsicInst *Start = Info.LifetimeStart[0];
-      IRB.SetInsertPoint(Start->getNextNode());
-      tagAlloca(IRB, AI, Tag, Size);
-      if (!memtag::forAllReachableExits(DT, PDT, LI, Start, Info.LifetimeEnd,
-                                        SInfo.RetVec, TagEnd)) {
-        for (auto *End : Info.LifetimeEnd)
-          End->eraseFromParent();
-      }
-    } else {
-      tagAlloca(IRB, AI, Tag, Size);
-      for (auto *RI : SInfo.RetVec)
-        TagEnd(RI);
-      // We inserted tagging outside of the lifetimes, so we have to remove
-      // them.
-      for (auto &II : Info.LifetimeStart)
-        II->eraseFromParent();
-      for (auto &II : Info.LifetimeEnd)
-        II->eraseFromParent();
-    }
+    // bool StandardLifetime =
+    //     !SInfo.CallsReturnTwice && SInfo.UnrecognizedLifetimes.empty() &&
+    //     memtag::isStandardLifetime(Info.LifetimeStart, Info.LifetimeEnd,
+    //     &DT,
+    //                                &LI, ClMaxLifetimes);
+    // assert(!DetectUseAfterScope &&
+    //        "FieldArmor does not support UAS"); // GET RID OF UAS
+
+    // if (DetectUseAfterScope && StandardLifetime) {
+    //   IntrinsicInst *Start = Info.LifetimeStart[0];
+    //   IRB.SetInsertPoint(Start->getNextNode());
+    //   tagAlloca(IRB, AI, Tag, Size, DL);
+    //   if (!memtag::forAllReachableExits(DT, PDT, LI, Start,
+    //   Info.LifetimeEnd,
+    //                                     SInfo.RetVec, TagEnd)) {
+    //     for (auto *End : Info.LifetimeEnd)
+    //       End->eraseFromParent();
+    //   }
+    // } else {
+    tagAlloca(IRB, AI, Tag, Size, DL);
+    // for (auto *RI : SInfo.RetVec)
+    //   TagEnd(RI);// I DONT WANT THIS PORCODIO
+    // We inserted tagging outside of the lifetimes, so we have to remove
+    // them.
+    for (auto &II : Info.LifetimeStart)
+      II->eraseFromParent();
+    for (auto &II : Info.LifetimeEnd)
+      II->eraseFromParent();
+    // }
     memtag::alignAndPadAlloca(Info, Mapping.getObjectAlignment());
   }
   for (auto &I : SInfo.UnrecognizedLifetimes)
@@ -1614,15 +1846,16 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   NumInstrumentedFuncs++;
 
-  LLVM_DEBUG(dbgs() << "Function: " << F.getName() << "\n");
-
   SmallVector<InterestingMemoryOperand, 16> OperandsToInstrument;
   SmallVector<MemIntrinsic *, 16> IntrinToInstrument;
   SmallVector<Instruction *, 8> LandingPadVec;
+  SmallVector<GetElementPtrInst *, 40> GEPsToInstrument;
+
   const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
 
   memtag::StackInfoBuilder SIB(SSI, DEBUG_TYPE);
   for (auto &Inst : instructions(F)) {
+
     if (InstrumentStack) {
       SIB.visit(ORE, Inst);
     }
@@ -1635,21 +1868,25 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
       if (!ignoreMemIntrinsic(ORE, MI))
         IntrinToInstrument.push_back(MI);
+
+    if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(&Inst)) {
+      GEPsToInstrument.push_back(GEPI);
+    }
+
+    if (auto *CB = dyn_cast<CallBase>(&Inst)) {
+
+      if (CB->getCalledFunction() &&
+          CB->getCalledFunction()->getName().contains(
+              "alloc")) { // TODO: how to distinguish libc malloc from
+                          // wrappers?
+        LLVM_DEBUG(dbgs() << " Found call to memory allocation function: "
+                          << *CB << "\n");
+      }
+    }
+
   } // instrument stack to build lifetime info, find memset/memcpy calls, get
     // info on how to instrument for exception handling (landing pads)
   // Dump interesting memory operands iterating over InterestingMemoryOperand
-
-  if (F.getName() == "main") {
-
-    for (auto &Op : OperandsToInstrument) {
-      errs() << "HWAddressSanitizer::sanitizeFunction: sanitizing op at "
-                "instruction "
-             << *(Op).getInsn() << "\n";
-    }
-  }
-  // EXP TODO @ale: look for GEPs, dump them at every optimization level to figure out how pointers are retrieved
-  // TODO: instrument mallocs
-  // Q: HWasanIO adds HWTestFreedFunc for operands -> does this mean they check whether a function frees a pointer? They insert a call to hwasan_test_free to detect invalid free, maybe they left it there by mistake?
   memtag::StackInfo &SInfo = SIB.get();
 
   initializeCallbacks(*F.getParent());
@@ -1682,8 +1919,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     const PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
     const LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
     Value *StackTag = getStackBaseTag(EntryIRB);
-    Value *UARTag = getUARTag(EntryIRB);
-    instrumentStack(SInfo, StackTag, UARTag, DT, PDT, LI);
+    instrumentStack(SInfo, StackTag, DT, PDT, LI, F.getDataLayout());
   }
 
   // If we split the entry block, move any allocas that were originally in the
@@ -1713,19 +1949,408 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       instrumentMemIntrinsic(Inst);
   }
 
+  LLVM_DEBUG(dbgs() << " [++] FUNCTION " << F.getName()
+                    << " -> Total GEPs to instrument: "
+                    << GEPsToInstrument.size() << "\n");
+  for (auto &GEPI : GEPsToInstrument) {
+    InstrumentGEP(GEPI);
+    // LLVM_DEBUG(dbgs() << " Instrumented GEP: " << *GEPI << "\n");
+  }
   ShadowBase = nullptr;
   StackBaseTag = nullptr;
   CachedFP = nullptr;
 }
 
-void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV, uint8_t Tag) {
-  // TODO check whether globals include structs and, eventually, instrument the struct GEPs
-  assert(!UsePageAliases);
+void dumpGEPDebug(GetElementPtrInst *GEPI) {
+  LLVM_DEBUG(dbgs() << " _______________________________\n");
+  LLVM_DEBUG(dbgs() << " GEP INSTRUCTION: ");
+  LLVM_DEBUG(GEPI->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\n");
+
+  LLVM_DEBUG(dbgs() << "\t SRC TYPE: ");
+  LLVM_DEBUG(GEPI->getSourceElementType()->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\n");
+
+  LLVM_DEBUG(dbgs() << "\t DST TYPE: ");
+  auto res_type = GEPI->getResultElementType();
+  LLVM_DEBUG(res_type->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\n");
+  for (auto *User : GEPI->users()) {
+    LLVM_DEBUG(dbgs() << "\t\t GEP USER: ");
+    LLVM_DEBUG(User->print(dbgs()));
+    LLVM_DEBUG(dbgs() << "\n");
+  }
+
+  LLVM_DEBUG(dbgs() << "\n _______________________________\n");
+}
+
+void dumpGEPUsersWhenRetStruct(GetElementPtrInst *GEPI) {
+  auto res_type = GEPI->getResultElementType();
+  if (res_type->isStructTy()) {
+    StructType *ST = dyn_cast<StructType>(res_type);
+    for (auto *User : GEPI->users()) {
+      if (ST->getName().starts_with("union")) {
+        IRBuilder<> IRB(User->getContext());
+        IRB.SetInsertPoint(cast<Instruction>(User)->getNextNode());
+        LLVM_DEBUG(dbgs() << "  instrumenting GEP user (union struct): ");
+        LLVM_DEBUG(User->print(dbgs()));
+        LLVM_DEBUG(dbgs() << "\n");
+      }
+    }
+  }
+}
+
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/Instructions.h"
+
+StringRef getStructODRIdentifier(Instruction *Instr) {
+  auto *GEP = dyn_cast<GetElementPtrInst>(Instr);
+  if (!GEP)
+    return "";
+
+  Type *StructType = GEP->getSourceElementType();
+  if (!StructType->isStructTy())
+    return "";
+
+  // Get debug location
+  auto DbgLoc = GEP->getDebugLoc();
+  if (!DbgLoc)
+    return "";
+
+  // Get the scope from the debug location
+  DIScope *Scope = DbgLoc->getScope();
+  if (!Scope)
+    return "";
+
+  // Traverse to DILocalScope if possible
+  DILocalScope *LocalScope = dyn_cast<DILocalScope>(Scope);
+  if (!LocalScope)
+    return "";
+
+  // Get the subprogram from the local scope
+  DISubprogram *SP = LocalScope->getSubprogram();
+  if (!SP)
+    return "";
+
+  // Get the compile unit from the subprogram
+  DICompileUnit *CU = SP->getUnit();
+  if (!CU)
+    return "";
+
+  // Search compile unit's retained types
+  for (auto *Type : CU->getRetainedTypes()) {
+    if (auto *CompType = dyn_cast<DICompositeType>(Type)) {
+      if (CompType->getName() == StructType->getStructName()) {
+        if (auto *Identifier = CompType->getRawIdentifier()) {
+          return Identifier->getString();
+        }
+      }
+    }
+  }
+
+  return "";
+}
+
+void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
+  dumpGEPDebug(GEPI);
+  auto nOperands = GEPI->getNumOperands();
+  assert(nOperands <= 3); // I expect 3 at most TODO: CHECK ON THIS
+
+  /**
+   * NOTE: this does not work, assuming a dbg instruction with the type is there
+   * is not reliable.
+   */
+
+  // lets look the name up in the DI nodes
+
+  auto fatherType = GEPI->getSourceElementType();
+  if (!fatherType->isStructTy()) {
+    LLVM_DEBUG(
+        dbgs() << " Skipping GEP instrumentation: source type is not struct\n");
+    return;
+  }
+
+  IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
+
+  auto sonType = GEPI->getResultElementType();
+  // IRB.SetInsertPoint(GEPI->getNextNode()); // NOTE: this does not work
+  // since after 1-2 instructions, it wont do anything, not even fail or raise
+  // an error cases a) outer root pointer accesses non aggregate b) outer root
+  // pointer accesses aggregate (struct/union) c) inner pointer accesses non
+  // aggregate d) inner pointer accesses aggregate (struct/union)
+
+  Value *resultLong = IRB.CreatePointerCast(GEPI, IntptrTy);
+
+  auto sonIdx =
+      IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
+                    ConstantInt::get(IntptrTy, 0x1u)); //+1
+
+  Value *fatherTL = IRB.CreateLShr(
+      IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x7FL << 56L)),
+      PointerTagShift); // UNSET RP
+
+  Value *fatherT = IRB.CreateAnd(fatherTL, ConstantInt::get(IntptrTy, 0x0FLu));
+
+  Value *fatherL =
+      IRB.CreateAnd(fatherTL, ConstantInt::get(IntptrTy, 0x70Lu)); /*01110000*/
+  // LEVEL is aligned and ready to be applied
+
+  Value *sonTag = nullptr;
+
+  if (!sonType->isStructTy()) {
+
+    Value *sonT = IRB.CreateURem(IRB.CreateAdd(fatherT, sonIdx),
+                                 ConstantInt::get(IntptrTy, 0x10Lu));
+    sonTag = IRB.CreateOr(sonT, fatherL);
+  }
+
+  else {
+
+    Value *mask =
+        ConstantInt::get(IntptrTy, sonType->getNumContainedTypes() % 16u);
+
+    Value *positions =
+        IRB.CreateURem(sonIdx, ConstantInt::get(IntptrTy, 0x4Lu));
+
+    Value *rotatedMask = IRB.CreateOr(
+        IRB.CreateLShr(
+            mask, IRB.CreateSub(ConstantInt::get(IntptrTy, 0x4Lu), positions)),
+        IRB.CreateShl(mask, positions));
+    rotatedMask = IRB.CreateAnd(
+        rotatedMask, ConstantInt::get(IntptrTy, 0x0FLu)); // keep lower 4 bits
+    Value* expectedSonT = IRB.CreateURem(
+        IRB.CreateAdd(fatherT, sonIdx), ConstantInt::get(IntptrTy, 0x10Lu));
+
+    Value *sonT = IRB.CreateXor(rotatedMask, expectedSonT); // DEBUG THIS
+    // Value *sonT = IRB.CreateURem(IRB.CreateAdd(maskedFatherT, sonIdx),
+    //                              ConstantInt::get(IntptrTy, 0x10Lu));
+    
+    Value *sonL = IRB.CreateShl(
+        IRB.CreateURem(IRB.CreateAdd(IRB.CreateLShr(fatherL, 4u),
+                                     ConstantInt::get(IntptrTy, 1u)),
+                       ConstantInt::get(IntptrTy, 0x8u)),
+        4u); // level aligned and ready to be applied
+    sonTag = IRB.CreateOr(IRB.CreateOr(sonT, sonL),
+                          ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit
+  }
+
+  Value *untaggedResLong = IRB.CreateAnd(
+      resultLong, ConstantInt::get(resultLong->getType(),
+                                   ~(TagMaskByte << PointerTagShift)));
+  Value *untaggedResLongPtr = IRB.CreatePointerCast(untaggedResLong, IntptrTy);
+  Value *taggedPointer =
+      tagPointer(IRB, GEPI->getType(), untaggedResLongPtr, sonTag);
+
+  std::string Name = GEPI->hasName() ? GEPI->getName().str()
+                                     : "gep." + itostr(++instrumentedGEPs);
+  taggedPointer->setName(Name + ".fieldarmor");
+  Value *indexOfTaggedPointer = sonIdx;
+  indexOfTaggedPointer->setName(Name + ".fieldarmor.idx");
+
+  Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy); //?? TODO REMOVE
+
+  GEPI->replaceUsesWithIf(
+      taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
+        auto *User = U.getUser();
+        return User != resultLong && User != GEPICastToPtr &&
+               !isa<LifetimeIntrinsic>(User); // NOOOO
+      });
+}
+
+void HWAddressSanitizer::instrumentGlobalAggregate(GlobalVariable *GV,
+                                                   uint8_t Tag,
+                                                   const DataLayout &DL) {
+  /** You can assume the GV is an aggregate. Apply RLT schema for the global
+   */
+  LLVM_DEBUG(dbgs() << " [++] Simulating instrumentation of global aggregate: "
+                    << GV->getName() << "\n");
   Constant *Initializer = GV->getInitializer();
+  Type *type = Initializer->getType();
+  assert(type->isAggregateType());
+  LLVM_DEBUG(dbgs() << "\t\tGlobal is struct type ");
+  LLVM_DEBUG(type->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\n");
+  // create GlobalVar with the associated tag sequence bytes inside so that
+  // runtime can use it for tagging sequentially the allocated global method
+  // start
+  // std::deque<std::tuple<Type *, uint8_t, uint8_t, uint8_t, size_t>>
+  // AggQueue;
+
+  // Type *rootType =
+  //     GV->getInitializer()->getType(); // the type of the global variable
+  // assert(rootType->isAggregateType() &&
+  //        "Global variable must be aggregate type");
+  // assert(rootType->isSized() && "Global variable must be sized type");
+  // std::vector<uint8_t> TagsVector;
+  // auto rootTypeMemberOffsets =
+  //     DL.getStructLayout(cast<StructType>(rootType))->getMemberOffsets();
+  // uint8_t baseTag = 1;
+  // uint8_t baseLevelOfNesting = 0;
+  // uint8_t idx = 0;
+  // for (auto subtype : rootType->subtypes()) {
+  //   AggQueue.push_back(std::make_tuple(subtype, baseTag,
+  //   baseLevelOfNesting,
+  //                                      idx, rootTypeMemberOffsets[idx]));
+  //   idx++;
+  // }
+
+  // while (!AggQueue.empty()) {
+  //   auto el_pair = AggQueue.front();
+  //   AggQueue.pop_front();
+
+  //   Type *sonType = std::get<0>(el_pair); // GEP
+
+  //   // my father's tag
+  //   uint8_t baseTag = std::get<1>(el_pair); // from top-byte
+
+  //   // level of nesting wrt to the top aggregate
+  //   uint8_t currNestingLevel = std::get<2>(el_pair); // GEP
+
+  //   // index of the (sub) field in the (sub)type
+  //   uint8_t sonTypeIndex =
+  //       std::get<3>(el_pair); // GEPs provide you with this info
+
+  //   // offset of the field from the beginning of the aggregate in memory
+  //   size_t currOffset =
+  //       std::get<4>(el_pair); // current offset from the root ptr
+
+  //   if (sonType->isAggregateType() &&
+  //       !sonType->isArrayTy()) { /*either struct or union */
+  //     uint8_t typeMask = sonType->getNumContainedTypes() % 256;
+  //     uint8_t expectedTag =
+  //         baseTag + sonTypeIndex; // What it means: I expected this to be
+  //         the
+  //                                  // tag, turns out it is an aggregate ->
+  //                                  hence
+  //                                  // I'm computing tags for its subfields
+  //     auto newBaseTag = (typeMask << 1 ^ expectedTag); // DRAFT
+  //     uint8_t count = 0;
+  //     auto numElementsInSubtype = sonType->getNumContainedTypes();
+  //     // pokeIntoAggregate(sonType, currNestingLevel, expectedTag,
+  //     typeMask,
+  //     //                   newBaseTag, numElementsInSubtype);
+  //     auto memberOffsets =
+  //         DL.getStructLayout(cast<StructType>(sonType))->getMemberOffsets();
+
+  //     size_t currSubtypeOffset = 0;
+
+  //     for (Type *subtype : llvm::reverse(sonType->subtypes())) {
+  //       currSubtypeOffset =
+  //           memberOffsets[numElementsInSubtype - count - 1] + currOffset;
+  //       AggQueue.push_front(std::make_tuple(
+  //           subtype, newBaseTag, currNestingLevel + 1,
+  //           numElementsInSubtype - count - 1, currSubtypeOffset));
+  //       count++;
+  //     } // visits the elements of the sonType if this is an aggregate and
+  //       // establishes tags
+  //   } else {
+
+  //     uint8_t newTag = baseTag + sonTypeIndex;
+  //     LLVM_DEBUG(dbgs() << "\t\t At offset: " << currOffset
+  //                       << " of global, setting tag: " << unsigned(newTag)
+  //                       << " for type: ");
+  //     LLVM_DEBUG(sonType->print(dbgs()));
+  //     LLVM_DEBUG(dbgs() << "\n");
+  //     // push in the tagsVector as many bytes equal to tag, as the size of
+  //     the
+  //     // current type in bytes
+  //     uint64_t TypeSizeInBytes = DL.getTypeAllocSize(sonType);
+  //     for (uint64_t i = 0; i < TypeSizeInBytes; i++) {
+  //       TagsVector.push_back(newTag);
+  //     }
+  //   } // done collecting tags
+
+  //     // method end
+  //     // create new global variable with a fixed size byte array inside
+  //     holding
+  //     // the tags -> constant
+  //     uint64_t TagSize =
+  //     alignTo(M.getDataLayout().getTypeAllocSize(rootType),
+  //                                Mapping.getObjectAlignment());
+
+  //     Value *Init = ConstantAggregateZero::get(ArrayType::get(Int8Ty,
+  //     TagSize));
+
+  //     for (auto tag : TagsVector) {
+  //       Init = ConstantExpr::getInsertValue(Init, ConstantInt::get(Int8Ty,
+  //       tag),
+  //                                           {0,
+  //                                           (int64_t)TagsVector.size()});
+  //     }
+
+  //     auto *NewGV = new GlobalVariable(M, Init->getType(), true,
+  //                                      GlobalValue::ExternalLinkage, Init,
+  //                                      GV->getName() + ".hwasan.tags");
+  //     NewGV->copyAttributesFrom(GV);
+  //     NewGV->setLinkage(GlobalValue::PrivateLinkage);
+  //     NewGV->copyMetadata(GV, 0);
+  //     NewGV->setAlignment(
+  //         std::max(GV->getAlign().valueOrOne(),
+  //         Mapping.getObjectAlignment()));
+
+  //     NewGV->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
+
+  //     // Descriptor format (assuming little-endian):
+  //     // bytes 0-3: relative address of global
+  //     // bytes 4-6: size of global (16MB ought to be enough for anyone, but
+  //     in
+  //     // case it isn't, we create multiple descriptors) byte 7: tag
+  //     auto *DescriptorTy = StructType::get(Int32Ty, Int32Ty);
+  //     auto SizeInBytes = TagsVector.size(); // TODO: check
+
+  //     const uint64_t MaxDescriptorSize = 0xfffff0;
+  //     for (uint64_t DescriptorPos = 0; DescriptorPos < SizeInBytes;
+  //          DescriptorPos += MaxDescriptorSize) {
+  //       auto *Descriptor = new GlobalVariable(
+  //           M, DescriptorTy, true, GlobalValue::PrivateLinkage, nullptr,
+  //           GV->getName() + ".hwasan.tags.descriptor");
+  //       auto *GVRelPtr = ConstantExpr::getTrunc(
+  //           ConstantExpr::getAdd(
+  //               ConstantExpr::getSub(
+  //                   ConstantExpr::getPtrToInt(NewGV, Int64Ty),
+  //                   ConstantExpr::getPtrToInt(Descriptor, Int64Ty)),
+  //               ConstantInt::get(Int64Ty, DescriptorPos)),
+  //           Int32Ty);
+  //       uint32_t Size =
+  //           std::min(SizeInBytes - DescriptorPos, MaxDescriptorSize);
+  //       auto *SizeAndTag =
+  //           ConstantInt::get(Int32Ty, Size | (uint32_t(Tag) << 24)); //
+  //           review this later
+  //       Descriptor->setComdat(NewGV->getComdat());
+  //       Descriptor->setInitializer(
+  //           ConstantStruct::getAnon({GVRelPtr, SizeAndTag}));
+  //       Descriptor->setSection("hwasan_globals");
+  //       Descriptor->setMetadata(LLVMContext::MD_associated,
+  //                               MDNode::get(*C,
+  //                               ValueAsMetadata::get(NewGV)));
+  //       appendToCompilerUsed(M, Descriptor);
+  //     }
+}
+
+void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV, uint8_t Tag) {
+  assert(!UsePageAliases);
+  /** This method is called for all globals, ideally we want to filter on
+   * aggregates */
+
+  Constant *Initializer = GV->getInitializer();
+  Type *type = Initializer->getType();
+  LLVM_DEBUG(dbgs() << " [++] Instrumenting global: " << GV->getName() << "\n");
+
+  if (type->isAggregateType() && !type->isArrayTy()) {
+    LLVM_DEBUG(dbgs() << "  Global is struct type ");
+    LLVM_DEBUG(type->print(dbgs()));
+    LLVM_DEBUG(dbgs() << "\n");
+  }
+
   uint64_t SizeInBytes =
       M.getDataLayout().getTypeAllocSize(Initializer->getType());
-  uint64_t NewSize = alignTo(SizeInBytes, Mapping.getObjectAlignment());
+  uint64_t NewSize = alignTo(
+      SizeInBytes,
+      Mapping.getObjectAlignment()); // this might no longer be necessary
   if (SizeInBytes != NewSize) {
+    LLVM_DEBUG(dbgs() << "  Global size " << SizeInBytes
+                      << " is not multiple of alignment , padding with "
+                         "zeros and tag byte\n");
     // Pad the initializer out to the next multiple of 16 bytes and add the
     // required short granule tag.
     std::vector<uint8_t> Init(NewSize - SizeInBytes, 0);
@@ -1745,20 +2370,19 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV, uint8_t Tag) {
 
   // It is invalid to ICF two globals that have different tags. In the case
   // where the size of the global is a multiple of the tag granularity the
-  // contents of the globals may be the same but the tags (i.e. symbol values)
-  // may be different, and the symbols are not considered during ICF. In the
-  // case where the size is not a multiple of the granularity, the short granule
-  // tags would discriminate two globals with different tags, but there would
-  // otherwise be nothing stopping such a global from being incorrectly ICF'd
-  // with an uninstrumented (i.e. tag 0) global that happened to have the short
-  // granule tag in the last byte.
+  // contents of the globals may be the same but the tags (i.e. symbol
+  // values) may be different, and the symbols are not considered during
+  // ICF. In the case where the size is not a multiple of the granularity,
+  // the short granule tags would discriminate two globals with different
+  // tags, but there would otherwise be nothing stopping such a global from
+  // being incorrectly ICF'd with an uninstrumented (i.e. tag 0) global that
+  // happened to have the short granule tag in the last byte.
   NewGV->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
 
   // Descriptor format (assuming little-endian):
   // bytes 0-3: relative address of global
-  // bytes 4-6: size of global (16MB ought to be enough for anyone, but in case
-  // it isn't, we create multiple descriptors)
-  // byte 7: tag
+  // bytes 4-6: size of global (16MB ought to be enough for anyone, but in
+  // case it isn't, we create multiple descriptors) byte 7: tag
   auto *DescriptorTy = StructType::get(Int32Ty, Int32Ty);
   const uint64_t MaxDescriptorSize = 0xfffff0;
   for (uint64_t DescriptorPos = 0; DescriptorPos < SizeInBytes;
@@ -1799,6 +2423,18 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV, uint8_t Tag) {
 void HWAddressSanitizer::instrumentGlobals() {
   std::vector<GlobalVariable *> Globals;
   for (GlobalVariable &GV : M.globals()) {
+    LLVM_DEBUG(dbgs() << " -> Considering global: " << GV.getName()
+                      << " with linkage " << GV.getLinkage()
+                      << " and initializer "
+                      << (GV.hasInitializer() ? GV.getInitializer()->getName()
+                                              : "ciao")
+                      << "\n");
+    for (auto gv_user : GV.users()) {
+      LLVM_DEBUG(dbgs() << "\t   User: ");
+      LLVM_DEBUG(gv_user->print(dbgs()));
+      LLVM_DEBUG(dbgs() << "\n");
+    }
+
     if (GV.hasSanitizerMetadata() && GV.getSanitizerMetadata().NoHWAddress)
       continue;
 
@@ -1806,16 +2442,18 @@ void HWAddressSanitizer::instrumentGlobals() {
         GV.isThreadLocal())
       continue;
 
-    // Common symbols can't have aliases point to them, so they can't be tagged.
+    // Common symbols can't have aliases point to them, so they can't be
+    // tagged.
     if (GV.hasCommonLinkage())
       continue;
 
-    // Globals with custom sections may be used in __start_/__stop_ enumeration,
-    // which would be broken both by adding tags and potentially by the extra
-    // padding/alignment that we insert.
+    // Globals with custom sections may be used in __start_/__stop_
+    // enumeration, which would be broken both by adding tags and
+    // potentially by the extra padding/alignment that we insert.
     if (GV.hasSection())
       continue;
-
+    if (!GV.getInitializer()->getType()->isStructTy())
+      continue; // short circuit this -> only structs/unions
     Globals.push_back(&GV);
   }
 
@@ -1829,21 +2467,22 @@ void HWAddressSanitizer::instrumentGlobals() {
 
   for (GlobalVariable *GV : Globals) {
     // Don't allow globals to be tagged with something that looks like a
-    // short-granule tag, otherwise we lose inter-granule overflow detection, as
-    // the fast path shadow-vs-address check succeeds.
+    // short-granule tag, otherwise we lose inter-granule overflow
+    // detection, as the fast path shadow-vs-address check succeeds.
     if (Tag < 16 || Tag > TagMaskByte)
       Tag = 16;
-    instrumentGlobal(GV, Tag++);
+    // instrumentGlobal(GV, Tag++);
+    instrumentGlobalAggregate(GV, Tag++, M.getDataLayout());
   }
 }
 
 void HWAddressSanitizer::instrumentPersonalityFunctions() {
-  // We need to untag stack frames as we unwind past them. That is the job of
-  // the personality function wrapper, which either wraps an existing
+  // We need to untag stack frames as we unwind past them. That is the job
+  // of the personality function wrapper, which either wraps an existing
   // personality function or acts as a personality function on its own. Each
-  // function that has a personality function or that can be unwound past has
-  // its personality function changed to a thunk that calls the personality
-  // function wrapper in the runtime.
+  // function that has a personality function or that can be unwound past
+  // has its personality function changed to a thunk that calls the
+  // personality function wrapper in the runtime.
   MapVector<Constant *, std::vector<Function *>> PersonalityFns;
   for (Function &F : M) {
     if (F.isDeclaration() || !F.hasFnAttribute(Attribute::SanitizeHWAddress))
@@ -1931,4 +2570,14 @@ void HWAddressSanitizer::ShadowMapping::init(Triple &TargetTriple,
         ClMappingOffsetDynamic.getPosition() > ClMappingOffset.getPosition())) {
     SetFixed(ClMappingOffset);
   }
+  errs() << "HWAddressSanitizer Shadow Mapping: "
+         << (Kind == OffsetKind::kFixed ? "fixed" : "dynamic") << " offset, "
+         << "scale " << scale() << ", " << kDefaultShadowScale << ", "
+         << (WithFrameRecord ? "with" : "without") << " frame record\n";
+}
+
+Value *HWAddressSanitizer::getAllocaTagRootPtr(IRBuilder<> &IRB,
+                                               Value *StackTag,
+                                               unsigned AllocaNo) {
+  return ConstantInt::get(StackTag->getType(), 0b10000000);
 }

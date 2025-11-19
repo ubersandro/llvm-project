@@ -284,12 +284,15 @@ void __sanitizer::BufferedStackTrace::UnwindImpl(
 }
 
 static bool InitializeSingleGlobal(const hwasan_global &global) {
+  //BINGO
+  VPrintf(1, "------------\n[HWASAN] Initializing global %p of size %zu with tag %02x\n",
+          (void *)global.addr(), global.size(), global.tag());
   uptr full_granule_size = RoundDownTo(global.size(), 16);
   TagMemoryAligned(global.addr(), full_granule_size, global.tag());
   if (global.size() % 16)
     TagMemoryAligned(global.addr() + full_granule_size, 16, global.size() % 16);
   return false;
-}
+}// tag at 16B granularity
 
 static void InitLoadedGlobals() {
   // Fuchsia's libc provides a hook (__sanitizer_module_loaded) that runs on
@@ -297,8 +300,8 @@ static void InitLoadedGlobals() {
   // initially loaded modules, so explicitly registering the globals here
   // isn't needed.
   if constexpr (!SANITIZER_FUCHSIA) {
-    dl_iterate_phdr(
-        [](dl_phdr_info *info, size_t /* size */, void * /* data */) -> int {
+    dl_iterate_phdr(// iterate on all the shared objects loaded at this point
+        [](dl_phdr_info *info, size_t /* size */, void * /* data */) -> int {// callback for each loaded shared object
           for (const hwasan_global &global : HwasanGlobalsFor(
                    info->dlpi_addr, info->dlpi_phdr, info->dlpi_phnum))
             InitializeSingleGlobal(global);
@@ -445,6 +448,7 @@ void __hwasan_print_shadow(const void *p, uptr sz) {
 }
 
 sptr __hwasan_test_shadow(const void *p, uptr sz) {
+  VPrintf(1, "[FieldArmor] This routine has been patched. Test shadow for %p size %zu\n", p, sz);
   if (sz == 0)
     return -1;
   uptr ptr = reinterpret_cast<uptr>(p);
@@ -670,7 +674,10 @@ void __hwasan_store16_match_all_noabort(uptr p, u8 match_all_tag) {
     CheckAddress<ErrorAction::Recover, AccessType::Store, 4>(p);
 }
 
-void __hwasan_tag_memory(uptr p, u8 tag, uptr sz) {
+void __hwasan_tag_memory(uptr p, u8 tag, uptr sz, uptr type_descriptor) {
+  VPrintf(2, "[FieldArmor] Tagging memory %p of size %zu with tag %02x (type descriptor %zx)\n",
+          (void *)p, sz, tag, type_descriptor);
+  
   TagMemoryAligned(UntagAddr(p), sz, tag);
 }
 

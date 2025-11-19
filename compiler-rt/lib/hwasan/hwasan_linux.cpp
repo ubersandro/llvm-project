@@ -495,7 +495,6 @@ void Thread::InitStackAndTls(const InitState *) {
 }
 
 uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
-  VPrintf(1, "{HWASAN] TagMemoryAligned: p=%p size=%p tag=%02x\n", (void *)p, (void *)size, tag);
   CHECK(IsAligned(p, kShadowAlignment));
   CHECK(IsAligned(size, kShadowAlignment));
   uptr shadow_start = MemToShadow(p);
@@ -517,7 +516,7 @@ uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
     internal_memset((void *)shadow_start, tag, shadow_size);
   }
   uptr tagged = AddTagToPointer(p, tag);
-  VPrintf(1, "TagMemoryAligned: return %p\n", (void *)tagged);
+  VPrintf(2, "\t\t[HWASAN] TagMemoryAligned: return %p\n------------\n", (void *)tagged);
   return tagged;
 }
 

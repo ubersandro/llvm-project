@@ -35,7 +35,7 @@
 
 // Reasonable values are 4 (for 1/16th shadow) and 6 (for 1/64th).
 constexpr uptr kShadowScale = 0;
-constexpr uptr kShadowAlignment = 1ULL << 3; // changed because of the INSTR
+constexpr uptr kShadowAlignment = 1ULL ; // what does this do?
 
 namespace __hwasan {
 
@@ -47,17 +47,17 @@ extern uptr kHighShadowStart;
 extern uptr kHighShadowEnd;
 extern uptr kHighMemStart;
 extern uptr kHighMemEnd;
-#define TRANS_CONSTANT 0x400000000000
+#define TRANS_CONSTANT 0x400000000000ULL
 inline uptr GetShadowOffset() {
   return SANITIZER_FUCHSIA ? 0 : __hwasan_shadow_memory_dynamic_address;
 }
 inline uptr MemToShadow(uptr untagged_addr) {
   // return (untagged_addr >> kShadowScale) + GetShadowOffset(); // THIS CANNOT WORK if you use dynamically sized zones
-  return untagged_addr ^ 0x400000000000;
+  return untagged_addr ^ 0x400000000000ULL;
 }
 inline uptr ShadowToMem(uptr shadow_addr) {
   // return (shadow_addr - GetShadowOffset()) << kShadowScale;
-  return shadow_addr ^ 0x400000000000;
+  return shadow_addr ^ 0x400000000000ULL;
 }
 inline uptr MemToShadowSize(uptr size) {
   // return size >> kShadowScale; // THIS CANNOT WORK, since this function is called on kHighMemEnd

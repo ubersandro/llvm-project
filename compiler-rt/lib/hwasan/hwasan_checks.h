@@ -133,7 +133,7 @@ __attribute__((always_inline, nodebug)) static inline uptr ShortTagSize(
     return kShadowAlignment;
   if (!mem_tag || mem_tag >= kShadowAlignment)
     return 0;
-  if (*(u8 *)(ptr | (kShadowAlignment - 1)) != ptr_tag)
+  if (*(u8*)(ptr | (kShadowAlignment - 1)) != ptr_tag)
     return 0;
   return mem_tag;
 }
@@ -147,48 +147,271 @@ PossiblyShortTagMatches(tag_t mem_tag, uptr ptr, uptr sz) {
     return false;
   if ((ptr & (kShadowAlignment - 1)) + sz > mem_tag)
     return false;
-  return *(u8 *)(ptr | (kShadowAlignment - 1)) == ptr_tag;
+  return *(u8*)(ptr | (kShadowAlignment - 1)) == ptr_tag;
+}
+
+#define getT(tag) tag & 0xF
+#define getL(tag) (tag & 0x30) >> 4
+#define getR(tag) (tag & 0x80) >> 7
+
+// // __attribute__((always_inline, nodebug))
+// template <ErrorAction EA, AccessType AT>
+// static void CheckAddressSizedTyped(uptr p, uptr sz, uptr type_descriptor) {
+//   VPrintf(1, "[FieldArmor] CheckAddressSizedTyped addr=%p size=%u
+//   type_desc=%p\n",
+//           (void*)p, sz, (void*)type_descriptor);
+//   CheckAddressSized<EA, AT>(p, sz);
+// }
+
+// template <ErrorAction EA, AccessType AT>
+// __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
+//                                                                       uptr
+//                                                                       sz) {
+//   if (sz == 0 || !InTaggableRegion(p)) {
+//     VPrintf(1, "[FieldArmor] CheckAddressSized addr=%p size=%u: skipped\n",
+//             (void*)p, sz);
+//     return;
+//   }
+//   /**PROBLEMS
+//    * 0 tags must not be allowed
+//    * when size=1, undefined behavior
+//    * nested checks dont work
+//    */
+//   unsigned char* ptr_raw = (unsigned char*)(p & ~kAddressTagMask);
+//   tag_t ptr_tag = GetTagFromPointer(p);
+//   tag_t R = getR(ptr_tag);
+//   tag_t L = getL(ptr_tag);
+//   tag_t T = getT(ptr_tag);
+//   VPrintf(1, "[FieldArmor] CheckAddressSized A=%p SZ=%u R=%u L=%u T=%u\n",
+//           (void*)p, sz, R, L, T);
+//   tag_t mem_tag = *(tag_t*)MemToShadow((uptr)ptr_raw);
+//   if (mem_tag == 0) {
+//     VPrintf(1, "\033[1;33m[FieldArmor] Memory %p, skipping checks\033[0m\n",
+//             (void*)ptr_raw);
+//     return;
+//   }
+//   if (R) {
+//     VPrintf(1, "\t\t[FieldArmor] Root pointer check addr=%p sz=%u\n",
+//     (void*)p,
+//             sz);
+//     if ((L == 0) && (T == 0))
+//       return; /* pointer to outer root struct can do whatever -> CASE1*/
+
+//     unsigned int idx = 1;  // initial index is always 1 in RLT
+//     unsigned int i = 0;
+
+//     tag_t exp = T + idx;  // expected tag of the first field
+//     int inc = 0;
+
+//     tag_t* curr;  // current element memory tag
+
+//     while (i < sz) {
+//       curr = (tag_t*)MemToShadow((uptr)ptr_raw) + i;
+
+//       if ((getT(*curr)) != exp) {
+//         if (inc == 0) {
+//           idx = (idx + 1) % 16;  // TODO: also enforce this in
+//           instrumentation exp = (T + idx) % 16;  // you are in the memory of
+//           the "next" field inc = 1; continue;  // do not increment i
+
+//         } else {
+//           // we might be in the nested case
+//           if (L < getL(*curr)) {
+//             i++;  // CHECK // TODO handle nesting!!!!
+//             inc = 0;
+//             continue;
+//           }
+//           VPrintf(1, "\t\t[FieldArmor] Tag mismatch at addr=%p sz=%u\n",
+//                   (void*)p, sz);
+//           VPrintf(1, "\t\t[FieldArmor] Expected tag=%u, found tag=%u\n", exp,
+//                   getT(*curr));
+//           VPrintf(1, "\t\t[FieldArmor] DBG inc value is %u\n", inc);
+//           SigTrap<EA, AT>(p, sz);
+//           if (EA == ErrorAction::Abort)
+//             __builtin_unreachable();
+//         }
+//       }  // first tag mismatch
+
+//       else {
+//         VPrintf(2, "\t\t[FieldArmor] Tag match at addr=%p sz=%u\n",
+//                 (void*)p, sz);
+//         inc = 0;
+//         i++;
+//       }
+
+//     }  // while
+
+//   } else {
+//     /*not a root pointer -> you can only overwrite the bytes with the same
+//     tag*/ VPrintf(1, "\t[FieldArmor] Non-root pointer check addr=%p sz=%u\n",
+//             (void*)p, sz);
+//     unsigned int i = 0;
+//     tag_t* curr;
+//     while (i < sz) {
+//       curr = (tag_t*)MemToShadow((uptr)ptr_raw) + i;
+//       if (*curr != ptr_tag) {
+//         VPrintf(1, "[FieldArmor] Tag mismatch at addr=%p sz=%u\n", (void*)p,
+//                 sz);
+//         VPrintf(1, "[FieldArmor] Expected tag=%u, found tag=%u\n", ptr_tag,
+//                 *curr);
+
+//         SigTrap<EA, AT>(p, sz);
+//         if (EA == ErrorAction::Abort)
+//           __builtin_unreachable();
+//       }
+//       i++;
+//     }
+//   }
+// }
+
+template <ErrorAction EA, AccessType AT>
+__attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
+                                                                      uptr sz) {
+  if (sz == 0 || !InTaggableRegion(p)) {
+    VPrintf(1, "[FieldArmor] CheckAddressSized addr=%p size=%u: skipped\n",
+            (void*)p, sz);
+    return;
+  }
+  /**PROBLEMS
+   * 0 tags must not be allowed
+   * when size=1, undefined behavior
+   * nested checks dont work
+   */
+  unsigned char* ptr_raw = (unsigned char*)(p & ~kAddressTagMask);
+  tag_t ptr_tag = GetTagFromPointer(p);
+  tag_t R = getR(ptr_tag);
+  tag_t L = getL(ptr_tag);
+  tag_t T = getT(ptr_tag);
+  VPrintf(1, "[FieldArmor] CheckAddressSized A=%p SZ=%u R=%u L=%u T=%u\n",
+          (void*)p, sz, R, L, T);
+  tag_t mem_tag = *(tag_t*)MemToShadow((uptr)ptr_raw);
+  if (mem_tag == 0) {
+    VPrintf(1, "\033[1;33m[FieldArmor] Memory %p, skipping checks\033[0m\n",
+            (void*)ptr_raw);
+    return;
+  }
+  if (R) {
+    VPrintf(1, "\t\t[FieldArmor] Root pointer check addr=%p sz=%u\n", (void*)p,
+            sz);
+    if ((L == 0) && (T == 0))
+      return; /* pointer to outer root struct can do whatever -> CASE1*/
+
+    unsigned int idx = 1;  // initial index is always 1 in RLT
+    unsigned int i = 0;
+    unsigned int tries = 0;
+    unsigned const int THRESHOLD = 16;  // we assume a struct has no more than
+                                        // 16 fields for now // TODO Review
+
+    /** The following can happen here:
+     * 1. linear write of the whole struct (like a memset)
+     * 2. random access to a field (of whatever size)
+     * 3. security hole: overflows are possible at levels lower than L
+     * In case 1, checks are sequential and easy to implement.
+     * In case 2, increments to the expected tag are needed to figure out
+     * whether this pointer can write to the targeted location or not.
+     */
+    tag_t exp = T + idx;  // expected tag of the first field
+    int inc = 0;
+
+    tag_t* curr;
+    tag_t prevT;  // current element memory tag
+    while (i < sz) {
+      curr = (tag_t*)MemToShadow((uptr)ptr_raw) + i;
+
+      if ((getT(*curr)) == exp) {
+        VPrintf(2, "\t\t[FieldArmor] Tag match at addr=%p sz=%u, exp=%u\n",
+                (void*)(p + i), 1, exp);
+        i++;
+        prevT = getT(*curr);
+        if (inc == 1) {
+          inc = 0;
+
+          VPrintf(
+              2, "\t\t[FieldArmor] Clearing INC flag, expecting field idx %u\n",
+              idx);
+        }
+        continue;
+      } else {
+        // if IDX is 1 we are looking for the first field. If INC is one, this
+        // is for sure a random access.
+        if (idx == 1 && inc == 1)
+          VPrintf(1,
+                  "\033[1;31m[FieldArmor] random access detected. This case "
+                  "should be handled in instrumentation untagging "
+                  "pointer?.\033[0m");
+        else {
+          if (inc == 1) {
+            tries++;
+            if (tries > THRESHOLD || (prevT + 1) % 16 != (getT(*curr))) {
+              /** OVERFLOW DETECTED only if level mismatch**/
+              if (getL(*curr) <= L) {  // NOTE: This is an ugly approximation
+                VPrintf(0, "OVERFLOW, exp=%x, idx=%u curr=%u cur L=%u, tag L=%u\n", exp, idx,
+                        *curr, getL(*curr), L);
+                SigTrap<EA, AT>(p, sz);
+                if (EA == ErrorAction::Abort)
+                  __builtin_unreachable();
+              } else { // L , curL
+                VPrintf(2,
+                        "\t\t[FieldArmor] cur L %u is MORE than L %u, "
+                        "continuing\n",
+                        getL(*curr), L);
+                        // THIS CASE MUST BE FIXED -> IDEAL FIX: apply masking
+                        // fix1: instrument memset, split into many memset
+                        // problem: custom memset
+              }
+            }
+          }
+
+          idx = (idx + 1) % 16;  // TODO: also enforce this in instrumentation
+          inc = 1;
+          exp = (T + idx) % 16;
+          VPrintf(2,
+                  "\t\t[FieldArmor] Advancing to next field, idx=%u curr=%u, "
+                  "former exp=%u, tries=%d\n",
+                  idx, *curr, exp, tries);
+
+        }  // idx != 1 || inc = 0
+
+      }  // tag mismatch
+    }
+  } else {
+    /*not a root pointer -> you can only overwrite the bytes with the same
+     * tag*/
+    VPrintf(1, "\t[FieldArmor] Non-root pointer check addr=%p sz=%u\n",
+            (void*)p, sz);
+    unsigned int i = 0;
+    tag_t* curr;
+    while (i < sz) {
+      curr = (tag_t*)MemToShadow((uptr)ptr_raw) + i;
+      if (*curr != ptr_tag) {
+        VPrintf(1, "[FieldArmor] Tag mismatch at addr=%p sz=%u\n", (void*)p,
+                sz);
+        VPrintf(1, "[FieldArmor] Expected tag=%u, found tag=%u\n", ptr_tag,
+                *curr);
+
+        SigTrap<EA, AT>(p, sz);
+        if (EA == ErrorAction::Abort)
+          __builtin_unreachable();
+      }
+      i++;
+    }
+  }
 }
 
 template <ErrorAction EA, AccessType AT, unsigned LogSize>
 __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   if (!InTaggableRegion(p))
     return;
-  VPrintf(1, "[HWASAN] CheckAddress addr=%p size=%u\n", (void *)p, 1 << LogSize);
-  uptr ptr_raw = p & ~kAddressTagMask;
-  tag_t mem_tag = *(tag_t *)MemToShadow(ptr_raw);
-  if (UNLIKELY(!PossiblyShortTagMatches(mem_tag, p, 1 << LogSize))) {
-    SigTrap<EA, AT, LogSize>(p);
-    if (EA == ErrorAction::Abort)
-      __builtin_unreachable();
-  }
-}
-
-template <ErrorAction EA, AccessType AT>
-__attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
-                                                                      uptr sz) {
-  if (sz == 0 || !InTaggableRegion(p))
-    return;
-  VPrintf(1, "[HWASAN] CheckAddressSized addr=%p size=%u\n", (void *)p, sz);
-  tag_t ptr_tag = GetTagFromPointer(p);
-  uptr ptr_raw = p & ~kAddressTagMask;
-  tag_t *shadow_first = (tag_t *)MemToShadow(ptr_raw);
-  tag_t *shadow_last = (tag_t *)MemToShadow(ptr_raw + sz);
-  for (tag_t *t = shadow_first; t < shadow_last; ++t)
-    if (UNLIKELY(ptr_tag != *t)) {
-      SigTrap<EA, AT>(p, sz);
-      if (EA == ErrorAction::Abort)
-        __builtin_unreachable();
-    }
-  uptr end = p + sz;
-  uptr tail_sz = end & (kShadowAlignment - 1);
-  if (UNLIKELY(tail_sz != 0 &&
-               !PossiblyShortTagMatches(
-                   *shadow_last, end & ~(kShadowAlignment - 1), tail_sz))) {
-    SigTrap<EA, AT>(p, sz);
-    if (EA == ErrorAction::Abort)
-      __builtin_unreachable();
-  }
+  VPrintf(1, "[FieldArmor] CheckAddress addr=%p size=%u\n", (void*)p,
+          1 << LogSize);
+  // uptr ptr_raw = p & ~kAddressTagMask;
+  // tag_t mem_tag = *(tag_t*)MemToShadow(ptr_raw);
+  // if (UNLIKELY(!PossiblyShortTagMatches(mem_tag, p, 1 << LogSize))) {
+  //   SigTrap<EA, AT, LogSize>(p);
+  //   if (EA == ErrorAction::Abort)
+  //     __builtin_unreachable();
+  // }
+  CheckAddressSized<EA, AT>(p, 1 << LogSize);  // ALE: this is horrible
 }
 
 }  // end namespace __hwasan

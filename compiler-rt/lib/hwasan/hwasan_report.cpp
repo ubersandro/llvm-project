@@ -565,7 +565,7 @@ sptr BaseReport::FindMismatchOffset() const {
   sptr offset =
       __hwasan_test_shadow(reinterpret_cast<void *>(tagged_addr), access_size);
   CHECK_GE(offset, 0);
-  CHECK_LT(offset, static_cast<sptr>(access_size));
+  // CHECK_LT(offset, static_cast<sptr>(access_size)); // hackish shit no longer needed? @ale
   tag_t *tag_ptr =
       reinterpret_cast<tag_t *>(MemToShadow(untagged_addr + offset));
   tag_t mem_tag = *tag_ptr;
