@@ -230,7 +230,7 @@ static cl::opt<RecordStackHistoryMode> ClRecordStackHistory(
                                 "storing into the stack ring buffer directly"),
                clEnumVal(libcall, "Add a call to __hwasan_add_frame_record for "
                                   "storing into the stack ring buffer")),
-    cl::Hidden, cl::init(instr));
+    cl::Hidden, cl::init(none)); // fuck this
 
 static cl::opt<bool>
     ClInstrumentMemIntrinsics("hwasan-instrument-mem-intrinsics",
@@ -308,7 +308,7 @@ public:
     this->Rng = ClRandomKeepRate.getNumOccurrences() ? M.createRNG(DEBUG_TYPE)
                                                      : nullptr;
 
-    initializeModule();
+    initializeModule(); // globals are initialized in here at some point.
   }
 
   void sanitizeFunction(Function &F, FunctionAnalysisManager &FAM);
@@ -323,8 +323,9 @@ private:
   };
   // FieldArmor
   // SetVector<GetElementPtrInst *> GEPsToInstrument; // TODO handle ConstGEPs?
-  void InstrumentGEP(GetElementPtrInst *GEPI);    // TODO
-  Value *isMemoryTagged(GetElementPtrInst *GEPI); // TODO
+  void InstrumentGEP(GetElementPtrInst *GEPI);
+  void InstrumentConstGEP(ConstantExpr *GEPI, Type *Ty);
+
   Value *getAllocaTagRootPtr(IRBuilder<> &IRB, Value *StackTag,
                              unsigned AllocaNo); // TODO
   void
@@ -341,6 +342,11 @@ private:
   void initializeCallbacks(Module &M);
 
   Value *getOpaqueNoopCast(IRBuilder<> &IRB, Value *Val);
+  void createRuntimeTaggingFunction(); // FieldArmor
+  Function *RuntimeTagging;            // FieldArmor
+
+  void computeRLT(StructType *t, uint8_t *output); // FieldArmor
+  void createTagVectors();                         // FieldArmor
 
   Value *getDynamicShadowIfunc(IRBuilder<> &IRB);
   Value *getShadowNonTls(IRBuilder<> &IRB);
@@ -391,9 +397,8 @@ private:
 
   void emitPrologue(IRBuilder<> &IRB, bool WithFrameRecord);
 
-  void instrumentGlobal(GlobalVariable *GV, uint8_t Tag);
-  void instrumentGlobalAggregate(GlobalVariable *GV, uint8_t Tag,
-                                 const DataLayout &DL);
+  void instrumentGlobal(GlobalVariable *GV);
+
   void instrumentGlobals();
 
   Value *getCachedFP(IRBuilder<> &IRB);
@@ -548,6 +553,9 @@ void HWAddressSanitizerPass::printPipeline(
   OS << '>';
 }
 
+/** Create constructor functions, and then hook them up appending their
+ * reference to a global ctor list. Create globals metadata for runtime tagging.
+ */
 void HWAddressSanitizer::createHwasanCtorComdat() {
   std::tie(HwasanCtorFunction, std::ignore) =
       getOrCreateSanitizerCtorAndInitFunctions(
@@ -594,6 +602,8 @@ void HWAddressSanitizer::createHwasanCtorComdat() {
   // object file with non-instrumented globals is selected. The note is harmless
   // if the runtime doesn't support it, since it will just be ignored.
   Comdat *NoteComdat = M.getOrInsertComdat(kHwasanModuleCtorName);
+  // COMDAT -> way of representing something that should be included/discarded
+  // as a unit
 
   Type *Int8Arr0Ty = ArrayType::get(Int8Ty, 0);
   auto *Start =
@@ -649,7 +659,7 @@ void HWAddressSanitizer::createHwasanCtorComdat() {
 ///
 /// inserts a call to __hwasan_init to the module's constructor list.
 void HWAddressSanitizer::initializeModule() {
-  LLVM_DEBUG(dbgs() << "Init " << M.getName() << "\n");
+  // LLVM_DEBUG(dbgs() << "Init " << M.getName() << "\n");
   TargetTriple = M.getTargetTriple();
 
   // HWASan may do short granule checks on function arguments read from the
@@ -667,16 +677,6 @@ void HWAddressSanitizer::initializeModule() {
   DetectUseAfterScope = shouldDetectUseAfterScope(TargetTriple);
   PointerTagShift = IsX86_64 ? 57 : 56;
   TagMaskByte = IsX86_64 ? 0x3F : 0xFF;
-  errs() << "[+++] Summary of the initialization of HWAddressSanitizer\n";
-  errs() << "TargetTriple: " << TargetTriple.str() << "\n";
-  errs() << "IsX86_64: " << IsX86_64 << "\n";
-  errs() << "UsePageAliases: " << UsePageAliases << "\n";
-  errs() << "InstrumentWithCalls: " << InstrumentWithCalls << "\n";
-  errs() << "InstrumentStack: " << InstrumentStack << "\n";
-  errs() << "DetectUseAfterScope: " << DetectUseAfterScope << "\n";
-  errs() << "PointerTagShift: " << PointerTagShift << "\n";
-  errs() << "TagMaskByte: " << (unsigned)TagMaskByte << "\n";
-  errs() << "______________________________________________________\n";
 
   Mapping.init(TargetTriple, InstrumentWithCalls, CompileKernel);
 
@@ -719,9 +719,11 @@ void HWAddressSanitizer::initializeModule() {
   if (!CompileKernel) {
     createHwasanCtorComdat(); // creates the routine ctor with a call into the
                               // runtime function __hwasan_init
-
+    createTagVectors(); // THIS MUST BE DONE BEFORE GLOBALS CAN EVEN REFER TO
+                        // IT?
     if (InstrumentGlobals)
-      instrumentGlobals(); // sets up global instrumentation
+      instrumentGlobals(); // sets up global instrumentation -> TODO THIS MUST
+                           // GO
 
     bool InstrumentPersonalityFunctions =
         optOr(ClInstrumentPersonalityFunctions, NewRuntime);
@@ -739,6 +741,7 @@ void HWAddressSanitizer::initializeModule() {
       return GV;
     });
   }
+  createRuntimeTaggingFunction(); // TODO REENABLE
 }
 
 void HWAddressSanitizer::initializeCallbacks(Module &M) {
@@ -1244,7 +1247,7 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
       Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
     IRB.CreateCall(HwasanMemoryAccessCallbackSized[O.IsWrite], Args);
   }
-  untagPointerOperand(O.getInsn(), Addr);
+  untagPointerOperand(O.getInsn(), Addr); // TODO: check on this
 
   return true;
 }
@@ -1280,7 +1283,7 @@ void debugAggregateVisit(Type *sonType, uint8_t currNestingLevel,
 void HWAddressSanitizer::ApplyRLT(IRBuilder<> &IRB, Instruction *AI,
                                   Type *rootType, Value *Tag,
                                   const DataLayout &DL) {
-
+  LLVM_DEBUG(dbgs() << " [FieldArmor] RLT on type: " << *rootType << "\n");
   assert(rootType->isAggregateType() && !rootType->isArrayTy() &&
          "RLT can be applied only to non-array aggregate types");
 
@@ -1304,7 +1307,8 @@ void HWAddressSanitizer::ApplyRLT(IRBuilder<> &IRB, Instruction *AI,
                                        rootTypeMemberOffsets[sonIdx - 1]));
     sonIdx++;
   } // init for
-
+  // NOTE: given one offset, this returns the index of the struct containing
+  // that offset 	-> getElementContainingOffset TODO: use
   while (!AggQueue.empty()) {
 
     /**
@@ -1385,6 +1389,7 @@ void HWAddressSanitizer::ApplyRLT(IRBuilder<> &IRB, Instruction *AI,
                IntptrTy, typeDescriptor
                              ? typeDescriptor->getLine()
                              : 0)}); // NOTE: this is a bogus parameter for now
+                                     // TODO: remove, this is not necessary
       LLVM_DEBUG(dbgs() << " [++] TAG MEM @ offset " << sonOffset << " -> 0x"
                         << utohexstr((unsigned)sonTag) << "\n");
     } // else ->visit memory location
@@ -1440,15 +1445,8 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, Value *Tag,
     Size = AlignedSize;
   debugTagAlloca(AI, Size, AlignedSize, Mapping.scale(), Tag);
 
-  Tag = IRB.CreateTrunc(Tag, Int8Ty);
-  // if (InstrumentWithCalls) {
-  //   LLVM_DEBUG(dbgs() << " [++] tagAlloca: instrumenting with calls\n");
-  //   IRB.CreateCall(HwasanTagMemoryFunc,
-  //                  {IRB.CreatePointerCast(AI, PtrTy), Tag,
-  //                   ConstantInt::get(IntptrTy, AlignedSize)});
-  // } else {
+  Tag = IRB.CreateTrunc(Tag, Int8Ty); // this is used for the padding bytes
   ApplyRLT(IRB, AI, AI->getAllocatedType(), Tag, DL);
-  // } // if not instrumenting with calls
 } // tagAlloca
 
 unsigned HWAddressSanitizer::retagMask(unsigned AllocaNo) {
@@ -1680,10 +1678,17 @@ bool HWAddressSanitizer::instrumentStack(
   unsigned int I = 0;
 
   for (auto &KV : SInfo.AllocasToInstrument) {
-    errs() << "Instrumenting alloca: " << *(KV.first)
-           << "\n"; // show me the instruction
     auto N = I++;
-    auto *AI = KV.first;
+    auto *AI = KV.first; // This is the alloca instruction
+    if (AllocaInst *AIcast = dyn_cast<AllocaInst>(AI)) {
+      // gets allocated type
+      Type *allocatedType = AIcast->getAllocatedType();
+      if (!allocatedType->isStructTy()) {
+        errs() << "[FieldArmor] Skipping alloca (not struct type): " << *AIcast
+               << " type " << *allocatedType << "\n";
+        continue;
+      }
+    }
     memtag::AllocaInfo &Info = KV.second;
     IRBuilder<> IRB(AI->getNextNonDebugInstruction());
 
@@ -1850,6 +1855,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   SmallVector<MemIntrinsic *, 16> IntrinToInstrument;
   SmallVector<Instruction *, 8> LandingPadVec;
   SmallVector<GetElementPtrInst *, 40> GEPsToInstrument;
+  SmallVector<ConstantExpr *, 40> ConstGEPsToInstrument;
 
   const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
 
@@ -1864,6 +1870,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       LandingPadVec.push_back(&Inst);
 
     getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
+    // TODO: filter out interesting memory operands -> stores to non structs
+    // must not be instrumented. IF POSSIBLE, saverio.
 
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
       if (!ignoreMemIntrinsic(ORE, MI))
@@ -1872,21 +1880,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(&Inst)) {
       GEPsToInstrument.push_back(GEPI);
     }
+  }
 
-    if (auto *CB = dyn_cast<CallBase>(&Inst)) {
-
-      if (CB->getCalledFunction() &&
-          CB->getCalledFunction()->getName().contains(
-              "alloc")) { // TODO: how to distinguish libc malloc from
-                          // wrappers?
-        LLVM_DEBUG(dbgs() << " Found call to memory allocation function: "
-                          << *CB << "\n");
-      }
-    }
-
-  } // instrument stack to build lifetime info, find memset/memcpy calls, get
-    // info on how to instrument for exception handling (landing pads)
-  // Dump interesting memory operands iterating over InterestingMemoryOperand
   memtag::StackInfo &SInfo = SIB.get();
 
   initializeCallbacks(*F.getParent());
@@ -1919,7 +1914,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     const PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
     const LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
     Value *StackTag = getStackBaseTag(EntryIRB);
-    instrumentStack(SInfo, StackTag, DT, PDT, LI, F.getDataLayout());
+    // instrumentStack(SInfo, StackTag, DT, PDT, LI, F.getDataLayout()); // TODO
+    // REENABLE
   }
 
   // If we split the entry block, move any allocas that were originally in the
@@ -1940,22 +1936,22 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   LoopInfo *LI = FAM.getCachedResult<LoopAnalysis>(F);
   DomTreeUpdater DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy);
   const DataLayout &DL = F.getDataLayout();
-  for (auto &Operand : OperandsToInstrument)
-    instrumentMemAccess(Operand, DTU, LI, DL);
+  // for (auto &Operand : OperandsToInstrument)
+  //   instrumentMemAccess(Operand, DTU, LI, DL); // TODO REENABLE
   DTU.flush();
 
-  if (ClInstrumentMemIntrinsics && !IntrinToInstrument.empty()) {
-    for (auto *Inst : IntrinToInstrument)
-      instrumentMemIntrinsic(Inst);
-  }
+  // if (ClInstrumentMemIntrinsics && !IntrinToInstrument.empty()) {
+  //   for (auto *Inst : IntrinToInstrument)
+  //     instrumentMemIntrinsic(Inst); // TODO REENABLE
+  // }
 
   LLVM_DEBUG(dbgs() << " [++] FUNCTION " << F.getName()
                     << " -> Total GEPs to instrument: "
                     << GEPsToInstrument.size() << "\n");
-  for (auto &GEPI : GEPsToInstrument) {
-    InstrumentGEP(GEPI);
-    // LLVM_DEBUG(dbgs() << " Instrumented GEP: " << *GEPI << "\n");
-  }
+  // for (auto &GEPI : GEPsToInstrument) {
+  //   // InstrumentGEP(GEPI); // TODO REENABLE
+  //   // LLVM_DEBUG(dbgs() << " Instrumented GEP: " << *GEPI << "\n");
+  // }
   ShadowBase = nullptr;
   StackBaseTag = nullptr;
   CachedFP = nullptr;
@@ -2000,55 +1996,180 @@ void dumpGEPUsersWhenRetStruct(GetElementPtrInst *GEPI) {
   }
 }
 
-#include "llvm/IR/DebugInfoMetadata.h"
-#include "llvm/IR/Instructions.h"
+// #include "llvm/IR/DebugInfoMetadata.h"
+// #include "llvm/IR/Instructions.h"
 
-StringRef getStructODRIdentifier(Instruction *Instr) {
-  auto *GEP = dyn_cast<GetElementPtrInst>(Instr);
-  if (!GEP)
-    return "";
+// StringRef getStructODRIdentifier(Instruction *Instr) {
+//   auto *GEP = dyn_cast<GetElementPtrInst>(Instr);
+//   if (!GEP)
+//     return "";
 
-  Type *StructType = GEP->getSourceElementType();
-  if (!StructType->isStructTy())
-    return "";
+//   Type *StructType = GEP->getSourceElementType();
+//   if (!StructType->isStructTy())
+//     return "";
 
-  // Get debug location
-  auto DbgLoc = GEP->getDebugLoc();
-  if (!DbgLoc)
-    return "";
+//   // Get debug location
+//   auto DbgLoc = GEP->getDebugLoc();
+//   if (!DbgLoc)
+//     return "";
 
-  // Get the scope from the debug location
-  DIScope *Scope = DbgLoc->getScope();
-  if (!Scope)
-    return "";
+//   // Get the scope from the debug location
+//   DIScope *Scope = DbgLoc->getScope();
+//   if (!Scope)
+//     return "";
 
-  // Traverse to DILocalScope if possible
-  DILocalScope *LocalScope = dyn_cast<DILocalScope>(Scope);
-  if (!LocalScope)
-    return "";
+//   // Traverse to DILocalScope if possible
+//   DILocalScope *LocalScope = dyn_cast<DILocalScope>(Scope);
+//   if (!LocalScope)
+//     return "";
 
-  // Get the subprogram from the local scope
-  DISubprogram *SP = LocalScope->getSubprogram();
-  if (!SP)
-    return "";
+//   // Get the subprogram from the local scope
+//   DISubprogram *SP = LocalScope->getSubprogram();
+//   if (!SP)
+//     return "";
 
-  // Get the compile unit from the subprogram
-  DICompileUnit *CU = SP->getUnit();
-  if (!CU)
-    return "";
+//   // Get the compile unit from the subprogram
+//   DICompileUnit *CU = SP->getUnit();
+//   if (!CU)
+//     return "";
 
-  // Search compile unit's retained types
-  for (auto *Type : CU->getRetainedTypes()) {
-    if (auto *CompType = dyn_cast<DICompositeType>(Type)) {
-      if (CompType->getName() == StructType->getStructName()) {
-        if (auto *Identifier = CompType->getRawIdentifier()) {
-          return Identifier->getString();
-        }
-      }
-    }
+//   // Search compile unit's retained types
+//   for (auto *Type : CU->getRetainedTypes()) {
+//     if (auto *CompType = dyn_cast<DICompositeType>(Type)) {
+//       if (CompType->getName() == StructType->getStructName()) {
+//         if (auto *Identifier = CompType->getRawIdentifier()) {
+//           return Identifier->getString();
+//         }
+//       }
+//     }
+//   }
+
+//   return "";
+// }
+
+/** Track the origin of this value to check if it has been created/defined
+ * from a malloc-like function. I.e., if chunk is dynamically allocated. We do
+ * this checking if it is NOT coming from an alloca.*/
+// QUESTION: should I do this at LTO?
+
+// // NOTE: I must be able to track back the origin of Base.
+// // Recursively traverse back through GEPs to find the original allocation.
+// // NOTE: this only works in the current module, if var is defined
+// elsewhere, I cannot track it back.
+
+/** FOR LATER: conservatively return FALSE, assuming nothing is dyn alloc.
+ * Then, at LTO or so, figure out where the variable comes from. */
+
+// TODO get rid of this C style crap
+bool isDynamicallyAllocated(GetElementPtrInst *GEPI,
+                            Instruction **endOfTheChain) {
+  Value *Base = GEPI->getPointerOperand();
+
+  // 1. If it's a GEP *instruction*, peel nested GEPs.
+  while (auto *GEP = dyn_cast<GetElementPtrInst>(Base))
+    Base = GEP->getPointerOperand();
+
+  // 2. If it's a GEP *constant expression*, peel its pointer operand.
+  if (auto *CE = dyn_cast<ConstantExpr>(Base)) {
+    if (CE->getOpcode() == Instruction::GetElementPtr)
+      Base = CE->getOperand(0);
   }
 
-  return "";
+  // 3. Strip pointer casts and inbounds constant-offset GEPs.
+  Base =
+      Base->stripInBoundsConstantOffsets(); // or
+                                            // stripPointerCastsAndAliases()
+                                            // depending on how aggressive you
+                                            // want to be [web:58][web:61]
+
+  // 4. Now check for a global. -> this works
+  if (auto *GV = dyn_cast<GlobalVariable>(Base)) {
+    LLVM_DEBUG(dbgs() << "GEP source is a global variable: " << GV->getName()
+                      << "\n");
+    return false; // not dynamically allocated
+  }
+
+  if (isa<AllocaInst>(Base)) {
+    LLVM_DEBUG(dbgs() << " GEP SOURCE is ALLOCA: " << *Base << "\n");
+    return false; // not dynamically allocated -> when would we ever hit this
+                  // case?
+  }
+
+  else if (isa<CallInst>(Base)) {
+    CallInst *CI = cast<CallInst>(Base);
+    Function *CalledFunc = CI->getCalledFunction();
+    if (CalledFunc) {
+      StringRef FuncName = CalledFunc->getName();
+      if (FuncName.contains("malloc") || FuncName.contains("calloc") ||
+          FuncName.contains("realloc") || FuncName.contains("strdup") ||
+          FuncName.contains("memalign") || FuncName.contains("valloc") ||
+          FuncName.contains("posix_memalign")) {
+        LLVM_DEBUG(dbgs() << " GEP source comes from malloc-like function: "
+                          << FuncName << "\n");
+        *endOfTheChain = CI;
+        return true; // Found a malloc-like function
+      }
+    } else
+      return true; // TODO: review this
+
+  } else if (isa<IntToPtrInst>(Base) &&
+             Base->getName().contains("fieldarmor")) {
+    LLVM_DEBUG(dbgs() << " GEP SOURCE is an instrumented alloca: " << *Base
+                      << "\n");
+    return false; // it's an instrumented alloca
+
+  } else if (isa<LoadInst>(Base)) {
+    LLVM_DEBUG(dbgs() << " GEP SOURCE is LOAD: " << *Base << "\n");
+    // LLVM_DEBUG(
+    //     dbgs()
+    //     << " TODO: HANDLE ME AT LTO -> THIS MIGHT BE DEFINED IN ANOTHER "
+    //        "FUNCTION of the same module, or in another module?\n");
+    Value *loadOperand = cast<LoadInst>(Base)->getPointerOperand();
+    // TODO: might be that some values come from intToPtr, dont know why
+    // NOTE : if there are multiple stores, what do you do? Conservatively say
+    // it;s dyn alloc.
+
+    for (auto &U : loadOperand->uses()) {
+      if (auto *storeInst = dyn_cast<StoreInst>(U.getUser())) {
+        LLVM_DEBUG(dbgs() << " Found store op: " << *storeInst << "\n");
+        Value *whatIsStored = storeInst->getValueOperand();
+        if (isa<CallInst>(whatIsStored)) {
+
+          CallInst *CI = cast<CallInst>(whatIsStored);
+          Function *CalledFunc = CI->getCalledFunction();
+
+          if (CalledFunc) {
+            StringRef FuncName = CalledFunc->getName();
+            if (FuncName.contains("malloc") || FuncName.contains("calloc") ||
+                FuncName.contains("realloc") ||
+                FuncName.contains("alligned_alloc") ||
+                FuncName.contains("memalign") || FuncName.contains("valloc") ||
+                FuncName.contains("posix_memalign")) {
+              LLVM_DEBUG(dbgs() << " GEP source comes from malloc-like "
+                                   "function via load/store: "
+                                << FuncName << "\n");
+              *endOfTheChain = CI;
+              return true; // Found a malloc-like function
+            }
+          }
+        } else if (isa<LoadInst>(whatIsStored)) {
+          LLVM_DEBUG(dbgs() << " Things are pretty fucked up here: "
+                            << *whatIsStored << "\n");
+          return true;
+        }
+
+        return true; // TODO: review this
+      }
+    } // for uses
+
+    LLVM_DEBUG(dbgs() << " GEP SOURCE is UNKNOWN: " << *Base << "\n");
+    LLVM_DEBUG(dbgs() << " GEP TYPE is: ");
+    Base->getType()->print(dbgs());
+    LLVM_DEBUG(dbgs() << "\n");
+    return true;
+  } // if load
+
+  return true; // DEFAULT
 }
 
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
@@ -2057,16 +2178,87 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   assert(nOperands <= 3); // I expect 3 at most TODO: CHECK ON THIS
 
   /**
-   * NOTE: this does not work, assuming a dbg instruction with the type is there
-   * is not reliable.
+   * NOTE: this does not work, assuming a dbg instruction with the type is
+   * there is not reliable.
    */
 
-  // lets look the name up in the DI nodes
-
+  Instruction *endOfTheChain = nullptr;
+  // NOTE: this must be an instruction!!!!!
+  auto dynamicallyAllocated = isDynamicallyAllocated(GEPI, &endOfTheChain);
   auto fatherType = GEPI->getSourceElementType();
+
+  if (dynamicallyAllocated) {
+    LLVM_DEBUG(dbgs() << "[FieldArmor] GEPE on dynamically allocated memory ->"
+                      << *GEPI << "\n");
+    if (endOfTheChain) {
+      LLVM_DEBUG(dbgs() << "[FieldArmor] GEP CHAIN END: " << *endOfTheChain
+                        << "\n");
+      Value *size = nullptr;
+
+      if (isa<CallInst>(endOfTheChain)) {
+        CallInst *CI = cast<CallInst>(endOfTheChain);
+        Function *CalledFunc = CI->getCalledFunction();
+        if (CalledFunc) {
+          StringRef FuncName = CalledFunc->getName();
+          if (FuncName.contains("malloc")) {
+            size = CI->getArgOperand(0);
+          } else if (FuncName.contains("calloc")) {
+            // TODO: debug case of calloc
+            Value *num = CI->getArgOperand(0);
+            Value *sizePerElem = CI->getArgOperand(1);
+            IRBuilder<> IRBForSize(CI->getNextNonDebugInstruction());
+            size = IRBForSize.CreateMul(
+                num, sizePerElem); // INSERT THE REST AFTER THIS
+          } else if (FuncName.contains("realloc")) {
+            size = CI->getArgOperand(1);
+          } else if (FuncName.contains("aligned_alloc")) {
+            size = CI->getArgOperand(1);
+          } else if (FuncName.contains("posix_memalign")) {
+            size = CI->getArgOperand(2);
+          }
+        }
+        if (size == nullptr) {
+          LLVM_DEBUG(dbgs() << " [FieldArmor] Could not determine size for GEP "
+                            << *GEPI << "\n");
+          return;
+        }
+
+        IRBuilder<> IRB(endOfTheChain->getNextNonDebugInstruction());
+
+        Value *tagBuffer = M.getNamedGlobal(fatherType->getStructName().str() +
+                                            ".fieldarmor.tagvec");
+
+        if (!tagBuffer) {
+          LLVM_DEBUG(dbgs() << " [FieldArmor] No tag buffer found for struct "
+                            << fatherType->getStructName() << "\n");
+          return;
+        }
+
+        Value *sizeCast = IRB.CreateZExtOrBitCast(size, Int64Ty);
+        Value *taggedPtr = IRB.CreateCall(RuntimeTagging,
+                                          {endOfTheChain, tagBuffer, sizeCast});
+        taggedPtr->setName("fieldarmor.malloced.taggedptr");
+
+        endOfTheChain->replaceUsesWithIf(
+            taggedPtr, [endOfTheChain, taggedPtr](const Use &U) {
+              auto *User = U.getUser();
+              return User != endOfTheChain && User != taggedPtr &&
+                     !isa<LifetimeIntrinsic>(User);
+            });
+      } // if isa<CallInst>
+      else {
+        LLVM_DEBUG(dbgs() << " [FieldArmor] No end of the chain found for GEP "
+                          << *GEPI << "\n");
+      }
+    }
+  } // if dynamically allocated
+
   if (!fatherType->isStructTy()) {
     LLVM_DEBUG(
-        dbgs() << " Skipping GEP instrumentation: source type is not struct\n");
+        dbgs()
+        << " [FieldArmor] Skipping GEP instrumentation: source type is not "
+           "struct\n"); // TODO: handle this case properly, what
+                        // happens with arrays?
     return;
   }
 
@@ -2074,10 +2266,11 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
   auto sonType = GEPI->getResultElementType();
   // IRB.SetInsertPoint(GEPI->getNextNode()); // NOTE: this does not work
-  // since after 1-2 instructions, it wont do anything, not even fail or raise
-  // an error cases a) outer root pointer accesses non aggregate b) outer root
-  // pointer accesses aggregate (struct/union) c) inner pointer accesses non
-  // aggregate d) inner pointer accesses aggregate (struct/union)
+  // since after 1-2 instructions, it wont do anything, not even fail or
+  // raise an error cases a) outer root pointer accesses non aggregate b)
+  // outer root pointer accesses aggregate (struct/union) c) inner pointer
+  // accesses non aggregate d) inner pointer accesses aggregate
+  // (struct/union)
 
   Value *resultLong = IRB.CreatePointerCast(GEPI, IntptrTy);
 
@@ -2118,13 +2311,13 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         IRB.CreateShl(mask, positions));
     rotatedMask = IRB.CreateAnd(
         rotatedMask, ConstantInt::get(IntptrTy, 0x0FLu)); // keep lower 4 bits
-    Value* expectedSonT = IRB.CreateURem(
-        IRB.CreateAdd(fatherT, sonIdx), ConstantInt::get(IntptrTy, 0x10Lu));
+    Value *expectedSonT = IRB.CreateURem(IRB.CreateAdd(fatherT, sonIdx),
+                                         ConstantInt::get(IntptrTy, 0x10Lu));
 
     Value *sonT = IRB.CreateXor(rotatedMask, expectedSonT); // DEBUG THIS
     // Value *sonT = IRB.CreateURem(IRB.CreateAdd(maskedFatherT, sonIdx),
     //                              ConstantInt::get(IntptrTy, 0x10Lu));
-    
+
     Value *sonL = IRB.CreateShl(
         IRB.CreateURem(IRB.CreateAdd(IRB.CreateLShr(fatherL, 4u),
                                      ConstantInt::get(IntptrTy, 1u)),
@@ -2157,207 +2350,47 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       });
 }
 
-void HWAddressSanitizer::instrumentGlobalAggregate(GlobalVariable *GV,
-                                                   uint8_t Tag,
-                                                   const DataLayout &DL) {
-  /** You can assume the GV is an aggregate. Apply RLT schema for the global
-   */
-  LLVM_DEBUG(dbgs() << " [++] Simulating instrumentation of global aggregate: "
-                    << GV->getName() << "\n");
-  Constant *Initializer = GV->getInitializer();
-  Type *type = Initializer->getType();
-  assert(type->isAggregateType());
-  LLVM_DEBUG(dbgs() << "\t\tGlobal is struct type ");
-  LLVM_DEBUG(type->print(dbgs()));
-  LLVM_DEBUG(dbgs() << "\n");
-  // create GlobalVar with the associated tag sequence bytes inside so that
-  // runtime can use it for tagging sequentially the allocated global method
-  // start
-  // std::deque<std::tuple<Type *, uint8_t, uint8_t, uint8_t, size_t>>
-  // AggQueue;
-
-  // Type *rootType =
-  //     GV->getInitializer()->getType(); // the type of the global variable
-  // assert(rootType->isAggregateType() &&
-  //        "Global variable must be aggregate type");
-  // assert(rootType->isSized() && "Global variable must be sized type");
-  // std::vector<uint8_t> TagsVector;
-  // auto rootTypeMemberOffsets =
-  //     DL.getStructLayout(cast<StructType>(rootType))->getMemberOffsets();
-  // uint8_t baseTag = 1;
-  // uint8_t baseLevelOfNesting = 0;
-  // uint8_t idx = 0;
-  // for (auto subtype : rootType->subtypes()) {
-  //   AggQueue.push_back(std::make_tuple(subtype, baseTag,
-  //   baseLevelOfNesting,
-  //                                      idx, rootTypeMemberOffsets[idx]));
-  //   idx++;
-  // }
-
-  // while (!AggQueue.empty()) {
-  //   auto el_pair = AggQueue.front();
-  //   AggQueue.pop_front();
-
-  //   Type *sonType = std::get<0>(el_pair); // GEP
-
-  //   // my father's tag
-  //   uint8_t baseTag = std::get<1>(el_pair); // from top-byte
-
-  //   // level of nesting wrt to the top aggregate
-  //   uint8_t currNestingLevel = std::get<2>(el_pair); // GEP
-
-  //   // index of the (sub) field in the (sub)type
-  //   uint8_t sonTypeIndex =
-  //       std::get<3>(el_pair); // GEPs provide you with this info
-
-  //   // offset of the field from the beginning of the aggregate in memory
-  //   size_t currOffset =
-  //       std::get<4>(el_pair); // current offset from the root ptr
-
-  //   if (sonType->isAggregateType() &&
-  //       !sonType->isArrayTy()) { /*either struct or union */
-  //     uint8_t typeMask = sonType->getNumContainedTypes() % 256;
-  //     uint8_t expectedTag =
-  //         baseTag + sonTypeIndex; // What it means: I expected this to be
-  //         the
-  //                                  // tag, turns out it is an aggregate ->
-  //                                  hence
-  //                                  // I'm computing tags for its subfields
-  //     auto newBaseTag = (typeMask << 1 ^ expectedTag); // DRAFT
-  //     uint8_t count = 0;
-  //     auto numElementsInSubtype = sonType->getNumContainedTypes();
-  //     // pokeIntoAggregate(sonType, currNestingLevel, expectedTag,
-  //     typeMask,
-  //     //                   newBaseTag, numElementsInSubtype);
-  //     auto memberOffsets =
-  //         DL.getStructLayout(cast<StructType>(sonType))->getMemberOffsets();
-
-  //     size_t currSubtypeOffset = 0;
-
-  //     for (Type *subtype : llvm::reverse(sonType->subtypes())) {
-  //       currSubtypeOffset =
-  //           memberOffsets[numElementsInSubtype - count - 1] + currOffset;
-  //       AggQueue.push_front(std::make_tuple(
-  //           subtype, newBaseTag, currNestingLevel + 1,
-  //           numElementsInSubtype - count - 1, currSubtypeOffset));
-  //       count++;
-  //     } // visits the elements of the sonType if this is an aggregate and
-  //       // establishes tags
-  //   } else {
-
-  //     uint8_t newTag = baseTag + sonTypeIndex;
-  //     LLVM_DEBUG(dbgs() << "\t\t At offset: " << currOffset
-  //                       << " of global, setting tag: " << unsigned(newTag)
-  //                       << " for type: ");
-  //     LLVM_DEBUG(sonType->print(dbgs()));
-  //     LLVM_DEBUG(dbgs() << "\n");
-  //     // push in the tagsVector as many bytes equal to tag, as the size of
-  //     the
-  //     // current type in bytes
-  //     uint64_t TypeSizeInBytes = DL.getTypeAllocSize(sonType);
-  //     for (uint64_t i = 0; i < TypeSizeInBytes; i++) {
-  //       TagsVector.push_back(newTag);
-  //     }
-  //   } // done collecting tags
-
-  //     // method end
-  //     // create new global variable with a fixed size byte array inside
-  //     holding
-  //     // the tags -> constant
-  //     uint64_t TagSize =
-  //     alignTo(M.getDataLayout().getTypeAllocSize(rootType),
-  //                                Mapping.getObjectAlignment());
-
-  //     Value *Init = ConstantAggregateZero::get(ArrayType::get(Int8Ty,
-  //     TagSize));
-
-  //     for (auto tag : TagsVector) {
-  //       Init = ConstantExpr::getInsertValue(Init, ConstantInt::get(Int8Ty,
-  //       tag),
-  //                                           {0,
-  //                                           (int64_t)TagsVector.size()});
-  //     }
-
-  //     auto *NewGV = new GlobalVariable(M, Init->getType(), true,
-  //                                      GlobalValue::ExternalLinkage, Init,
-  //                                      GV->getName() + ".hwasan.tags");
-  //     NewGV->copyAttributesFrom(GV);
-  //     NewGV->setLinkage(GlobalValue::PrivateLinkage);
-  //     NewGV->copyMetadata(GV, 0);
-  //     NewGV->setAlignment(
-  //         std::max(GV->getAlign().valueOrOne(),
-  //         Mapping.getObjectAlignment()));
-
-  //     NewGV->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
-
-  //     // Descriptor format (assuming little-endian):
-  //     // bytes 0-3: relative address of global
-  //     // bytes 4-6: size of global (16MB ought to be enough for anyone, but
-  //     in
-  //     // case it isn't, we create multiple descriptors) byte 7: tag
-  //     auto *DescriptorTy = StructType::get(Int32Ty, Int32Ty);
-  //     auto SizeInBytes = TagsVector.size(); // TODO: check
-
-  //     const uint64_t MaxDescriptorSize = 0xfffff0;
-  //     for (uint64_t DescriptorPos = 0; DescriptorPos < SizeInBytes;
-  //          DescriptorPos += MaxDescriptorSize) {
-  //       auto *Descriptor = new GlobalVariable(
-  //           M, DescriptorTy, true, GlobalValue::PrivateLinkage, nullptr,
-  //           GV->getName() + ".hwasan.tags.descriptor");
-  //       auto *GVRelPtr = ConstantExpr::getTrunc(
-  //           ConstantExpr::getAdd(
-  //               ConstantExpr::getSub(
-  //                   ConstantExpr::getPtrToInt(NewGV, Int64Ty),
-  //                   ConstantExpr::getPtrToInt(Descriptor, Int64Ty)),
-  //               ConstantInt::get(Int64Ty, DescriptorPos)),
-  //           Int32Ty);
-  //       uint32_t Size =
-  //           std::min(SizeInBytes - DescriptorPos, MaxDescriptorSize);
-  //       auto *SizeAndTag =
-  //           ConstantInt::get(Int32Ty, Size | (uint32_t(Tag) << 24)); //
-  //           review this later
-  //       Descriptor->setComdat(NewGV->getComdat());
-  //       Descriptor->setInitializer(
-  //           ConstantStruct::getAnon({GVRelPtr, SizeAndTag}));
-  //       Descriptor->setSection("hwasan_globals");
-  //       Descriptor->setMetadata(LLVMContext::MD_associated,
-  //                               MDNode::get(*C,
-  //                               ValueAsMetadata::get(NewGV)));
-  //       appendToCompilerUsed(M, Descriptor);
-  //     }
-}
-
-void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV, uint8_t Tag) {
+// Filter out non aggregate globals.
+void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   assert(!UsePageAliases);
-  /** This method is called for all globals, ideally we want to filter on
-   * aggregates */
-
   Constant *Initializer = GV->getInitializer();
   Type *type = Initializer->getType();
-  LLVM_DEBUG(dbgs() << " [++] Instrumenting global: " << GV->getName() << "\n");
+  if (!type->isAggregateType() || type->isArrayTy()) {
+    LLVM_DEBUG(dbgs() << "[FieldArmor] Skipping instrumentation of global "
+                      << GV->getName() << "\n");
+    return;
+  }
+  if (type->isStructTy()) {
+    StructType *ST = dyn_cast<StructType>(type);
+    // NOW CHECK IF LITERAL
+    if (ST->isLiteral()) {
+      // USE HASHING IN THIS CASE TODO TODO TODO
 
-  if (type->isAggregateType() && !type->isArrayTy()) {
-    LLVM_DEBUG(dbgs() << "  Global is struct type ");
-    LLVM_DEBUG(type->print(dbgs()));
-    LLVM_DEBUG(dbgs() << "\n");
+      LLVM_DEBUG(
+          dbgs() << "[FieldArmor] Skipping instrumentation of literal struct "
+                 << GV->getName() << "\n");
+      return;
+    }
+    // if (ST->getName().starts_with("union")) {
+    //   LLVM_DEBUG(dbgs() << "[FieldArmor] Skipping instrumentation of union "
+    //                     << GV->getName() << "\n");
+    //   return;
+    // }
   }
 
+  uint8_t Tag = 0b10000000;
   uint64_t SizeInBytes =
       M.getDataLayout().getTypeAllocSize(Initializer->getType());
-  uint64_t NewSize = alignTo(
-      SizeInBytes,
-      Mapping.getObjectAlignment()); // this might no longer be necessary
-  if (SizeInBytes != NewSize) {
-    LLVM_DEBUG(dbgs() << "  Global size " << SizeInBytes
-                      << " is not multiple of alignment , padding with "
-                         "zeros and tag byte\n");
-    // Pad the initializer out to the next multiple of 16 bytes and add the
-    // required short granule tag.
-    std::vector<uint8_t> Init(NewSize - SizeInBytes, 0);
-    Init.back() = Tag;
-    Constant *Padding = ConstantDataArray::get(*C, Init);
-    Initializer = ConstantStruct::getAnon({Initializer, Padding});
-  }
+
+  // uint64_t NewSize = alignTo(
+  //     SizeInBytes,
+  //     Mapping.getObjectAlignment()); // this might no longer be necessary
+  // if (SizeInBytes != NewSize) {
+  //   std::vector<uint8_t> Init(NewSize - SizeInBytes, 0);
+  //   Init.back() = Tag;
+  //   Constant *Padding = ConstantDataArray::get(*C, Init);
+  //   Initializer = ConstantStruct::getAnon({Initializer, Padding});
+  // } // NOTE: do we need this?
 
   auto *NewGV = new GlobalVariable(M, Initializer->getType(), GV->isConstant(),
                                    GlobalValue::ExternalLinkage, Initializer,
@@ -2378,12 +2411,16 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV, uint8_t Tag) {
   // being incorrectly ICF'd with an uninstrumented (i.e. tag 0) global that
   // happened to have the short granule tag in the last byte.
   NewGV->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
+  // NOTE: the new global is actually the symbol that gets loaded on each use
+  // of the former global
 
-  // Descriptor format (assuming little-endian):
-  // bytes 0-3: relative address of global
-  // bytes 4-6: size of global (16MB ought to be enough for anyone, but in
-  // case it isn't, we create multiple descriptors) byte 7: tag
-  auto *DescriptorTy = StructType::get(Int32Ty, Int32Ty);
+  // NOTE: dont set tag vector here, do it once and for all in constructor and
+  // only reference it here
+
+  auto *DescriptorTy =
+      StructType::get(Int32Ty, Int32Ty, Int32Ty,
+                      Int32Ty); // addr, info, tagvec ptr, padding ->
+                                // preserve original alignment (8)
   const uint64_t MaxDescriptorSize = 0xfffff0;
   for (uint64_t DescriptorPos = 0; DescriptorPos < SizeInBytes;
        DescriptorPos += MaxDescriptorSize) {
@@ -2395,12 +2432,37 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV, uint8_t Tag) {
             ConstantExpr::getSub(
                 ConstantExpr::getPtrToInt(NewGV, Int64Ty),
                 ConstantExpr::getPtrToInt(Descriptor, Int64Ty)),
-            ConstantInt::get(Int64Ty, DescriptorPos)),
+            ConstantInt::get(
+                Int64Ty,
+                DescriptorPos)), // NOTE: when descriptor pos is 0, omitted
         Int32Ty);
+
+    // NOTE: if the struct is a literal struct, getStructName cannot be
+    // called.
+
+    auto *TagVector =
+        M.getOrInsertGlobal(type->getStructName().str() + ".fieldarmor.tagvec",
+                            ArrayType::get(Int8Ty, SizeInBytes));
+    // LLVM_DEBUG(
+    //     dbgs() << "[FieldArmor] Global struct name: " << type->isLiteral()
+    //         ? " "
+    //         : type->getStructName() << " OR " << type->getName() << "\n";);
+    // auto *TagVector =
+    //     M.getOrInsertGlobal(type->getName().str() + ".fieldarmor.tagvec",
+    //                         ArrayType::get(Int8Ty, SizeInBytes));
+    // Q: can I replace getStructName with getName? NOO
+
+    auto *TVRelPtr = ConstantExpr::getTrunc(
+        ConstantExpr::getSub(ConstantExpr::getPtrToInt(TagVector, Int64Ty),
+                             ConstantExpr::getPtrToInt(Descriptor, Int64Ty)),
+        Int32Ty);
+
     uint32_t Size = std::min(SizeInBytes - DescriptorPos, MaxDescriptorSize);
-    auto *SizeAndTag = ConstantInt::get(Int32Ty, Size | (uint32_t(Tag) << 24));
+    auto *SizeAndTag = ConstantInt::get(Int32Ty, Size);
     Descriptor->setComdat(NewGV->getComdat());
-    Descriptor->setInitializer(ConstantStruct::getAnon({GVRelPtr, SizeAndTag}));
+    Descriptor->setInitializer(
+        ConstantStruct::getAnon({GVRelPtr, SizeAndTag, TVRelPtr,
+                                 TVRelPtr})); // PADDING -> not sure about this
     Descriptor->setSection("hwasan_globals");
     Descriptor->setMetadata(LLVMContext::MD_associated,
                             MDNode::get(*C, ValueAsMetadata::get(NewGV)));
@@ -2423,17 +2485,6 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV, uint8_t Tag) {
 void HWAddressSanitizer::instrumentGlobals() {
   std::vector<GlobalVariable *> Globals;
   for (GlobalVariable &GV : M.globals()) {
-    LLVM_DEBUG(dbgs() << " -> Considering global: " << GV.getName()
-                      << " with linkage " << GV.getLinkage()
-                      << " and initializer "
-                      << (GV.hasInitializer() ? GV.getInitializer()->getName()
-                                              : "ciao")
-                      << "\n");
-    for (auto gv_user : GV.users()) {
-      LLVM_DEBUG(dbgs() << "\t   User: ");
-      LLVM_DEBUG(gv_user->print(dbgs()));
-      LLVM_DEBUG(dbgs() << "\n");
-    }
 
     if (GV.hasSanitizerMetadata() && GV.getSanitizerMetadata().NoHWAddress)
       continue;
@@ -2453,29 +2504,32 @@ void HWAddressSanitizer::instrumentGlobals() {
     if (GV.hasSection())
       continue;
     if (!GV.getInitializer()->getType()->isStructTy())
-      continue; // short circuit this -> only structs/unions
+      continue;
+    // short circuit this -> only structs/unions, not even the tag
+    // vectors created for supporting FieldArmor // DOES THIS WORK????
     Globals.push_back(&GV);
   }
-
-  MD5 Hasher;
-  Hasher.update(M.getSourceFileName());
-  MD5::MD5Result Hash;
-  Hasher.final(Hash);
-  uint8_t Tag = Hash[0];
-
-  assert(TagMaskByte >= 16);
-
+  // NOTE: I am assuming all the above checks are necessary.
   for (GlobalVariable *GV : Globals) {
-    // Don't allow globals to be tagged with something that looks like a
-    // short-granule tag, otherwise we lose inter-granule overflow
-    // detection, as the fast path shadow-vs-address check succeeds.
-    if (Tag < 16 || Tag > TagMaskByte)
-      Tag = 16;
-    // instrumentGlobal(GV, Tag++);
-    instrumentGlobalAggregate(GV, Tag++, M.getDataLayout());
+    LLVM_DEBUG(dbgs() << "[FieldArmor] GLOBAL to instrument: " << GV->getName()
+                      << "\n");
+    for (auto *U : GV->users()) {
+      if (dyn_cast<ConstantExpr>(U) &&
+          cast<ConstantExpr>(U)->getOpcode() == Instruction::GetElementPtr) {
+        LLVM_DEBUG(dbgs() << "  CONST GEP (const expr): ");
+        LLVM_DEBUG(U->print(dbgs()));
+        LLVM_DEBUG(dbgs() << "\n");
+        // InstrumentGEP(cast<GetElementPtrInst>(U)); // NOOOO
+        InstrumentConstGEP(cast<ConstantExpr>(U),
+                           GV->getInitializer()->getType());
+      }
+    }
+    instrumentGlobal(GV);
+    // Q: is it safe to query for users after replacing? NO!!!!!!
   }
 }
 
+// TODO: why do we even need this in first place?
 void HWAddressSanitizer::instrumentPersonalityFunctions() {
   // We need to untag stack frames as we unwind past them. That is the job
   // of the personality function wrapper, which either wraps an existing
@@ -2570,14 +2624,406 @@ void HWAddressSanitizer::ShadowMapping::init(Triple &TargetTriple,
         ClMappingOffsetDynamic.getPosition() > ClMappingOffset.getPosition())) {
     SetFixed(ClMappingOffset);
   }
-  errs() << "HWAddressSanitizer Shadow Mapping: "
-         << (Kind == OffsetKind::kFixed ? "fixed" : "dynamic") << " offset, "
-         << "scale " << scale() << ", " << kDefaultShadowScale << ", "
-         << (WithFrameRecord ? "with" : "without") << " frame record\n";
+  // errs() << "HWAddressSanitizer Shadow Mapping: "
+  //        << (Kind == OffsetKind::kFixed ? "fixed" : "dynamic") << " offset,
+  //        "
+  //        << "scale " << scale() << ", " << kDefaultShadowScale << ", "
+  //        << (WithFrameRecord ? "with" : "without") << " frame record\n";
 }
 
 Value *HWAddressSanitizer::getAllocaTagRootPtr(IRBuilder<> &IRB,
                                                Value *StackTag,
                                                unsigned AllocaNo) {
   return ConstantInt::get(StackTag->getType(), 0b10000000);
+}
+
+// NOTE: This could easily be a runtime function, but for now we keep it
+void HWAddressSanitizer::createRuntimeTaggingFunction() {
+  // void* __fieldarmor_runtime_tagging(void* memory_to_tag, uint8_t*
+  // tag_buffer, u_int64_t bytes_to_tag); This must take a pointer to a
+  // GlobalVariable containing the tag vector.
+
+  RuntimeTagging = Function::Create(
+      FunctionType::get(PtrTy, {PtrTy, PtrTy, Int64Ty}, false),
+      GlobalValue::InternalLinkage, "__fieldarmor_runtime_tagging", &M);
+
+  BasicBlock *BB = BasicBlock::Create(M.getContext(), "", RuntimeTagging);
+  IRBuilder<> IRB(BB);
+
+  FunctionCallee PrintfFunc = M.getOrInsertFunction(
+      "printf", FunctionType::get(Int32Ty, {PtrTy}, true));
+  Value *FormatStr =
+      IRB.CreateGlobalString("[RUNTIME_TAGGING] INPUT: %p %p %lu \n");
+  IRB.CreateCall(PrintfFunc,
+                 {FormatStr, RuntimeTagging->getArg(0),
+                  RuntimeTagging->getArg(1), RuntimeTagging->getArg(2)});
+
+  Value *MemoryToTag = RuntimeTagging->getArg(0);
+  Value *TagBuffer = RuntimeTagging->getArg(1);
+  Value *BytesToTag = RuntimeTagging->getArg(2);
+  Value *Remainder = IRB.CreateURem(BytesToTag, ConstantInt::get(Int64Ty, 8u));
+
+  // Declare loop index as a variable, not a constant, so it can be updated in
+  // the loop.
+  Value *i = IRB.CreateAlloca(Int64Ty, nullptr, "i");
+  IRB.CreateStore(ConstantInt::get(Int64Ty, 0u), i);
+
+  Value *j = IRB.CreateAlloca(Int64Ty, nullptr, "j");
+  IRB.CreateStore(ConstantInt::get(Int64Ty, 0u), j);
+
+  BasicBlock *TaggingLoop =
+      BasicBlock::Create(M.getContext(), "TaggingLoop", RuntimeTagging);
+  BasicBlock *ReturnBB =
+      BasicBlock::Create(M.getContext(), "ReturnBB", RuntimeTagging);
+  BasicBlock *RemainderTaggingBB =
+      BasicBlock::Create(M.getContext(), "RemainderTaggingBB", RuntimeTagging);
+  BasicBlock *AfterTaggingLoop =
+      BasicBlock::Create(M.getContext(), "AfterTaggingLoop", RuntimeTagging);
+
+  IRB.CreateBr(TaggingLoop);
+
+  // TaggingLoop:
+  IRB.SetInsertPoint(TaggingLoop);
+  Value *cur_i = IRB.CreateLoad(Int64Ty, i, "i.load");
+  Value *currentPtrLong =
+      IRB.CreateAdd(IRB.CreatePtrToInt(MemoryToTag, IntptrTy), cur_i);
+  Value *CurrentShadowMemoryPtr = IRB.CreateIntToPtr(
+      IRB.CreateXor(currentPtrLong,
+                    ConstantInt::get(Int64Ty, 0x400000000000ULL)),
+      PtrTy);
+
+  // Load 8 bytes from CurrTagBuffer as i64
+  Value *currTagVectorPtr = IRB.CreateGEP(Int8Ty, TagBuffer, cur_i);
+
+  Value *currTagVector8B =
+      IRB.CreateLoad(Int64Ty, currTagVectorPtr, "currTagVector8B.load");
+  IRB.CreateStore(currTagVector8B, CurrentShadowMemoryPtr);
+
+  // create DBG printfs
+  FormatStr = IRB.CreateGlobalString(
+      "[RUNTIME_TAGGING] Tagging 8 bytes at shadow addr: %p with tag vector: "
+      "0x%llx\n");
+  IRB.CreateCall(PrintfFunc,
+                 {FormatStr, CurrentShadowMemoryPtr, currTagVector8B});
+  // eof dbg printf
+
+  cur_i = IRB.CreateAdd(cur_i, ConstantInt::get(Int64Ty, 8u));
+  IRB.CreateStore(cur_i, i); // update i
+  IRB.CreateCondBr(IRB.CreateICmpUGE(cur_i, BytesToTag),
+                   /*if true*/ AfterTaggingLoop,
+                   /*if false*/ TaggingLoop);
+
+  IRB.SetInsertPoint(AfterTaggingLoop);
+  // tag the remainder if diff from 0, and ret
+  IRB.CreateCondBr(IRB.CreateICmpEQ(Remainder, ConstantInt::get(Int64Ty, 0u)),
+                   /*if true*/ ReturnBB,
+                   /*if false*/ RemainderTaggingBB);
+  IRB.SetInsertPoint(RemainderTaggingBB);
+  Value *i_last =
+      IRB.CreateSub(cur_i, ConstantInt::get(Int64Ty, 8u)); // this is fine
+
+  BasicBlock *RemainderTaggingLoop = BasicBlock::Create(
+      M.getContext(), "RemainderTaggingLoop", RuntimeTagging);
+  IRB.CreateBr(RemainderTaggingLoop);
+  IRB.SetInsertPoint(RemainderTaggingLoop);
+  // RemainderTaggingLoop:
+  Value *cur_j = IRB.CreateLoad(Int64Ty, j, "j.load");
+  Value *currentPtrLongRemainder = IRB.CreateAdd(
+      IRB.CreateAdd(IRB.CreatePtrToInt(MemoryToTag, IntptrTy), i_last), cur_j);
+
+  CurrentShadowMemoryPtr = IRB.CreateIntToPtr(
+      IRB.CreateXor(currentPtrLongRemainder,
+                    ConstantInt::get(IntptrTy, 0x400000000000ULL)),
+      PtrTy);
+  // Load 1 byte from TagBuffer as i8
+  Value *currTagBytePtr =
+      IRB.CreateGEP(Int8Ty, TagBuffer, IRB.CreateAdd(i_last, cur_j));
+  Value *currTagByte =
+      IRB.CreateLoad(Int8Ty, currTagBytePtr, "currTagByte.load");
+  IRB.CreateStore(
+      currTagByte, CurrentShadowMemoryPtr,
+      true); // TODO: impose volatility ow compiler might optimize out da shit
+
+  // create DBG printfs
+  Value *FormatStrRemainder =
+      IRB.CreateGlobalString("[RUNTIME_TAGGING] Tagging REMAINDER %d byte at "
+                             "shadow addr: %p with tag byte: "
+                             "0x%x\n");
+  IRB.CreateCall(PrintfFunc,
+                 {FormatStrRemainder, Remainder, CurrentShadowMemoryPtr,
+                  IRB.CreateZExt(currTagByte, Int64Ty)});
+  // eof dbg printf
+
+  cur_j = IRB.CreateAdd(cur_j, ConstantInt::get(Int64Ty, 1u));
+  IRB.CreateStore(cur_j, j);
+  IRB.CreateCondBr(IRB.CreateICmpUGE(cur_j, Remainder),
+                   /*if true*/ ReturnBB,
+                   /*if false*/ RemainderTaggingLoop);
+  // ReturnBB:
+  IRB.SetInsertPoint(ReturnBB);
+  Value *TaggedPtr =
+      tagPointer(IRB, RuntimeTagging->getReturnType(),
+                 IRB.CreatePtrToInt(RuntimeTagging->getArg(0), IntptrTy),
+                 ConstantInt::get(IntptrTy, 0b10000000));
+  IRB.CreateRet(TaggedPtr);
+}
+
+/**
+ * For each type emitted by the runtime, generate comdats to describe the type
+ * and provide the runtime with the relative tag vector. Runtime is going to
+ * tag the associated global with the right tag vector upon initialization.
+ */
+
+void HWAddressSanitizer::createTagVectors() {
+  /** For each identified struct type, precompute tag vector. */
+  auto identifiedStructTypes = M.getIdentifiedStructTypes();
+
+  for (auto t : identifiedStructTypes) {
+    if (t->isLiteral()) {
+      LLVM_DEBUG(dbgs() << "[FieldArmor] NO PRECOMP FOR LITERAL STRUCT: "
+                        << t->getName() << "\n");
+      continue;
+    }
+    auto size = M.getDataLayout().getTypeAllocSize(t);
+    std::string TagVecName = t->getStructName().str() + ".fieldarmor.tagvec";
+    // GlobalVariable *ExistingGV = M.getGlobalVariable(TagVecName, true); ->
+    // this was not flagging anything
+    // TODO: fix re-definition bug for this vectors
+
+    // GlobalVariable *ExistingGV = M.getOrInsertGlobal(
+    //     TagVecName, ArrayType::get(Int8Ty, size));
+    // if (ExistingGV) {
+    //   // SUPER FUCKING BROKEN  -> global lookups broken
+    //   LLVM_DEBUG(dbgs() << " Tag vector for type " << t->getName()
+    //                     << " already exists, skipping creation.\n");
+    //   continue;
+    // }
+    uint8_t *tags = new uint8_t[size];
+    computeRLT(t, tags);
+    ArrayType *TagArrayType = ArrayType::get(Int8Ty, size);
+    std::vector<llvm::Constant *> Elements(size,
+                                           llvm::ConstantInt::get(Int8Ty, 0));
+    for (int i = 0; i < size; i++) {
+      Elements[i] = llvm::ConstantInt::get(Int8Ty, tags[i]);
+    }
+    delete[] tags;
+    llvm::Constant *Init = llvm::ConstantArray::get(TagArrayType, Elements);
+    auto *NewTagVector_global =
+        new GlobalVariable(M, TagArrayType, true,
+                           GlobalVariable::PrivateLinkage, Init, TagVecName);
+    NewTagVector_global->setSection("hwanal_global"); // is this better?
+    appendToCompilerUsed(M, NewTagVector_global);
+    LLVM_DEBUG(dbgs() << " Created global variable for type tag vector: "
+                      << NewTagVector_global->getName() << "\n");
+  }
+}
+
+// TODO: check correctness here -> order is fucked for sure
+void HWAddressSanitizer::computeRLT(StructType *Ty, uint8_t *tags) {
+  /** This function implements the same algorithm as ApplyRLT for
+   * pre-computing a tag vector */
+
+  Value *PaddingTag = ConstantInt::get(Int8Ty, 0); // TODO
+  DataLayout DL = M.getDataLayout(); // What if the type is defined elsewhere?
+                                     // TODO: check on this
+
+  std::deque<std::tuple<Type *, uint8_t, uint8_t, uint8_t, size_t>> AggQueue;
+
+  auto rootTypeMemberOffsets = DL.getStructLayout(Ty)->getMemberOffsets();
+
+  uint8_t fatherT = 0;
+  uint8_t fatherL = 0;
+  uint8_t sonIdx = 1;
+
+  for (auto subtype : Ty->subtypes()) {
+    AggQueue.push_back(std::make_tuple(subtype, fatherT, fatherL, sonIdx,
+                                       rootTypeMemberOffsets[sonIdx - 1]));
+    sonIdx++;
+  }
+  while (!AggQueue.empty()) {
+
+    auto el_pair = AggQueue.front();
+    AggQueue.pop_front();
+
+    Type *sonType = std::get<0>(el_pair);
+    fatherT = std::get<1>(el_pair);
+    fatherL = std::get<2>(el_pair);
+    sonIdx = std::get<3>(el_pair);
+    size_t sonOffset = std::get<4>(el_pair);
+
+    if (sonType->isAggregateType() && !sonType->isArrayTy()) {
+      uint8_t sonT =
+          (fatherT + sonIdx) % 16; // tag of ptr to this field, expected tag
+
+      uint8_t sonMask = sonType->getNumContainedTypes() % 16u;
+      auto rotatedMask = rotateOn4bits(sonMask, sonIdx);
+      auto newBaseTag = (rotatedMask ^ sonT);
+
+      uint8_t count = 0;
+      auto sonSubfieldsCount = sonType->getNumContainedTypes();
+
+      auto sonSubfieldsOffsets =
+          DL.getStructLayout(cast<StructType>(sonType))->getMemberOffsets();
+      size_t currSonSubfieldOffset = 0;
+
+      for (Type *subtype : llvm::reverse(sonType->subtypes())) {
+        currSonSubfieldOffset =
+            sonSubfieldsOffsets[sonSubfieldsCount - count - 1] + sonOffset;
+        AggQueue.push_front(
+            std::make_tuple(subtype, newBaseTag, (fatherL + 1) % 8,
+                            sonSubfieldsCount - count, currSonSubfieldOffset));
+        count++;
+      } // visits the elements of the sonType if this is an aggregate and
+        // establishes tags
+
+    } else {
+      uint8_t sonT = (fatherT + sonIdx) % 16;
+      uint8_t sonTag = sonT | (fatherL << 4);
+
+      assert((sonT & 0x80) == 0 &&
+             "ROOT POINTER BIT must be set to 0 in memory tags");
+
+      int sonSize = DL.getTypeAllocSize(sonType);
+      for (int i = 0; i < sonSize; i++) {
+        tags[sonOffset + i] = sonTag;
+      }
+
+    } // else ->visit memory location
+  } // while agg queue not empty
+}
+
+void HWAddressSanitizer::InstrumentConstGEP(ConstantExpr *GEPI,
+                                            Type *fatherType) {
+  /** DEBUG */
+  FunctionCallee PrintfFunc = M.getOrInsertFunction(
+      "printf", FunctionType::get(Int32Ty, {PtrTy}, true));
+  /** DEBUG */
+
+  auto nOperands = GEPI->getNumOperands();
+  assert(nOperands <= 3); // I expect 3 at most TODO: CHECK ON THIS
+  Instruction *insertBefore = nullptr;
+  // IDEA: insert instrumentation before every user of the const GEP.
+  auto users = GEPI->users();
+  LLVM_DEBUG(dbgs() << " [FieldArmor] CONST GEP has " << GEPI->getNumUses()
+                    << " users\n");
+  if (!users.empty()) {
+
+    auto *one_user = *users.begin();
+    if (Instruction *one_user_inst = dyn_cast<Instruction>(one_user)) {
+      LLVM_DEBUG(dbgs() << "\tuser for CONST GEP: ");
+      LLVM_DEBUG(one_user_inst->print(dbgs()));
+      LLVM_DEBUG(dbgs() << "\n");
+
+      insertBefore = one_user_inst->getPrevNode();
+    }
+    if (!insertBefore) {
+      LLVM_DEBUG(dbgs() << "\t[FieldArmor] Skipping CONST GEP "
+                           "instrumentation: no valid user "
+                           "instruction found\n");
+      return;
+    }
+  }
+  auto *constIdx = dyn_cast<ConstantInt>(GEPI->getOperand(2));
+  if (!constIdx) {
+    LLVM_DEBUG(dbgs() << " [FieldArmor] CONST GEP index is not constant\n");
+    return;
+  }
+  uint64_t gepIdx = constIdx->getZExtValue();
+  auto sonType = fatherType->getContainedType(gepIdx);
+
+  LLVM_DEBUG(dbgs() << "[FieldArmor] CONST GEP TYPES: src: ");
+  LLVM_DEBUG(fatherType->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\n");
+  LLVM_DEBUG(dbgs() << " \t[FieldArmor] dst: ");
+  LLVM_DEBUG(sonType->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\n");
+
+  IRBuilder<> IRB(M.getContext());
+  IRB.SetInsertPoint(insertBefore);
+  Value *resultLong = IRB.CreatePointerCast(GEPI, IntptrTy);
+
+  auto sonIdx =
+      IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
+                    ConstantInt::get(IntptrTy, 0x1u)); //+1
+
+  Value *fatherTL = IRB.CreateLShr(
+      IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x7FL << 56L)),
+      PointerTagShift); // UNSET RP
+
+  Value *fatherT = IRB.CreateAnd(fatherTL, ConstantInt::get(IntptrTy, 0x0FLu));
+
+  Value *fatherL =
+      IRB.CreateAnd(fatherTL, ConstantInt::get(IntptrTy, 0x70Lu)); /*01110000*/
+  // LEVEL is aligned and ready to be applied
+  // DEBUG
+  // Value *FormatStr =
+  //     IRB.CreateGlobalString("[ConstGEPINST] FT: %08x FL: %08x\n");
+  // IRB.CreateCall(PrintfFunc,
+  //                {FormatStr, fatherT, fatherL});
+  // END DEBUG
+  Value *sonTag = nullptr;
+
+  if (!sonType->isStructTy()) {
+    Value *sonT = IRB.CreateURem(IRB.CreateAdd(fatherT, sonIdx),
+                                 ConstantInt::get(IntptrTy, 0x10Lu));
+    sonTag = IRB.CreateOr(sonT, fatherL);
+    // DEBUG
+    // Value *FormatStr2 =
+    //     IRB.CreateGlobalString("[ConstGEPINST] SON STRUCT TYPE, SON T:
+    //     %08x\n");
+    // IRB.CreateCall(PrintfFunc,
+    //                {FormatStr2, sonT});
+    // END DEBUG
+  }
+
+  else {
+    Value *mask =
+        ConstantInt::get(IntptrTy, sonType->getNumContainedTypes() % 16u);
+
+    Value *positions =
+        IRB.CreateURem(sonIdx, ConstantInt::get(IntptrTy, 0x4Lu));
+
+    Value *rotatedMask = IRB.CreateOr(
+        IRB.CreateLShr(
+            mask, IRB.CreateSub(ConstantInt::get(IntptrTy, 0x4Lu), positions)),
+        IRB.CreateShl(mask, positions));
+    rotatedMask = IRB.CreateAnd(
+        rotatedMask, ConstantInt::get(IntptrTy, 0x0FLu)); // keep lower 4 bits
+    Value *expectedSonT = IRB.CreateURem(IRB.CreateAdd(fatherT, sonIdx),
+                                         ConstantInt::get(IntptrTy, 0x10Lu));
+
+    Value *sonT = IRB.CreateXor(rotatedMask, expectedSonT); // DEBUG THIS
+    // Value *sonT = IRB.CreateURem(IRB.CreateAdd(maskedFatherT, sonIdx),
+    //                              ConstantInt::get(IntptrTy, 0x10Lu));
+
+    Value *sonL = IRB.CreateShl(
+        IRB.CreateURem(IRB.CreateAdd(IRB.CreateLShr(fatherL, 4u),
+                                     ConstantInt::get(IntptrTy, 1u)),
+                       ConstantInt::get(IntptrTy, 0x8u)),
+        4u); // level aligned and ready to be applied
+    sonTag = IRB.CreateOr(IRB.CreateOr(sonT, sonL),
+                          ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit
+  }
+
+  Value *untaggedResLong = IRB.CreateAnd(
+      resultLong, ConstantInt::get(resultLong->getType(),
+                                   ~(TagMaskByte << PointerTagShift)));
+  Value *untaggedResLongPtr = IRB.CreatePointerCast(untaggedResLong, IntptrTy);
+  Value *taggedPointer =
+      tagPointer(IRB, GEPI->getType(), untaggedResLongPtr, sonTag);
+
+  std::string Name = GEPI->hasName() ? GEPI->getName().str()
+                                     : "gep." + itostr(++instrumentedGEPs);
+  taggedPointer->setName(Name + ".fieldarmor");
+  Value *indexOfTaggedPointer = sonIdx;
+  indexOfTaggedPointer->setName(Name + ".fieldarmor.idx");
+
+  Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy); //?? TODO REMOVE
+
+  GEPI->replaceUsesWithIf(
+      taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
+        auto *User = U.getUser();
+        return User != resultLong && User != GEPICastToPtr &&
+               !isa<LifetimeIntrinsic>(User); // NOOOO
+      });
 }

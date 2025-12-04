@@ -18,6 +18,7 @@
 namespace __hwasan {
 uptr TagMemory(uptr p, uptr size, tag_t tag);
 uptr TagMemoryAligned(uptr p, uptr size, tag_t tag);
+uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector);
 
 }  // namespace __hwasan
 

@@ -494,6 +494,20 @@ void Thread::InitStackAndTls(const InitState *) {
                        &tls_end_);
 }
 
+uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector) {
+  // TODO complete
+  u_int8_t * ptr = (u_int8_t *)tag_vector;
+  uptr tagged = AddTagToPointer(p, 0b10000000);
+
+  for(int i=0; i<size; i++){
+    // inspect tag vector
+    u_int8_t tag = ptr[i];
+    VPrintf(2, "\t\t[HWASAN] TagMemory_mod: tagging %p with tag 0x%02x\n", (void *)(p + i), tag);
+    *(char *)(MemToShadow(p + i)) = tag;
+  }
+  return tagged;
+}
+
 uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
   CHECK(IsAligned(p, kShadowAlignment));
   CHECK(IsAligned(size, kShadowAlignment));

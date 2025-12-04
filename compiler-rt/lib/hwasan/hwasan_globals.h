@@ -31,12 +31,14 @@ struct hwasan_global {
   // The fully-relocated address of this global.
   uptr addr() const { return reinterpret_cast<uintptr_t>(this) + gv_relptr; }
   // The static tag of this global.
-  u8 tag() const { return info >> 24; }; // interpret this as the base tag
+  uptr tag_vector() const { return reinterpret_cast<uintptr_t>(this) + tag_vector_relptr; }; // interpret this as the base tag
 
   // The relative address between the start of the descriptor for the HWASan
   // global (in the PT_NOTE), and the fully relocated address of the global.
   s32 gv_relptr;
-  u32 info; // THIS IS WHERE THE TAG LIVES
+  u32 info;
+  u32 tag_vector_relptr; // THIS IS WHERE THE TAG LIVES
+  u32 padding; // THIS IS WHERE THE TAG LIVES -> TODO remove it later, someday, not too soon...
 };
 
 // Walk through the specific DSO (as specified by the base, phdr, and phnum),

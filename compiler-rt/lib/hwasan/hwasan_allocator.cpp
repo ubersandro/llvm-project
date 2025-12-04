@@ -292,9 +292,10 @@ static void HwasanDeallocate(StackTrace *stack, void *tagged_ptr) {
 
   if (RunFreeHooks(tagged_ptr))
     return;
+  // TODO: this is not ok
 
-  if (CheckInvalidFree(stack, untagged_ptr, tagged_ptr))
-    return;
+  // if (CheckInvalidFree(stack, untagged_ptr, tagged_ptr))
+  //   return;
 
   void *aligned_ptr = reinterpret_cast<void *>(
       RoundDownTo(reinterpret_cast<uptr>(untagged_ptr), kShadowAlignment));

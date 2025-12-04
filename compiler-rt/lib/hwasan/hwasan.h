@@ -23,9 +23,9 @@
 #include "sanitizer_common/sanitizer_stacktrace.h"
 #include "ubsan/ubsan_platform.h"
 
-#ifndef HWASAN_CONTAINS_UBSAN
-# define HWASAN_CONTAINS_UBSAN CAN_SANITIZE_UB
-#endif
+// #ifndef HWASAN_CONTAINS_UBSAN
+// # define HWASAN_CONTAINS_UBSAN CAN_SANITIZE_UB
+// #endif
 
 #ifndef HWASAN_WITH_INTERCEPTORS
 #define HWASAN_WITH_INTERCEPTORS 0
