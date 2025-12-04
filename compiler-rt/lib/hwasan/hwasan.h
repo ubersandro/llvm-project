@@ -23,6 +23,11 @@
 #include "sanitizer_common/sanitizer_stacktrace.h"
 #include "ubsan/ubsan_platform.h"
 
+#ifdef CAN_SANITIZE_LEAKS
+#undef CAN_SANITIZE_LEAKS
+#define CAN_SANITIZE_LEAKS 0
+#endif
+
 // #ifndef HWASAN_CONTAINS_UBSAN
 // # define HWASAN_CONTAINS_UBSAN CAN_SANITIZE_UB
 // #endif
