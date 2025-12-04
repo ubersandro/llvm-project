@@ -334,7 +334,7 @@ private:
       const TargetLibraryInfo &TLI,
       SmallVectorImpl<InterestingMemoryOperand> &Interesting);
 
-  void tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, Value *Tag, size_t Size,
+  void tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, Value *Tag,
                  const DataLayout &DL);
   Value *tagPointer(IRBuilder<> &IRB, Type *Ty, Value *PtrLong, Value *Tag);
   Value *untagPointer(IRBuilder<> &IRB, Value *PtrLong);
@@ -343,14 +343,13 @@ private:
                        const DataLayout &DL);
   bool instrumentLandingPads(SmallVectorImpl<Instruction *> &RetVec);
   Value *getNextTagWithCall(IRBuilder<> &IRB); // not sure I still need this
-  Value *getStackBaseTag(IRBuilder<> &IRB);
-  Value *getAllocaTag(IRBuilder<> &IRB, Value *StackTag, unsigned AllocaNo);
 
   Value *getHwasanThreadSlotPtr(IRBuilder<> &IRB);
   Value *applyTagMask(IRBuilder<> &IRB, Value *OldTag);
   unsigned retagMask(unsigned AllocaNo);
 
-  // void emitPrologue(IRBuilder<> &IRB, bool WithFrameRecord); // TODO: do I still need this?
+  // void emitPrologue(IRBuilder<> &IRB, bool WithFrameRecord); // TODO: do I
+  // still need this?
 
   void instrumentGlobal(GlobalVariable *GV);
 
@@ -659,11 +658,13 @@ void HWAddressSanitizer::initializeModule() {
   if (!CompileKernel) {
     createHwasanCtorComdat(); // creates the routine ctor with a call into the
                               // runtime function __hwasan_init
-    createTagVectors(); // THIS MUST BE DONE BEFORE GLOBALS CAN EVEN REFER TO
-                        // IT?
-    if (InstrumentGlobals)
-      instrumentGlobals(); // sets up global instrumentation -> TODO THIS MUST
-                           // GO
+    // TODO bring this back at some point
+    // createTagVectors(); // THIS MUST BE DONE BEFORE GLOBALS CAN EVEN REFER TO
+    // IT?
+    // if (InstrumentGlobals)
+    //   instrumentGlobals(); // sets up global instrumentation -> TODO THIS
+    //   MUST
+    //                        // GO
 
     bool InstrumentPersonalityFunctions =
         optOr(ClInstrumentPersonalityFunctions, NewRuntime);
@@ -681,7 +682,7 @@ void HWAddressSanitizer::initializeModule() {
       return GV;
     });
   }
-  createRuntimeTaggingFunction(); // TODO REENABLE
+  // createRuntimeTaggingFunction(); // TODO REENABLE
 }
 
 void HWAddressSanitizer::initializeCallbacks(Module &M) {
@@ -1375,14 +1376,11 @@ void pokeIntoAggregate(Type *sonType, unsigned currNestingLevel,
 }
 
 void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, Value *Tag,
-                                   size_t Size, const DataLayout &DL) {
-  size_t AlignedSize = alignTo(Size, Mapping.getObjectAlignment());
+                                   const DataLayout &DL) {
+  // debugTagAlloca(AI, Size, AlignedSize, Mapping.scale(), Tag);
 
-  Size = AlignedSize;
-  debugTagAlloca(AI, Size, AlignedSize, Mapping.scale(), Tag);
-
-  Tag = IRB.CreateTrunc(Tag, Int8Ty); // this is used for the padding bytes
-  ApplyRLT(IRB, AI, AI->getAllocatedType(), Tag, DL);
+  Tag = IRB.CreateTrunc(Tag, Int8Ty); // TODO: use for padding
+  ApplyRLT(IRB, AI, AI->getAllocatedType(), Tag, DL); // NOTE: this is tricky and pretty broken -> BUG on rotate on 4 bits
 } // tagAlloca
 
 unsigned HWAddressSanitizer::retagMask(unsigned AllocaNo) {
@@ -1415,30 +1413,6 @@ Value *HWAddressSanitizer::applyTagMask(IRBuilder<> &IRB, Value *OldTag) {
 
 Value *HWAddressSanitizer::getNextTagWithCall(IRBuilder<> &IRB) {
   return IRB.CreateZExt(IRB.CreateCall(HwasanGenerateTagFunc), IntptrTy);
-}
-
-Value *HWAddressSanitizer::getStackBaseTag(IRBuilder<> &IRB) {
-  if (ClGenerateTagsWithCalls)
-    return nullptr;
-  if (StackBaseTag)
-    return StackBaseTag;
-  // Extract some entropy from the stack pointer for the tags.
-  // Take bits 20..28 (ASLR entropy) and xor with bits 0..8 (these differ
-  // between functions).
-  Value *FramePointerLong = getCachedFP(IRB);
-  Value *StackTag =
-      applyTagMask(IRB, IRB.CreateXor(FramePointerLong,
-                                      IRB.CreateLShr(FramePointerLong, 20)));
-  StackTag->setName("hwasan.stack.base.tag");
-  return StackTag;
-}
-
-Value *HWAddressSanitizer::getAllocaTag(IRBuilder<> &IRB, Value *StackTag,
-                                        unsigned AllocaNo) {
-  if (ClGenerateTagsWithCalls)
-    return getNextTagWithCall(IRB);
-  return IRB.CreateXor(
-      StackTag, ConstantInt::get(StackTag->getType(), retagMask(AllocaNo)));
 }
 
 // Add a tag to an address.
@@ -1656,7 +1630,7 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     llvm::for_each(Info.LifetimeStart, HandleLifetime);
     llvm::for_each(Info.LifetimeEnd, HandleLifetime);
     tagAlloca(
-        IRB, AI, Tag, Size,
+        IRB, AI, Tag,
         DL); // TODO: should this take into consideration the aligned size?
     memtag::alignAndPadAlloca(Info, Mapping.getObjectAlignment());
 
@@ -1801,7 +1775,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     const PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
     const LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
 
-    instrumentStack(SInfo, DT, PDT, LI, F.getDataLayout());
+    // instrumentStack(SInfo, DT, PDT, LI, F.getDataLayout()); // TODO REENABLE
   }
 
   // If we split the entry block, move any allocas that were originally in the
@@ -2854,4 +2828,4 @@ void HWAddressSanitizer::InstrumentConstGEP(ConstantExpr *GEPI,
         return User != resultLong && User != GEPICastToPtr &&
                !isa<LifetimeIntrinsic>(User); // NOOOO
       });
-}// instrumentConstGEP
+} // instrumentConstGEP

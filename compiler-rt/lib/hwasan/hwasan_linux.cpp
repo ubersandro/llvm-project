@@ -500,9 +500,8 @@ uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector) {
   uptr tagged = AddTagToPointer(p, 0b10000000);
 
   for(uptr i=0; i<size; i++){
-    // inspect tag vector
     u_int8_t tag = ptr[i];
-    VPrintf(2, "\t\t[HWASAN] TagMemory_mod: tagging %p with tag 0x%02x\n", (void *)(p + i), tag);
+    VPrintf(2, "\t\t[HWASAN] TagMemory_mod: A: %p shadow[A]  -> T: 0x%02x\n", (void *)(p + i), tag);
     *(char *)(MemToShadow(p + i)) = tag;
   }
   return tagged;
