@@ -270,6 +270,20 @@ Thread* GetCurrentThread() {
   return hwasanThreadList().GetThreadByBufferAddress((uptr)R->Next());
 }
 
+// TODO: consider refactoring
+uptr fieldarmor_tag_memory(void *ptr, uptr tags, uptr size) {
+  // TODO: make sure pointer is untagged
+  if(!tags){
+    // untag memory, i.e. tag it with 0s
+    VPrintf(2, "[FieldArmor] untagging memory %p of size %zu\n", ptr, size);
+    return TagMemory_mod((uptr)ptr, size, 0); // TODO
+    // return (uptr) UntagPtr(ptr);
+  }
+  ptr = UntagPtr(ptr);
+
+  return TagMemory_mod((uptr)ptr, size, tags);
+}
+
 }  // namespace __hwasan
 
 using namespace __hwasan;
@@ -287,6 +301,7 @@ void __sanitizer::BufferedStackTrace::UnwindImpl(uptr pc, uptr bp,
   Unwind(max_depth, pc, bp, context, t->stack_top(), t->stack_bottom(),
          request_fast);
 }
+
 
 static bool InitializeSingleGlobal(const hwasan_global& global) {
   VPrintf(1, "[FieldArmor] GLOBAL INIT %p size %zu \n",

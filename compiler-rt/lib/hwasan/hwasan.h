@@ -141,6 +141,10 @@ int hwasan_posix_memalign(void **memptr, uptr alignment, uptr size,
                         StackTrace *stack);
 void hwasan_free(void *ptr, StackTrace *stack);
 
+// fieldarmor functions
+uptr fieldarmor_tag_memory(void *ptr, uptr tags, uptr size);
+// EOF fieldarmor functions
+
 void InstallAtExitHandler();
 
 #define GET_MALLOC_STACK_TRACE                                            \
