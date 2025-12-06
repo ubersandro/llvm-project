@@ -197,6 +197,7 @@ STATISTIC(NumLiteralStructs, "Number of literal structs encountered");
 STATISTIC(NumInstrumentedGEPs, "Number of instrumented GEP instructions");
 STATISTIC(NumInstrumentedGlobals, "Number of instrumented global variables");
 STATISTIC(NumDefinedTagVectors, "Number of defined tag vectors");
+STATISTIC(NumProtectedUnions, "Number of protected unions");
 
 // Mode for selecting how to insert frame record info into the stack ring
 // buffer.
@@ -2328,10 +2329,26 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
                       << t->getName() << "\n");
     return;
   }
-
   auto size = M.getDataLayout().getTypeAllocSize(t);
-  // Q: should I use the name?
-  uint8_t *tags = computeTags(t);
+
+  bool isUnion = t->getName().str().find("union.") != std::string::npos;
+  u_int8_t *tags = nullptr;
+  if (isUnion) {
+    // create constant tag vector with all 1s
+    LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Tagging union with "
+                         "constant tag. Type ");
+    LLVM_DEBUG(t->print(dbgs()));
+    LLVM_DEBUG(dbgs() << "\n");
+    tags = new uint8_t[size]; // TODO: get rid of this, maybe causing OOM
+    memset(tags, 0x1, size);
+    NumProtectedUnions++;
+  } // if isUnion
+  else {
+    LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Its not a union: "
+                      << t->getName() << "\n");
+    tags = computeTags(t);
+  }
+
   ArrayType *TagArrayType = ArrayType::get(Int8Ty, size);
   std::vector<llvm::Constant *> Elements(size,
                                          llvm::ConstantInt::get(Int8Ty, 0));
@@ -2419,13 +2436,36 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
     size_t sonOffset = std::get<4>(el_pair);
 
     if (sonType->isStructTy()) {
-      uint8_t sonT =
-          (fatherT + sonIdx) % 16; // tag of ptr to this field, expected tag
+      auto structTy = cast<StructType>(sonType);
+      if (structTy->isLiteral()) {
+        // NOTE: getName fires an assertion on literal structs
+        // NOTE: many std c++ types are implemented as literal structs
+        LLVM_DEBUG(
+            dbgs()
+            << " [FieldArmor - ComputeTags] NO PRECOMP FOR LITERAL STRUCT: ");
+        LLVM_DEBUG(sonType->print(dbgs()));
+        LLVM_DEBUG(dbgs() << "\n");
+        ++NumLiteralStructs;
+        // continue;
+      } else {
+        bool nestedUnion =
+            structTy->getStructName().str().find("union.") != std::string::npos;
+        if (nestedUnion) {
+          LLVM_DEBUG(dbgs()
+                     << " [FieldArmor - ComputeTags] Identified nested union "
+                        "struct tagging. Type ");
+          LLVM_DEBUG(sonType->print(dbgs()));
+          LLVM_DEBUG(dbgs() << "\n");
+        }
+      }
 
-      uint8_t sonMask = sonType->getNumContainedTypes() % 16u;
-      auto rotatedMask = rotateOn4bits(sonMask, sonIdx);
-      auto newBaseTag = (rotatedMask ^ sonT);
+      // uint8_t sonT =
+      //     (fatherT + sonIdx) % 16; // tag of ptr to this field, expected tag
+      // uint8_t sonMask = sonType->getNumContainedTypes() % 16u;
+      // auto rotatedMask = rotateOn4bits(sonMask, sonIdx);
+      // auto newBaseTag = (rotatedMask ^ sonT);
 
+      u_int8_t newBaseTag = 0; // FLAT scheme introduced here
       uint8_t count = 0;
       auto sonSubfieldsCount = sonType->getNumContainedTypes();
 

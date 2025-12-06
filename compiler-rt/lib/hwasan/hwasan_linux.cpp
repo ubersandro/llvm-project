@@ -502,7 +502,7 @@ uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector) {
 
   for(uptr i=0; i<size; i++){
     u_int8_t tag = ptr ? ptr[i] : 0; // TODO this sucks
-    VPrintf(2, "\t\t[HWASAN] TagMemory_mod: A: %p shadow[A]  -> T: 0x%02x\n", (void *)(p + i), tag);
+    VPrintf(2, "\t\t[FieldaArmor] TagMemory_mod: A: %p shadow[A]  -> T: 0x%02x\n", (void *)(p + i), tag);
     *(char *)(MemToShadow(p + i)) = tag;
   }
   return ptr ? tagged : p;
