@@ -288,13 +288,10 @@ private:
   void InstrumentGEP(GetElementPtrInst *GEPI);
   void InstrumentConstGEP(ConstantExpr *GEPI, Type *Ty);
   Value *getRPTag(IRBuilder<> &IRB); // FieldArmor
-  void ApplyRLT(IRBuilder<> &IRB, Instruction *AI, Type *rootType,
-                const DataLayout &DL);     // TODO: refactor remove DL
+  Value *ApplyRLT(IRBuilder<> &IRB, Instruction *AI, Type *rootType,
+                  const DataLayout &DL);   // TODO: refactor remove DL
   unsigned long long instrumentedGEPs = 0; // TODO make atomic
-  void createRuntimeTaggingFunction(); // FieldArmor -> this must go to runtime,
-                                       // where compiler knows how to optimize
-                                       // possibly
-  Function *RuntimeTagging;            // FieldArmor
+
   u_int8_t *computeTags(StructType *t); // FieldArmor
   void createTagVectors();              // FieldArmor
   void createTagVector(StructType *t);  // FieldArmor
@@ -686,7 +683,6 @@ void HWAddressSanitizer::initializeModule() {
       return GV;
     });
   }
-  // createRuntimeTaggingFunction(); // TODO REENABLE
 }
 
 void HWAddressSanitizer::initializeCallbacks(Module &M) {
@@ -1223,121 +1219,9 @@ void debugAggregateVisit(Type *sonType, uint8_t currNestingLevel,
 /**
  * Applies RLT to memory
  */
-void HWAddressSanitizer::ApplyRLT(IRBuilder<> &IRB, Instruction *AI,
-                                  Type *rootType, const DataLayout &DL) {
-  /**
-  LLVM_DEBUG(dbgs() << " [FieldArmor] RLT on type: " << *rootType << "\n");
-  assert(rootType->isAggregateType() && !rootType->isArrayTy() &&
-         "RLT can be applied only to non-array aggregate types");
+Value *HWAddressSanitizer::ApplyRLT(IRBuilder<> &IRB, Instruction *AI,
+                                    Type *rootType, const DataLayout &DL) {
 
-  llvm::DIType *typeDescriptor =
-      nullptr; // lookup IR metadata for DI (Local/Global)
-
-  Value *RootAddrLong = untagPointer(IRB, IRB.CreatePointerCast(AI, IntptrTy));
-  // TODO: handle padding tags
-
-  std::deque<std::tuple<Type *, uint8_t, uint8_t, uint8_t, size_t>> AggQueue;
-
-  auto levelZeroFieldsOffsets =
-      DL.getStructLayout(cast<StructType>(rootType))->getMemberOffsets();
-
-  uint8_t fatherT = 0;
-  uint8_t fatherL = 0;
-  uint8_t sonIdx = 1; // NOTE: indexes start at 1
-
-  for (auto subtype : rootType->subtypes()) {
-    AggQueue.push_back(std::make_tuple(subtype, fatherT, fatherL, sonIdx,
-                                       levelZeroFieldsOffsets[sonIdx - 1]));
-    sonIdx++;
-  } // init for
-  // NOTE: given one offset, this returns the index of the struct containing
-  // that offset 	-> getElementContainingOffset TODO: use
-  while (!AggQueue.empty()) {
-
-    /**
-     * UNIONs
-     *  1 - layout seems to be inferred by the compiler -> maybe based on
-     * first use? 2 - size seems to be 0 when called upon the union itself 3 -
-     * in presence of padding in the union, compiler assumes it an i8 array
-     * FLEX MEMBERS 1 - their size is 0 --> just don't tag them
-     * INSTRUMENTATION 1 - I suspect compiler will still optimize away tag
-     * stores 2 - does it have to be so horribly inefficient?
-     *
-
-    auto el_pair = AggQueue.front();
-    AggQueue.pop_front();
-
-    Type *sonType = std::get<0>(el_pair); // GEP
-
-    // my father's tag
-    fatherT = std::get<1>(el_pair); // from top-byte
-
-    // level of nesting wrt to the top aggregate
-    fatherL = std::get<2>(el_pair); // GEP
-
-    // index of the (sub) field in the (sub)type
-    sonIdx = std::get<3>(el_pair); // GEPs provide you with this info
-
-    // offset of the field from the beginning of the aggregate in memory
-    size_t sonOffset = std::get<4>(el_pair); // current offset from the root ptr
-
-    if (sonType->isAggregateType() &&
-        !sonType->isArrayTy()) { /*either struct or union
-      // TAG memory associated to nested aggregate type
-      // TODO: should sonIdx be %'ed???
-      uint8_t sonT =
-          (fatherT + sonIdx) % 16; // tag of ptr to this field, expected tag
-
-      uint8_t sonMask = sonType->getNumContainedTypes() % 16u;
-      auto rotatedMask = rotateOn4bits(sonMask, sonIdx);
-      auto newBaseTag = (rotatedMask ^ sonT);
-      // fields tags will be newBaseTag + field index
-
-      debugAggregateVisit(sonType, fatherL, sonT, sonMask, newBaseTag);
-
-      uint8_t count = 0;
-      auto sonSubfieldsCount = sonType->getNumContainedTypes();
-
-      auto sonSubfieldsOffsets =
-          DL.getStructLayout(cast<StructType>(sonType))->getMemberOffsets();
-      size_t currSonSubfieldOffset = 0;
-
-      for (Type *subtype : llvm::reverse(sonType->subtypes())) {
-        currSonSubfieldOffset =
-            sonSubfieldsOffsets[sonSubfieldsCount - count - 1] + sonOffset;
-        AggQueue.push_front(
-            std::make_tuple(subtype, newBaseTag, (fatherL + 1) % 8,
-                            sonSubfieldsCount - count, currSonSubfieldOffset));
-        count++;
-      } // visits the elements of the sonType if this is an aggregate and
-        // establishes tags
-
-    } else {
-      /*Visit memory location and tag it
-      assert(sonType->isSized() && "Type must be sized"); // CHECK
-      uint8_t sonT = (fatherT + sonIdx) % 16;
-      uint8_t sonTag = sonT | (fatherL << 4);
-      assert((sonT & 0x80) == 0 &&
-             "ROOT POINTER BIT must be set to 0 in memory tags");
-
-      IRB.CreateCall(
-          HwasanTagMemoryFunc,
-          {IRB.CreateIntToPtr(
-               IRB.CreateAdd(IRB.CreatePtrToInt(RootAddrLong, IntptrTy),
-                             ConstantInt::get(IntptrTy, sonOffset)),
-               PtrTy),
-           ConstantInt::get(Int8Ty, sonTag),
-           ConstantInt::get(IntptrTy, DL.getTypeAllocSize(sonType)),
-           ConstantInt::get(
-               IntptrTy, typeDescriptor
-                             ? typeDescriptor->getLine()
-                             : 0)}); // NOTE: this is a bogus parameter for now
-                                     // TODO: remove, this is not necessary
-      LLVM_DEBUG(dbgs() << " [++] TAG MEM @ offset " << sonOffset << " -> 0x"
-                        << utohexstr((unsigned)sonTag) << "\n");
-    } // else ->visit memory location
-  } // while agg queue not empty
-   */
   auto structTy = cast<StructType>(rootType);
   auto tagVector = M.getGlobalVariable(
       structTy->getStructName().str() + ".fieldarmor.tagvec", true);
@@ -1354,58 +1238,19 @@ void HWAddressSanitizer::ApplyRLT(IRBuilder<> &IRB, Instruction *AI,
   assert(tagVector && "Tag vector must exist here - tagAlloca");
   FunctionCallee fieldarmor_tag_memory = M.getOrInsertFunction(
       "_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy, PtrTy, PtrTy, Int64Ty);
-  IRB.CreateCall(fieldarmor_tag_memory,
-                 {IRB.CreatePointerCast(AI, PtrTy),
-                  IRB.CreatePointerCast(tagVector, PtrTy),
-                  ConstantInt::get(Int64Ty, DL.getTypeAllocSize(rootType))});
+  // IRB.SetInsertPoint(AI->getNextNode()); // what if I ignore this?
+
+  return IRB.CreateCall(
+      fieldarmor_tag_memory,
+      {IRB.CreatePointerCast(AI, PtrTy),
+       IRB.CreatePointerCast(tagVector, PtrTy),
+       ConstantInt::get(Int64Ty, DL.getTypeAllocSize(rootType))});
 
 } // ApplyRLT
 
-void debugTagAlloca(AllocaInst *AI, size_t Size, size_t AlignedSize,
-                    size_t scale, Value *Tag) {
-  LLVM_DEBUG(dbgs() << " [++] tagAlloca: not instrumenting with calls\n");
-  // shadowSize = size
-  LLVM_DEBUG(dbgs() << " [++] Aligned size : " << AlignedSize << "\n");
-  LLVM_DEBUG(dbgs() << " [++] Size : " << Size << "\n");
-  LLVM_DEBUG(dbgs() << " [++] Mapping scale : " << scale << "\n");
-  LLVM_DEBUG(dbgs() << " [++]   Tag value : ");
-  LLVM_DEBUG(Tag->print(dbgs()));
-  LLVM_DEBUG(dbgs() << "\n");
-  AI->getAllocatedType()->print(dbgs());
-  LLVM_DEBUG(dbgs() << "\n");
-  LLVM_DEBUG(dbgs() << " [++] Num contained types : "
-                    << AI->getAllocatedType()->getNumContainedTypes());
-  LLVM_DEBUG(dbgs() << "\n");
-  // print contained types
-  for (Type *contType : AI->getAllocatedType()->subtypes()) {
-    LLVM_DEBUG(dbgs() << " \t[++] Contained type: ");
-    LLVM_DEBUG(contType->print(dbgs()));
-    LLVM_DEBUG(dbgs() << "\n");
-  }
-  LLVM_DEBUG(dbgs() << "\n");
-}
-
-void pokeIntoAggregate(Type *sonType, unsigned currNestingLevel,
-                       uint8_t expectedTag, uint8_t typeMask,
-                       uint8_t newBaseTag, size_t numElementsInSubtype) {
-  LLVM_DEBUG(dbgs() << " [++] POKING INTO AGGREGATE: ");
-  LLVM_DEBUG(dbgs() << sonType->getStructName());
-  LLVM_DEBUG(dbgs() << " at nesting level: " << (unsigned)currNestingLevel
-                    << "\n");
-  LLVM_DEBUG(dbgs() << " \texpected tag: 0x" << utohexstr((unsigned)expectedTag)
-                    << "\n");
-  LLVM_DEBUG(dbgs() << " \ttype mask: 0x" << utohexstr((unsigned)typeMask)
-                    << "\n");
-  LLVM_DEBUG(dbgs() << " \tnew base tag: 0x" << utohexstr((unsigned)newBaseTag)
-                    << "\n");
-  LLVM_DEBUG(dbgs() << " \tnumber of elements in subtype: "
-                    << numElementsInSubtype << "\n");
-  LLVM_DEBUG(dbgs() << "\n");
-}
-
 void HWAddressSanitizer::untagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
                                      const DataLayout &DL) {
-  /** Apply tag 0 to the previously tagged memory */
+  /** Apply tag 0 to the previously tagged memory, immaterially of the type. */
   FunctionCallee fieldarmor_tag_memory = M.getOrInsertFunction(
       "_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy, PtrTy, PtrTy, Int64Ty);
   Value *NullTagVector = IRB.CreateIntToPtr(ConstantInt::get(IntptrTy, 0),
@@ -1422,16 +1267,34 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
   if (StructType *ST = dyn_cast<StructType>(AI->getAllocatedType())) {
     if (ST->isLiteral() || ST->isOpaque()) {
       LLVM_DEBUG(
-          dbgs()
-          << " [FieldArmor] Skipping RLT for literal/opaque struct. OPAQUE: "
-          << ST->isOpaque() << " LITERAL: " << ST->isLiteral() << *ST << "\n");
+          dbgs() << " [FieldArmor] RLT for literal/opaque struct. OPAQUE: "
+                 << ST->isOpaque() << " LITERAL: " << ST->isLiteral() << *ST
+                 << "\n");
       return;
-    } // if literal or opauqe -> TODO: fix this shit!!!
+    } // if literal or opaque -> TODO: fix this shit!!!
+    else {
+      ApplyRLT(IRB, AI, AI->getAllocatedType(), DL);
+      return;
+      // safe to apply to struct here}
+    }
   }
-  LLVM_DEBUG(dbgs() << " [FieldArmor] Applying RLT to alloca: " << *AI << "\n");
-
-  ApplyRLT(IRB, AI, AI->getAllocatedType(), DL);
-
+  if (ArrayType *AT = dyn_cast<ArrayType>(AI->getAllocatedType())) {
+    LLVM_DEBUG(dbgs() << " [FieldArmor] tagAlloca ON ARRAY TYPE: " << *AT
+                      << "\n");
+    auto elementType = AT->getElementType();
+    assert(elementType->isStructTy()); // TODO: handle other cases later. But
+                                       // this must be true for now!
+    // APPROACH 1: for each element, apply RLT. Apply it on a new GEP.
+    for (int el = 0; el < AT->getNumElements(); el++) {
+      auto *ElementPtr =
+          IRB.CreateGEP(elementType, AI, {ConstantInt::get(Int64Ty, el)});
+      GetElementPtrInst *GepInstruction = cast<GetElementPtrInst>(ElementPtr);
+      ApplyRLT(IRB, GepInstruction, elementType, DL);
+      // now replace all the users
+    } // for each element, tag
+    return;
+  }
+  assert(false && "This should be unreachable.");
 } // tagAlloca
 
 unsigned HWAddressSanitizer::retagMask(unsigned AllocaNo) {
@@ -1537,81 +1400,6 @@ Value *HWAddressSanitizer::getFrameRecordInfo(IRBuilder<> &IRB) {
   return IRB.CreateOr(PC, FP);
 }
 
-// void HWAddressSanitizer::emitPrologue(IRBuilder<> &IRB, bool
-// WithFrameRecord)
-// {
-//   if (!Mapping.isInTls())
-//     ShadowBase = getShadowNonTls(IRB);
-//   else if (!WithFrameRecord && TargetTriple.isAndroid())
-//     ShadowBase = getDynamicShadowIfunc(IRB);
-
-//   if (!WithFrameRecord && ShadowBase)
-//     return;
-
-//   Value *SlotPtr = nullptr;
-//   Value *ThreadLong = nullptr;
-//   Value *ThreadLongMaybeUntagged = nullptr;
-
-//   auto getThreadLongMaybeUntagged = [&]() {
-//     if (!SlotPtr)
-//       SlotPtr = getHwasanThreadSlotPtr(IRB);
-//     if (!ThreadLong)
-//       ThreadLong = IRB.CreateLoad(IntptrTy, SlotPtr);
-//     // Extract the address field from ThreadLong. Unnecessary on AArch64
-//     with
-//     // TBI.
-//     return TargetTriple.isAArch64() ? ThreadLong
-//                                     : untagPointer(IRB, ThreadLong);
-//   };
-
-//   if (WithFrameRecord) {
-//     switch (ClRecordStackHistory) {
-//     case libcall: {
-//       // Emit a runtime call into hwasan rather than emitting instructions
-//       for
-//       // recording stack history.
-//       Value *FrameRecordInfo = getFrameRecordInfo(IRB);
-//       IRB.CreateCall(HwasanRecordFrameRecordFunc, {FrameRecordInfo});
-//       break;
-//     }
-//     case instr: {
-//       ThreadLongMaybeUntagged = getThreadLongMaybeUntagged();
-
-//       StackBaseTag = IRB.CreateAShr(ThreadLong, 3);
-
-//       // Store data to ring buffer.
-//       Value *FrameRecordInfo = getFrameRecordInfo(IRB);
-//       Value *RecordPtr =
-//           IRB.CreateIntToPtr(ThreadLongMaybeUntagged, IRB.getPtrTy(0));
-//       IRB.CreateStore(FrameRecordInfo, RecordPtr);
-
-//       IRB.CreateStore(memtag::incrementThreadLong(IRB, ThreadLong, 8),
-//       SlotPtr); break;
-//     }
-//     case none: {
-//       llvm_unreachable(
-//           "A stack history recording mode should've been selected.");
-//     }
-//     }
-//   }
-
-//   if (!ShadowBase) {
-//     if (!ThreadLongMaybeUntagged)
-//       ThreadLongMaybeUntagged = getThreadLongMaybeUntagged();
-
-//     // Get shadow base address by aligning RecordPtr up.
-//     // Note: this is not correct if the pointer is already aligned.
-//     // Runtime library will make sure this never happens.
-//     ShadowBase = IRB.CreateAdd(
-//         IRB.CreateOr(
-//             ThreadLongMaybeUntagged,
-//             ConstantInt::get(IntptrTy, (1ULL << kShadowBaseAlignment) -
-//             1)),
-//         ConstantInt::get(IntptrTy, 1), "hwasan.shadow");
-//     ShadowBase = IRB.CreateIntToPtr(ShadowBase, PtrTy);
-//   }
-// }
-
 bool HWAddressSanitizer::instrumentLandingPads(
     SmallVectorImpl<Instruction *> &LandingPadVec) {
   for (auto *LP : LandingPadVec) {
@@ -1624,7 +1412,6 @@ bool HWAddressSanitizer::instrumentLandingPads(
   return true;
 }
 
-// PORCODIO ho fatto un bordello qua
 bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
                                          const DominatorTree &DT,
                                          const PostDominatorTree &PDT,
@@ -1637,10 +1424,22 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     auto *AI = KV.first;
     memtag::AllocaInfo &Info = KV.second;
 
+    // inspect the type
     if (AllocaInst *AIcast = dyn_cast<AllocaInst>(AI)) {
       Type *allocatedType = AIcast->getAllocatedType();
-      if (!allocatedType->isStructTy()) { // TODO: handle array of structs
-        // TODO: HANDLE ALLOCA FOR ARRAYS OF STRUCTS
+
+      if (allocatedType->isArrayTy()) {
+        auto elementType = allocatedType->getArrayElementType();
+        if (!elementType->isStructTy()) {
+          LLVM_DEBUG(dbgs()
+                     << " [FieldArmor] Skipping non-struct array alloca: "
+                     << *AIcast << "\n");
+          continue;
+        }
+      } // if array, check element type
+
+      else if (!allocatedType->isStructTy()) {
+
         LLVM_DEBUG(dbgs() << " [FieldArmor] Skipping non-struct alloca: "
                           << *AIcast << "\n");
         continue;
@@ -2509,150 +2308,6 @@ Value *HWAddressSanitizer::getRPTag(IRBuilder<> &IRB) {
 }
 
 // TODO: remove
-void HWAddressSanitizer::createRuntimeTaggingFunction() {
-  // void* __fieldarmor_runtime_tagging(void* memory_to_tag, uint8_t*
-  // tag_buffer, u_int64_t bytes_to_tag); This must take a pointer to a
-  // GlobalVariable containing the tag vector.
-
-  // RuntimeTagging = Function::Create(
-  //     FunctionType::get(PtrTy, {PtrTy, PtrTy, Int64Ty}, false),
-  //     GlobalValue::InternalLinkage, "__fieldarmor_runtime_tagging", &M);
-
-  // BasicBlock *BB = BasicBlock::Create(M.getContext(), "", RuntimeTagging);
-  // IRBuilder<> IRB(BB);
-
-  // FunctionCallee PrintfFunc = M.getOrInsertFunction(
-  //     "printf", FunctionType::get(Int32Ty, {PtrTy}, true));
-  // Value *FormatStr =
-  //     IRB.CreateGlobalString("[RUNTIME_TAGGING] INPUT: %p %p %lu \n");
-  // IRB.CreateCall(PrintfFunc,
-  //                {FormatStr, RuntimeTagging->getArg(0),
-  //                 RuntimeTagging->getArg(1), RuntimeTagging->getArg(2)});
-
-  // Value *MemoryToTag = RuntimeTagging->getArg(0);
-  // Value *TagBuffer = RuntimeTagging->getArg(1);
-  // Value *BytesToTag = RuntimeTagging->getArg(2);
-  // Value *Remainder = IRB.CreateURem(BytesToTag, ConstantInt::get(Int64Ty,
-  // 8u));
-
-  // // Declare loop index as a variable, not a constant, so it can be updated
-  // in
-  // // the loop.
-  // Value *i = IRB.CreateAlloca(Int64Ty, nullptr, "i");
-  // IRB.CreateStore(ConstantInt::get(Int64Ty, 0u), i);
-
-  // Value *j = IRB.CreateAlloca(Int64Ty, nullptr, "j");
-  // IRB.CreateStore(ConstantInt::get(Int64Ty, 0u), j);
-
-  // BasicBlock *TaggingLoop =
-  //     BasicBlock::Create(M.getContext(), "TaggingLoop", RuntimeTagging);
-  // BasicBlock *ReturnBB =
-  //     BasicBlock::Create(M.getContext(), "ReturnBB", RuntimeTagging);
-  // BasicBlock *RemainderTaggingBB =
-  //     BasicBlock::Create(M.getContext(), "RemainderTaggingBB",
-  //     RuntimeTagging);
-  // BasicBlock *AfterTaggingLoop =
-  //     BasicBlock::Create(M.getContext(), "AfterTaggingLoop",
-  //     RuntimeTagging);
-
-  // IRB.CreateBr(TaggingLoop);
-
-  // // TaggingLoop:
-  // IRB.SetInsertPoint(TaggingLoop);
-  // Value *cur_i = IRB.CreateLoad(Int64Ty, i, "i.load");
-  // Value *currentPtrLong =
-  //     IRB.CreateAdd(IRB.CreatePtrToInt(MemoryToTag, IntptrTy), cur_i);
-  // Value *CurrentShadowMemoryPtr = IRB.CreateIntToPtr(
-  //     IRB.CreateXor(currentPtrLong,
-  //                   ConstantInt::get(Int64Ty, 0x400000000000ULL)),
-  //     PtrTy);
-
-  // // Load 8 bytes from CurrTagBuffer as i64
-  // Value *currTagVectorPtr = IRB.CreateGEP(Int8Ty, TagBuffer, cur_i);
-
-  // Value *currTagVector8B =
-  //     IRB.CreateLoad(Int64Ty, currTagVectorPtr, "currTagVector8B.load");
-  // IRB.CreateStore(currTagVector8B, CurrentShadowMemoryPtr);
-
-  // // create DBG printfs
-  // FormatStr = IRB.CreateGlobalString(
-  //     "[RUNTIME_TAGGING] Tagging 8 bytes at shadow addr: %p with tag
-  //     vector: " "0x%llx\n");
-  // IRB.CreateCall(PrintfFunc,
-  //                {FormatStr, CurrentShadowMemoryPtr, currTagVector8B});
-  // // eof dbg printf
-
-  // cur_i = IRB.CreateAdd(cur_i, ConstantInt::get(Int64Ty, 8u));
-  // IRB.CreateStore(cur_i, i); // update i
-  // IRB.CreateCondBr(IRB.CreateICmpUGE(cur_i, BytesToTag),
-  //                  /*if true*/ AfterTaggingLoop,
-  //                  /*if false*/ TaggingLoop);
-
-  // IRB.SetInsertPoint(AfterTaggingLoop);
-  // // tag the remainder if diff from 0, and ret
-  // IRB.CreateCondBr(IRB.CreateICmpEQ(Remainder, ConstantInt::get(Int64Ty,
-  // 0u)),
-  //                  /*if true*/ ReturnBB,
-  //                  /*if false*/ RemainderTaggingBB);
-  // IRB.SetInsertPoint(RemainderTaggingBB);
-  // Value *i_last =
-  //     IRB.CreateSub(cur_i, ConstantInt::get(Int64Ty, 8u)); // this is fine
-
-  // BasicBlock *RemainderTaggingLoop = BasicBlock::Create(
-  //     M.getContext(), "RemainderTaggingLoop", RuntimeTagging);
-  // IRB.CreateBr(RemainderTaggingLoop);
-  // IRB.SetInsertPoint(RemainderTaggingLoop);
-  // // RemainderTaggingLoop:
-  // Value *cur_j = IRB.CreateLoad(Int64Ty, j, "j.load");
-  // Value *currentPtrLongRemainder = IRB.CreateAdd(
-  //     IRB.CreateAdd(IRB.CreatePtrToInt(MemoryToTag, IntptrTy), i_last),
-  //     cur_j);
-
-  // CurrentShadowMemoryPtr = IRB.CreateIntToPtr(
-  //     IRB.CreateXor(currentPtrLongRemainder,
-  //                   ConstantInt::get(IntptrTy, 0x400000000000ULL)),
-  //     PtrTy);
-  // // Load 1 byte from TagBuffer as i8
-  // Value *currTagBytePtr =
-  //     IRB.CreateGEP(Int8Ty, TagBuffer, IRB.CreateAdd(i_last, cur_j));
-  // Value *currTagByte =
-  //     IRB.CreateLoad(Int8Ty, currTagBytePtr, "currTagByte.load");
-  // IRB.CreateStore(
-  //     currTagByte, CurrentShadowMemoryPtr,
-  //     true); // TODO: impose volatility ow compiler might optimize out da
-  //     shit
-
-  // // create DBG printfs
-  // Value *FormatStrRemainder =
-  //     IRB.CreateGlobalString("[RUNTIME_TAGGING] Tagging REMAINDER %d byte
-  //     at
-  //     "
-  //                            "shadow addr: %p with tag byte: "
-  //                            "0x%x\n");
-  // IRB.CreateCall(PrintfFunc,
-  //                {FormatStrRemainder, Remainder, CurrentShadowMemoryPtr,
-  //                 IRB.CreateZExt(currTagByte, Int64Ty)});
-  // // eof dbg printf
-
-  // cur_j = IRB.CreateAdd(cur_j, ConstantInt::get(Int64Ty, 1u));
-  // IRB.CreateStore(cur_j, j);
-  // IRB.CreateCondBr(IRB.CreateICmpUGE(cur_j, Remainder),
-  //                  /*if true*/ ReturnBB,
-  //                  /*if false*/ RemainderTaggingLoop);
-  // // ReturnBB:
-  // IRB.SetInsertPoint(ReturnBB);
-  // Value *TaggedPtr =
-  //     tagPointer(IRB, RuntimeTagging->getReturnType(),
-  //                IRB.CreatePtrToInt(RuntimeTagging->getArg(0), IntptrTy),
-  //                ConstantInt::get(IntptrTy, 0b10000000));
-  // IRB.CreateRet(TaggedPtr);
-} // createRuntimeTagging function
-
-/**
- * For each type emitted by the runtime, generate comdats to describe the type
- * and provide the runtime with the relative tag vector. Runtime is going to
- * tag the associated global with the right tag vector upon initialization.
- */
 
 void HWAddressSanitizer::createTagVector(StructType *t) {
   if (t->isLiteral()) { // TODO: handle literal structs.
@@ -2707,13 +2362,14 @@ void HWAddressSanitizer::createTagVectors() {
 u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
 
   Value *PaddingTag = ConstantInt::get(Int8Ty, 0); // TODO
-  // can we tell padding apart from real members?
+  // can we tell padding apart from real members? Dont know but Memsetting
+  // tags vector to 0 tags padding with 0.
 
   DataLayout DL = M.getDataLayout(); // What if the type is defined elsewhere?
                                      // TODO: check on this
   u_int8_t *tags = new u_int8_t[DL.getTypeAllocSize(Ty)];
   memset(tags, 0, DL.getTypeAllocSize(Ty));
-  
+
   assert(tags && "Could not allocate tags array");
   std::deque<std::tuple<Type *, uint8_t, uint8_t, uint8_t, size_t>> AggQueue;
 

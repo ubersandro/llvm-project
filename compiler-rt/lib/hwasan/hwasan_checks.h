@@ -271,21 +271,21 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
     // }
 
   } else { // R == 0
-    VPrintf(1, "\t[FieldArmor] NO RP CHK A=%p SZ=%u\n", (void*)p, sz);
-    tag_t* curr_memtag;
-    for (uptr i = 0; i < sz; i++) {
-      curr_memtag = (tag_t*)MemToShadow((uptr)untagged_ptr) + i;
+  //   VPrintf(1, "\t[FieldArmor] NO RP CHK A=%p SZ=%u\n", (void*)p, sz);
+  //   tag_t* curr_memtag;
+  //   for (uptr i = 0; i < sz; i++) {
+  //     curr_memtag = (tag_t*)MemToShadow((uptr)untagged_ptr) + i;
 
-      if (*curr_memtag != ptr_tag) {
-        VPrintf(1, "[FieldArmor] TAG MISMATCH A=%p SZ=%u\n", (void*)p, sz);
-        VPrintf(1, "\t[FieldArmor] EXP_T=%x, MEM_T=%x\n", ptr_tag,
-                *curr_memtag);
+  //     if (*curr_memtag != ptr_tag) {
+  //       VPrintf(1, "[FieldArmor] TAG MISMATCH A=%p SZ=%u\n", (void*)p, sz);
+  //       VPrintf(1, "\t[FieldArmor] EXP_T=%x, MEM_T=%x\n", ptr_tag,
+  //               *curr_memtag);
 
-        SigTrap<EA, AT>(p, sz);
-        if (EA == ErrorAction::Abort)
-          __builtin_unreachable();
-      }
-    }  // for
+  //       SigTrap<EA, AT>(p, sz);
+  //       if (EA == ErrorAction::Abort)
+  //         __builtin_unreachable();
+  //     }
+  //   }  // for
   }  // NON RP chk
 } // CheckAddressSized
 
