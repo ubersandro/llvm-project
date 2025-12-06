@@ -2311,6 +2311,7 @@ Value *HWAddressSanitizer::getRPTag(IRBuilder<> &IRB) {
 
 void HWAddressSanitizer::createTagVector(StructType *t) {
   if (t->isLiteral()) { // TODO: handle literal structs.
+    // THIS SEEMS TO BE A PROBLEM ONLY IN GLOBALS...
     ++NumLiteralStructs;
     LLVM_DEBUG(
         dbgs()
@@ -2350,11 +2351,26 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
   NumDefinedTagVectors++;
 }
 
+void dbgPrintStructType(StructType *t) {
+  bool isUnion = false;
+  isUnion = t->getName().str().find("union.") != std::string::npos;
+  LLVM_DEBUG(dbgs() << "[FieldArmor - createTagVectors] Identified struct: "
+                    << t->getName() << "\n");
+  LLVM_DEBUG(dbgs() << "\t\ttype: ");
+  LLVM_DEBUG(t->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\n");
+  LLVM_DEBUG(dbgs() << "\t\tisLiteral: " << t->isLiteral() << "\n");
+  LLVM_DEBUG(dbgs() << "\t\tisOpaque: " << t->isOpaque() << "\n");
+  LLVM_DEBUG(dbgs() << "\t\tisSized: " << t->isSized() << "\n");
+  LLVM_DEBUG(dbgs() << "\t\tisUnion: " << isUnion << "\n");
+}
+
 void HWAddressSanitizer::createTagVectors() {
   /** you only do this for each struct... */
   auto identifiedStructTypes = M.getIdentifiedStructTypes();
 
   for (auto t : identifiedStructTypes) {
+    dbgPrintStructType(t);
     createTagVector(t);
   }
 }
@@ -2481,7 +2497,9 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
       } // if array of structs
 
       else {
-        LLVM_DEBUG(dbgs() << " [FieldArmor] Tagging array of scalars. Type ");
+        LLVM_DEBUG(
+            dbgs()
+            << " [FieldArmor - computeTags] Tagging array of scalars. Type ");
         LLVM_DEBUG(sonType->print(dbgs()));
         LLVM_DEBUG(dbgs() << "\n");
 
@@ -2502,7 +2520,8 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
 
     else {
       // scalar fields
-      LLVM_DEBUG(dbgs() << " [FieldArmor] Tagging scalar field. Type ");
+      LLVM_DEBUG(
+          dbgs() << " [FieldArmor - computeTags] Tagging scalar field. Type ");
       LLVM_DEBUG(sonType->print(dbgs()));
       LLVM_DEBUG(dbgs() << "\n");
       uint8_t sonT = (fatherT + sonIdx) % 16;
