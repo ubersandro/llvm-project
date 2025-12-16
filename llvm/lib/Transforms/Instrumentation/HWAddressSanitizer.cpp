@@ -262,9 +262,9 @@ bool shouldInstrumentStack(const Triple &TargetTriple) {
   return ClInstrumentStack;
 }
 /** FieldArmor flags */
-bool shouldInstrumentPtrToInt() { return ClInstrumentPtrToInt; }
-bool shouldInstrumentArithmetic() { return ClInstrumentArithmetic; }
-bool shouldInstrumentGEPs() { return ClInstrumentGEPs; }
+// bool shouldInstrumentPtrToInt() { return ClInstrumentPtrToInt; }
+// bool shouldInstrumentArithmetic() { return ClInstrumentArithmetic; }
+// bool shouldInstrumentGEPs() { return ClInstrumentGEPs; }
 
 bool shouldInstrumentWithCalls(const Triple &TargetTriple) {
   return optOr(ClInstrumentWithCalls, TargetTriple.getArch() == Triple::x86_64);
@@ -1151,25 +1151,25 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
                                              const DataLayout &DL) {
   Value *Addr = O.getPtr();
 
-  LLVM_DEBUG(dbgs() << "{++] Instrumenting MEMACCESS ");
-  LLVM_DEBUG(O.getInsn()->print(dbgs()));
-  LLVM_DEBUG(dbgs() << "\n");
-  LLVM_DEBUG(O.OpType->print(dbgs()));
+  // LLVM_DEBUG(dbgs() << "{++] Instrumenting MEMACCESS ");
+  // LLVM_DEBUG(O.getInsn()->print(dbgs()));
+  // LLVM_DEBUG(dbgs() << "\n");
+  // LLVM_DEBUG(O.OpType->print(dbgs()));
 
-  if (O.OpType->isPointerTy()) {
-    auto instruction = O.getInsn();
-    if (dyn_cast<LoadInst>(instruction)) {
-      LoadInst *LI = cast<LoadInst>(instruction);
-      LLVM_DEBUG(dbgs() << " -> load instruction\n");
-      LLVM_DEBUG(dbgs() << "load type: ");
-      LLVM_DEBUG(LI->getType()->print(dbgs()));
-    } else if (dyn_cast<StoreInst>(instruction)) {
-      LLVM_DEBUG(dbgs() << " -> store instruction\n");
-    } else {
-      LLVM_DEBUG(dbgs() << " -> other instruction\n");
-    }
-  }
-  LLVM_DEBUG(dbgs() << "\n");
+  // if (O.OpType->isPointerTy()) {
+  //   auto instruction = O.getInsn();
+  //   if (dyn_cast<LoadInst>(instruction)) {
+  //     LoadInst *LI = cast<LoadInst>(instruction);
+  //     LLVM_DEBUG(dbgs() << " -> load instruction\n");
+  //     LLVM_DEBUG(dbgs() << "load type: ");
+  //     LLVM_DEBUG(LI->getType()->print(dbgs()));
+  //   } else if (dyn_cast<StoreInst>(instruction)) {
+  //     LLVM_DEBUG(dbgs() << " -> store instruction\n");
+  //   } else {
+  //     LLVM_DEBUG(dbgs() << " -> other instruction\n");
+  //   }
+  // }
+  // LLVM_DEBUG(dbgs() << "\n");
 
   // If the pointer is statically known to be zero, the tag check will pass
   // since:
@@ -1192,23 +1192,24 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
        *O.Alignment >= O.TypeStoreSize / 8)) {
     size_t AccessSizeIndex = TypeSizeToSizeIndex(O.TypeStoreSize);
     if (InstrumentWithCalls) {
-      LLVM_DEBUG(dbgs() << "Using call-based instrumentation\n");
+      // LLVM_DEBUG(dbgs() << "Using call-based instrumentation\n");
+      errs() << "[++] Using call-based instrumentation\n";
       SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
       if (UseMatchAllCallback)
         Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
       IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
                      Args);
     } else if (OutlinedChecks) {
-      LLVM_DEBUG(dbgs() << "Outlining the check\n");
+      // LLVM_DEBUG(dbgs() << "Outlining the check\n");
       instrumentMemAccessOutline(Addr, O.IsWrite, AccessSizeIndex, O.getInsn(),
                                  DTU, LI);
     } else {
-      LLVM_DEBUG(dbgs() << "Inlining the check\n");
+      // LLVM_DEBUG(dbgs() << "Inlining the check\n");
       instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, O.getInsn(),
                                 DTU, LI);
     }
   } else {
-    LLVM_DEBUG(dbgs() << "Using call-based instrumentation, else case\n");
+    // LLVM_DEBUG(dbgs() << "Using call-based instrumentation, else case\n");
     SmallVector<Value *, 3> Args{
         IRB.CreatePointerCast(Addr, IntptrTy),
         IRB.CreateUDiv(IRB.CreateTypeSize(IntptrTy, O.TypeStoreSize),
@@ -1682,14 +1683,14 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     }
   } // Q: what is the value of this?
 
-  // DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
-  // PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
-  // LoopInfo *LI = FAM.getCachedResult<LoopAnalysis>(F);
-  // DomTreeUpdater DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy);
-  // const DataLayout &DL = F.getDataLayout();
-  // for (auto &Operand : OperandsToInstrument)
-  //   instrumentMemAccess(Operand, DTU, LI, DL);
-  // DTU.flush();
+  DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
+  PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
+  LoopInfo *LI = FAM.getCachedResult<LoopAnalysis>(F);
+  DomTreeUpdater DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy);
+  const DataLayout &DL = F.getDataLayout();
+  for (auto &Operand : OperandsToInstrument)
+    instrumentMemAccess(Operand, DTU, LI, DL);
+  DTU.flush();
 
   // if (ClInstrumentMemIntrinsics && !IntrinToInstrument.empty()) {
   //   for (auto *Inst : IntrinToInstrument)
@@ -1960,8 +1961,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   /** DEBUG */
   // FunctionCallee Printf =
   //     M.getOrInsertFunction("printf", Int32Ty, PtrTy, /*vararg*/ true);
-  FunctionCallee Fprintf = M.getOrInsertFunction(
-      "fprintf", FunctionType::get(Int32Ty, {PtrTy, PtrTy}, true));
+  // FunctionCallee Fprintf = M.getOrInsertFunction(
+  //     "fprintf", FunctionType::get(Int32Ty, {PtrTy, PtrTy}, true));
 
   /** DEBUG */
   dumpGEPDebug(GEPI);
@@ -2211,13 +2212,13 @@ void HWAddressSanitizer::InstrumentArithmetic(BinaryOperator *CI) {
 } // InstrumentArithmetic
 
 void HWAddressSanitizer::InstrumentPtrToInt(PtrToIntInst *PI) {
-  // might be removing too many tags
-  LLVM_DEBUG(dbgs() << "[FieldArmor] Instrumenting PtrToInt: " << *PI << "\n");
+  // REPLACE ptr operand with untagged operand in this insttruction
   IRBuilder<> IRB(PI);
-  Value *untaggedPtr =
+  LLVM_DEBUG(dbgs() << "[FieldArmor] Instrumenting PtrToInt: " << *PI << "\n");
+  Value *untaggedPtrLong =
       untagPointer(IRB, IRB.CreatePtrToInt(PI->getPointerOperand(), IntptrTy));
-  untaggedPtr->setName(PI->getName() + ".untagged");
-  PI->replaceAllUsesWith(untaggedPtr);
+  PI->setOperand(0, IRB.CreateIntToPtr(untaggedPtrLong, PI->getPointerOperand()->getType()));
+  // Q: do I still need to replace the uses?
 }
 
 // Filter out non aggregate globals.
