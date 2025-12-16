@@ -33,14 +33,16 @@
 using namespace __hwasan;
 
 struct HWAsanInterceptorContext {
-  const char *interceptor_name;
+  const char* interceptor_name;
 };
 
-#  define ACCESS_MEMORY_RANGE(offset, size, access)                           \
-    do {                                                                      \
-      __hwasan::CheckAddressSized<ErrorAction::Recover, access>((uptr)offset, \
-                                                                size);        \
+#  define ACCESS_MEMORY_RANGE(offset, size, access)                         \
+    do {                                                                    \
+      VPrintf(1, "[HWASAN] %s RANGE %p size=%llu\n",                        \
+              access == AccessType::Load ? "READ" : "WRITE", offset, size); \
     } while (0)
+// __hwasan::CheckAddressSized<ErrorAction::Recover, access>((uptr)offset,
+// size); \  TODO bring back
 
 #  define HWASAN_READ_RANGE(offset, size) \
     ACCESS_MEMORY_RANGE(offset, size, AccessType::Load)
@@ -97,7 +99,7 @@ struct HWAsanInterceptorContext {
 
 #    define COMMON_INTERCEPTOR_ENTER(ctx, func, ...) \
       HWAsanInterceptorContext _ctx = {#func};       \
-      ctx = (void *)&_ctx;                           \
+      ctx = (void*)&_ctx;                            \
       do {                                           \
         (void)(ctx);                                 \
         (void)(func);                                \
@@ -174,15 +176,16 @@ struct HWAsanInterceptorContext {
 // from elsewhere, such as the secondary allocator, which makes it a
 // very odd usecase.)
 template <class Mmap>
-static void *mmap_interceptor(Mmap real_mmap, void *addr, SIZE_T length,
+static void* mmap_interceptor(Mmap real_mmap, void* addr, SIZE_T length,
                               int prot, int flags, int fd, OFF64_T offset) {
   if (addr) {
-    if (flags & map_fixed) CHECK_EQ(addr, UntagPtr(addr));
+    if (flags & map_fixed)
+      CHECK_EQ(addr, UntagPtr(addr));
 
     addr = UntagPtr(addr);
   }
   SIZE_T rounded_length = RoundUpTo(length, GetPageSize());
-  void *end_addr = (char *)addr + (rounded_length - 1);
+  void* end_addr = (char*)addr + (rounded_length - 1);
   if (addr && length &&
       (!MemIsApp(reinterpret_cast<uptr>(addr)) ||
        !MemIsApp(reinterpret_cast<uptr>(end_addr)))) {
@@ -190,13 +193,13 @@ static void *mmap_interceptor(Mmap real_mmap, void *addr, SIZE_T length,
     // memory layout. Use a different address if allowed, else fail.
     if (flags & map_fixed) {
       errno = errno_EINVAL;
-      return (void *)-1;
+      return (void*)-1;
     } else {
       addr = nullptr;
     }
   }
-  void *res = real_mmap(addr, length, prot, flags, fd, offset);
-  if (length && res != (void *)-1) {
+  void* res = real_mmap(addr, length, prot, flags, fd, offset);
+  if (length && res != (void*)-1) {
     uptr beg = reinterpret_cast<uptr>(res);
     DCHECK(IsAligned(beg, GetPageSize()));
     if (!MemIsApp(beg) || !MemIsApp(beg + rounded_length - 1)) {
@@ -204,7 +207,7 @@ static void *mmap_interceptor(Mmap real_mmap, void *addr, SIZE_T length,
       // HWASan. Act as if we ran out of memory.
       internal_munmap(res, length);
       errno = errno_ENOMEM;
-      return (void *)-1;
+      return (void*)-1;
     }
     __hwasan::TagMemoryAligned(beg, rounded_length, 0);
   }
@@ -213,7 +216,7 @@ static void *mmap_interceptor(Mmap real_mmap, void *addr, SIZE_T length,
 }
 
 template <class Munmap>
-static int munmap_interceptor(Munmap real_munmap, void *addr, SIZE_T length) {
+static int munmap_interceptor(Munmap real_munmap, void* addr, SIZE_T length) {
   // We should not tag if munmap fail, but it's to late to tag after
   // real_munmap, as the pages could be mmaped by another thread.
   uptr beg = reinterpret_cast<uptr>(addr);
@@ -236,44 +239,44 @@ static int munmap_interceptor(Munmap real_munmap, void *addr, SIZE_T length) {
         return mmap_interceptor(REAL(mmap), addr, sz, prot, flags, fd, off);   \
       } while (false)
 
-#    define COMMON_INTERCEPTOR_MUNMAP_IMPL(ctx, addr, length)          \
-      do {                                                             \
-        (void)(ctx);                                                   \
-        return munmap_interceptor(REAL(munmap), addr, sz);             \
+#    define COMMON_INTERCEPTOR_MUNMAP_IMPL(ctx, addr, length) \
+      do {                                                    \
+        (void)(ctx);                                          \
+        return munmap_interceptor(REAL(munmap), addr, sz);    \
       } while (false)
 
-#    include "sanitizer_common/sanitizer_common_interceptors_memintrinsics.inc"
 #    include "sanitizer_common/sanitizer_common_interceptors.inc"
+#    include "sanitizer_common/sanitizer_common_interceptors_memintrinsics.inc"
 
 struct ThreadStartArg {
   __sanitizer_sigset_t starting_sigset_;
 };
 
-static void *HwasanThreadStartFunc(void *arg) {
+static void* HwasanThreadStartFunc(void* arg) {
   __hwasan_thread_enter();
-  SetSigProcMask(&reinterpret_cast<ThreadStartArg *>(arg)->starting_sigset_,
+  SetSigProcMask(&reinterpret_cast<ThreadStartArg*>(arg)->starting_sigset_,
                  nullptr);
   InternalFree(arg);
   auto self = GetThreadSelf();
   auto args = hwasanThreadArgRetval().GetArgs(self);
-  void *retval = (*args.routine)(args.arg_retval);
+  void* retval = (*args.routine)(args.arg_retval);
   hwasanThreadArgRetval().Finish(self, retval);
   return retval;
 }
 
 extern "C" {
-int pthread_attr_getdetachstate(void *attr, int *v);
+int pthread_attr_getdetachstate(void* attr, int* v);
 }
 
-INTERCEPTOR(int, pthread_create, void *thread, void *attr,
-            void *(*callback)(void *), void *param) {
+INTERCEPTOR(int, pthread_create, void* thread, void* attr,
+            void* (*callback)(void*), void* param) {
   EnsureMainThreadIDIsCorrect();
   ScopedTaggingDisabler tagging_disabler;
   bool detached = [attr]() {
     int d = 0;
     return attr && !pthread_attr_getdetachstate(attr, &d) && IsStateDetached(d);
   }();
-  ThreadStartArg *A = (ThreadStartArg *)InternalAlloc(sizeof(ThreadStartArg));
+  ThreadStartArg* A = (ThreadStartArg*)InternalAlloc(sizeof(ThreadStartArg));
   ScopedBlockSignals block(&A->starting_sigset_);
   // ASAN uses the same approach to disable leaks from pthread_create.
 #    if CAN_SANITIZE_LEAKS
@@ -283,14 +286,14 @@ INTERCEPTOR(int, pthread_create, void *thread, void *attr,
   int result;
   hwasanThreadArgRetval().Create(detached, {callback, param}, [&]() -> uptr {
     result = REAL(pthread_create)(thread, attr, &HwasanThreadStartFunc, A);
-    return result ? 0 : *(uptr *)(thread);
+    return result ? 0 : *(uptr*)(thread);
   });
   if (result != 0)
     InternalFree(A);
   return result;
 }
 
-INTERCEPTOR(int, pthread_join, void *thread, void **retval) {
+INTERCEPTOR(int, pthread_join, void* thread, void** retval) {
   int result;
   hwasanThreadArgRetval().Join((uptr)thread, [&]() {
     result = REAL(pthread_join)(thread, retval);
@@ -299,7 +302,7 @@ INTERCEPTOR(int, pthread_join, void *thread, void **retval) {
   return result;
 }
 
-INTERCEPTOR(int, pthread_detach, void *thread) {
+INTERCEPTOR(int, pthread_detach, void* thread) {
   int result;
   hwasanThreadArgRetval().Detach((uptr)thread, [&]() {
     result = REAL(pthread_detach)(thread);
@@ -308,13 +311,13 @@ INTERCEPTOR(int, pthread_detach, void *thread) {
   return result;
 }
 
-INTERCEPTOR(void, pthread_exit, void *retval) {
+INTERCEPTOR(void, pthread_exit, void* retval) {
   hwasanThreadArgRetval().Finish(GetThreadSelf(), retval);
   REAL(pthread_exit)(retval);
 }
 
 #    if SANITIZER_GLIBC
-INTERCEPTOR(int, pthread_tryjoin_np, void *thread, void **ret) {
+INTERCEPTOR(int, pthread_tryjoin_np, void* thread, void** ret) {
   int result;
   hwasanThreadArgRetval().Join((uptr)thread, [&]() {
     result = REAL(pthread_tryjoin_np)(thread, ret);
@@ -323,8 +326,8 @@ INTERCEPTOR(int, pthread_tryjoin_np, void *thread, void **ret) {
   return result;
 }
 
-INTERCEPTOR(int, pthread_timedjoin_np, void *thread, void **ret,
-            const struct timespec *abstime) {
+INTERCEPTOR(int, pthread_timedjoin_np, void* thread, void** ret,
+            const struct timespec* abstime) {
   int result;
   hwasanThreadArgRetval().Join((uptr)thread, [&]() {
     result = REAL(pthread_timedjoin_np)(thread, ret, abstime);
@@ -336,24 +339,24 @@ INTERCEPTOR(int, pthread_timedjoin_np, void *thread, void **ret,
 
 DEFINE_INTERNAL_PTHREAD_FUNCTIONS
 
-DEFINE_REAL(int, vfork,)
-DECLARE_EXTERN_INTERCEPTOR_AND_WRAPPER(int, vfork,)
+DEFINE_REAL(int, vfork, )
+DECLARE_EXTERN_INTERCEPTOR_AND_WRAPPER(int, vfork, )
 
 // Get and/or change the set of blocked signals.
-extern "C" int sigprocmask(int __how, const __hw_sigset_t *__restrict __set,
-                           __hw_sigset_t *__restrict __oset);
+extern "C" int sigprocmask(int __how, const __hw_sigset_t* __restrict __set,
+                           __hw_sigset_t* __restrict __oset);
 #    define SIG_BLOCK 0
 #    define SIG_SETMASK 2
 extern "C" int __sigjmp_save(__hw_sigjmp_buf env, int savemask) {
   env[0].__magic = kHwJmpBufMagic;
   env[0].__mask_was_saved =
       (savemask &&
-       sigprocmask(SIG_BLOCK, (__hw_sigset_t *)0, &env[0].__saved_mask) == 0);
+       sigprocmask(SIG_BLOCK, (__hw_sigset_t*)0, &env[0].__saved_mask) == 0);
   return 0;
 }
 
-static void __attribute__((always_inline))
-InternalLongjmp(__hw_register_buf env, int retval) {
+static void __attribute__((always_inline)) InternalLongjmp(
+    __hw_register_buf env, int retval) {
 #    if defined(__aarch64__)
   constexpr size_t kSpIndex = 13;
 #    elif defined(__x86_64__)
@@ -366,7 +369,7 @@ InternalLongjmp(__hw_register_buf env, int retval) {
   unsigned long long stack_pointer = env[kSpIndex];
   // The stack pointer should never be tagged, so we don't need to clear the
   // tag for this function call.
-  __hwasan_handle_longjmp((void *)stack_pointer);
+  __hwasan_handle_longjmp((void*)stack_pointer);
 
   // Run code for handling a longjmp.
   // Need to use a register that isn't going to be loaded from the environment
@@ -376,7 +379,7 @@ InternalLongjmp(__hw_register_buf env, int retval) {
   // stack pointer so we can't use it without knowing the demangling scheme.
 #    if defined(__aarch64__)
   register long int retval_tmp asm("x1") = retval;
-  register void *env_address asm("x0") = &env[0];
+  register void* env_address asm("x0") = &env[0];
   asm volatile(
       "ldp	x19, x20, [%0, #0<<3];"
       "ldp	x21, x22, [%0, #2<<3];"
@@ -400,7 +403,7 @@ InternalLongjmp(__hw_register_buf env, int retval) {
       : "r"(retval_tmp));
 #    elif defined(__x86_64__)
   register long int retval_tmp asm("%rsi") = retval;
-  register void *env_address asm("%rdi") = &env[0];
+  register void* env_address asm("%rdi") = &env[0];
   asm volatile(
       // Restore registers.
       "mov (0*8)(%0),%%rbx;"
@@ -419,7 +422,7 @@ InternalLongjmp(__hw_register_buf env, int retval) {
       "r"(retval_tmp));
 #    elif SANITIZER_RISCV64
   register long int retval_tmp asm("x11") = retval;
-  register void *env_address asm("x10") = &env[0];
+  register void* env_address asm("x10") = &env[0];
   asm volatile(
       "ld     ra,   0<<3(%0);"
       "ld     s0,   1<<3(%0);"
@@ -473,7 +476,7 @@ INTERCEPTOR(void, siglongjmp, __hw_sigjmp_buf env, int val) {
 
   if (env[0].__mask_was_saved)
     // Restore the saved signal mask.
-    (void)sigprocmask(SIG_SETMASK, &env[0].__saved_mask, (__hw_sigset_t *)0);
+    (void)sigprocmask(SIG_SETMASK, &env[0].__saved_mask, (__hw_sigset_t*)0);
   InternalLongjmp(env[0].__jmpbuf, val);
 }
 

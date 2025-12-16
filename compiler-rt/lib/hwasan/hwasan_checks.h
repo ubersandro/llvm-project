@@ -18,9 +18,9 @@
 #include "hwasan_registers.h"
 #include "sanitizer_common/sanitizer_common.h"
 
-#ifdef CAN_SANITIZE_LEAKS
-#define CAN_SANITIZE_LEAKS 0
-#endif
+// #ifdef CAN_SANITIZE_LEAKS
+// #  define CAN_SANITIZE_LEAKS 0
+// #endif
 
 namespace __hwasan {
 
@@ -154,43 +154,49 @@ PossiblyShortTagMatches(tag_t mem_tag, uptr ptr, uptr sz) {
   return *(u8*)(ptr | (kShadowAlignment - 1)) == ptr_tag;
 }
 
-#define getT(tag) tag & 0xF
-#define getL(tag) (tag & 0x30) >> 4
-#define getR(tag) (tag & 0x80) >> 7
+#define getT(tag) (tag & 0x0FUL)
+#define getL(tag) (tag & 0x30UL) >> 4
+#define getR(tag) (tag & 0x80UL) >> 7
 
 template <ErrorAction EA, AccessType AT>
 __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
                                                                       uptr sz) {
   if (sz == 0 || !InTaggableRegion(p)) {
-    VPrintf(1, "[FieldArmor] CAS A=%p S=%u: <SKIP> \n", (void*)p, sz);
+    // VPrintf(1, "[FieldArmor] CAS A=%p S=%u: <SKIP> \n", (void*)p, sz);
     return;
   }
 
   unsigned char* untagged_ptr = (unsigned char*)(p & ~kAddressTagMask);
   tag_t ptr_tag = GetTagFromPointer(p);
-
+  if (ptr_tag == 0) {
+    // VPrintf(1, "[FieldArmor] CAS A=%p SZ=%u: UNTAGGED PTR <SKIP>\n",
+    //         (void*)p, sz);
+    return;
+  }
   tag_t R = getR(ptr_tag);
   tag_t L = getL(ptr_tag);
   tag_t T = getT(ptr_tag);
 
-  VPrintf(1, "[FieldArmor] CAS A=%p SZ=%u - PTR R=%u L=%u T=%u\n", (void*)p, sz,
-          R, L, T);
+  // VPrintf(1, "[FieldArmor] CAS A=%p SZ=%u - PTR R=%u L=%u T=%u\n", (void*)p,
+  // sz,
+  //         R, L, T);
   tag_t mem_tag = *(tag_t*)MemToShadow((uptr)untagged_ptr);
   if (mem_tag == 0) {
-    VPrintf(1, "\033[1;33m[FieldArmor] MEM %p UNTAGGED, <SKIP>\033[0m\n",
-            (void*)untagged_ptr);
+    // VPrintf(1, "\033[1;33m[FieldArmor] MEM %p UNTAGGED, <SKIP>\033[0m\n",
+    //         (void*)untagged_ptr);
     return;
   }
 
   if (R) {
     // VPrintf(1, "\t\t[FieldArmor] RP CHECK A=%p SZ=%u\n", (void*)p, sz);
-    // if ((L == 0) && (T == 0))
-    //   return; /* pointer to outer root struct can do whatever -> CASE1*/
+    if ((L == 0) && (T == 0))
+      return; /* pointer to outer root struct can do whatever -> CASE1*/
 
     // unsigned int idx = 1;  // initial index is always 1 in RLT
     // unsigned int i = 0;
     // unsigned int tries = 0;
-    // unsigned const int THRESHOLD = 16;  // we assume a struct has no more than
+    // unsigned const int THRESHOLD = 16;  // we assume a struct has no more
+    // than
     //                                     // 16 fields for now // TODO Review
 
     // /** The following can happen here:
@@ -218,12 +224,13 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
     //       inc = 0;
 
     //       VPrintf(
-    //           2, "\t\t[FieldArmor] Clearing INC flag, expecting field idx %u\n",
-    //           idx);
+    //           2, "\t\t[FieldArmor] Clearing INC flag, expecting field idx
+    //           %u\n", idx);
     //     }
     //     continue;
     //   } else {
-    //     // if IDX is 1 we are looking for the first field. If INC is one, this
+    //     // if IDX is 1 we are looking for the first field. If INC is one,
+    //     this
     //     // is for sure a random access.
     //     if (idx == 1 && inc == 1)
     //       VPrintf(1,
@@ -233,14 +240,15 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
     //     else {
     //       if (inc == 1) {
     //         tries++;
-    //         if (tries > THRESHOLD || (prevT + 1) % 16 != (getT(*curr_memtag))) {
+    //         if (tries > THRESHOLD || (prevT + 1) % 16 !=
+    //         (getT(*curr_memtag))) {
     //           /** OVERFLOW DETECTED only if level mismatch**/
     //           if (getL(*curr_memtag) <=
     //               L) {  // NOTE: This is an ugly approximation
     //             VPrintf(0,
-    //                     "OVERFLOW, exp=%x, idx=%u curr_memtag=%u cur L=%u, tag "
-    //                     "L=%u\n",
-    //                     exp, idx, *curr_memtag, getL(*curr_memtag), L);
+    //                     "OVERFLOW, exp=%x, idx=%u curr_memtag=%u cur L=%u,
+    //                     tag " "L=%u\n", exp, idx, *curr_memtag,
+    //                     getL(*curr_memtag), L);
     //             SigTrap<EA, AT>(p, sz);
     //             if (EA == ErrorAction::Abort)
     //               __builtin_unreachable();
@@ -256,10 +264,8 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
     //         }
     //       }
 
-    //       idx = (idx + 1) % 16;  // TODO: also enforce this in instrumentation
-    //       inc = 1;
-    //       exp = (T + idx) % 16;
-    //       VPrintf(2,
+    //       idx = (idx + 1) % 16;  // TODO: also enforce this in
+    //       instrumentation inc = 1; exp = (T + idx) % 16; VPrintf(2,
     //               "\t\t[FieldArmor] Advancing to next field, idx=%u "
     //               "curr_memtag=%u, "
     //               "former exp=%u, tries=%d\n",
@@ -270,25 +276,29 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
     //   }  // tag mismatch
     // }
 
-  } else { // R == 0
-  //   VPrintf(1, "\t[FieldArmor] NO RP CHK A=%p SZ=%u\n", (void*)p, sz);
-  //   tag_t* curr_memtag;
-  //   for (uptr i = 0; i < sz; i++) {
-  //     curr_memtag = (tag_t*)MemToShadow((uptr)untagged_ptr) + i;
+  } else {  // R == 0
+    // VPrintf(1, "\t[FieldArmor] NO RP CHK A=%p SZ=%u\n", (void*)p, sz);
 
-  //     if (*curr_memtag != ptr_tag) {
-  //       VPrintf(1, "[FieldArmor] TAG MISMATCH A=%p SZ=%u\n", (void*)p, sz);
-  //       VPrintf(1, "\t[FieldArmor] EXP_T=%x, MEM_T=%x\n", ptr_tag,
-  //               *curr_memtag);
+    for (uptr i = 0; i < sz; i++) {
+      mem_tag = *(tag_t*)MemToShadow((uptr)untagged_ptr + i);
 
-  //       SigTrap<EA, AT>(p, sz);
-  //       if (EA == ErrorAction::Abort)
-  //         __builtin_unreachable();
-  //     }
-  //   }  // for
+      // TODO: un-ignore levels!!!! L 
+      if ((getT(mem_tag)) != getT(ptr_tag)) {
+        VPrintf(1, "[FieldArmor] TAG MISMATCH A=%p SZ=%u\n", (void*)(untagged_ptr + i), sz);
+        VPrintf(1, "\t[FieldArmor] memory T: %u, pointer T: %u\n",
+                getT(mem_tag), getT(ptr_tag));
+        // VPrintf(1, "\t[FieldArmor] EXP_T=%x, MEM_T=%x\n", ptr_tag,
+        // *curr_memtag);
+
+        SigTrap<EA, AT>(p, sz);
+        if (EA == ErrorAction::Abort)
+          __builtin_unreachable();
+      }
+      // else VPrintf(1, "\t\t[FieldArmor] TAG MATCH A=%p SZ=%u\n",
+      //         (void*)(untagged_ptr+ i), 1);
+    }  // for
   }  // NON RP chk
-} // CheckAddressSized
-
+}  // CheckAddressSized
 
 template <ErrorAction EA, AccessType AT, unsigned LogSize>
 __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {

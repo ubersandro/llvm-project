@@ -39,7 +39,7 @@
 #elif (SANITIZER_LINUX || SANITIZER_APPLE) && (SANITIZER_WORDSIZE == 64) && \
     (defined(__x86_64__) || defined(__mips64) || defined(__aarch64__) ||  \
      defined(__powerpc64__) || defined(__s390x__))
-#  define CAN_SANITIZE_LEAKS 1
+#  define CAN_SANITIZE_LEAKS 0
 #elif defined(__i386__) && (SANITIZER_LINUX || SANITIZER_APPLE)
 #  define CAN_SANITIZE_LEAKS 1
 #elif defined(__arm__) && SANITIZER_LINUX

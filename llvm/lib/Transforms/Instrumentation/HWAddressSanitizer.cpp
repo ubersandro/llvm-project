@@ -126,7 +126,8 @@ static cl::opt<bool> ClInstrumentAtomics(
 
 static cl::opt<bool> ClInstrumentByval("hwasan-instrument-byval",
                                        cl::desc("instrument byval arguments"),
-                                       cl::Hidden, cl::init(true));
+                                       cl::Hidden,
+                                       cl::init(true)); // TODO: look into this
 
 static cl::opt<bool>
     ClRecover("hwasan-recover",
@@ -136,6 +137,21 @@ static cl::opt<bool>
 static cl::opt<bool> ClInstrumentStack("hwasan-instrument-stack",
                                        cl::desc("instrument stack (allocas)"),
                                        cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClInstrumentPtrToInt(
+    "fieldarmor-instrument-ptr-to-int",
+    cl::desc("instrument stack ptrToInt instructions to untag results"),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClInstrumentGEPs(
+    "fieldarmor-instrument-geps",
+    cl::desc("instrument getelementptr instructions to untag results"),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClInstrumentArithmetic(
+    "fieldarmor-instrument-arithmetic",
+    cl::desc("instrument arithmetic instructions to untag results"),
+    cl::Hidden, cl::init(true));
 
 static cl::opt<bool>
     ClUseStackSafety("hwasan-use-stack-safety", cl::Hidden, cl::init(true),
@@ -245,6 +261,10 @@ template <typename T> T optOr(cl::opt<T> &Opt, T Other) {
 bool shouldInstrumentStack(const Triple &TargetTriple) {
   return ClInstrumentStack;
 }
+/** FieldArmor flags */
+bool shouldInstrumentPtrToInt() { return ClInstrumentPtrToInt; }
+bool shouldInstrumentArithmetic() { return ClInstrumentArithmetic; }
+bool shouldInstrumentGEPs() { return ClInstrumentGEPs; }
 
 bool shouldInstrumentWithCalls(const Triple &TargetTriple) {
   return optOr(ClInstrumentWithCalls, TargetTriple.getArch() == Triple::x86_64);
@@ -476,13 +496,13 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
 
   for (Function &F : M) {
 
-    errs() << "=== HWASan Before Function: " << F.getName() << " ===\n";
-    F.print(errs());
+    // errs() << "=== HWASan Before Function: " << F.getName() << " ===\n";
+    // F.print(errs());
 
     HWASan.sanitizeFunction(F, FAM);
 
-    errs() << "=== HWASan After Function: " << F.getName() << " ===\n";
-    F.print(errs());
+    // errs() << "=== HWASan After Function: " << F.getName() << " ===\n";
+    // F.print(errs());
   }
 
   PreservedAnalyses PA = PreservedAnalyses::none();
@@ -846,6 +866,7 @@ bool HWAddressSanitizer::ignoreAccess(OptimizationRemarkEmitter &ORE,
 }
 
 void HWAddressSanitizer::getInterestingMemoryOperands(
+    // TODO: explore this method
     OptimizationRemarkEmitter &ORE, Instruction *I,
     const TargetLibraryInfo &TLI,
     SmallVectorImpl<InterestingMemoryOperand> &Interesting) {
@@ -1605,14 +1626,13 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       CMPsToInstrument.push_back(CI);
     }
 
-    if(PtrToIntInst *PTII = dyn_cast<PtrToIntInst>(&Inst)) {
+    if (PtrToIntInst *PTII = dyn_cast<PtrToIntInst>(&Inst)) {
       PointerToIntInstructions.push_back(PTII);
     }
 
     if (BinaryOperator *BO = dyn_cast<BinaryOperator>(&Inst)) {
       ArithInstructions.push_back(BO);
     }
-    
   }
 
   memtag::StackInfo &SInfo = SIB.get();
@@ -1994,7 +2014,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
   Value *fatherL =
       IRB.CreateAnd(fatherTL, ConstantInt::get(IntptrTy, 0x70Lu)); /*01110000*/
-
+  // fatherTL.setName("gep.father.TL");
   // IRB.CreateCall(Fprintf,
   //                {Stderr,
   //                 IRB.CreateGlobalString(
@@ -2024,7 +2044,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
       std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                          : "gep." + itostr(NumInstrumentedGEPs);
-      taggedPointer->setName(Name + ".fieldarmor");
+      taggedPointer->setName(Name + ".fieldarmor.array");
       Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
 
       GEPI->replaceUsesWithIf(
@@ -2068,9 +2088,11 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   else {
 
     Value *sonL = IRB.CreateShl(
-        IRB.CreateURem(IRB.CreateAdd(IRB.CreateLShr(fatherL, 4Lu),
-                                     ConstantInt::get(IntptrTy, 1Lu)),
-                       ConstantInt::get(IntptrTy, 0x8Lu)),
+        IRB.CreateURem(
+            IRB.CreateAdd(
+                IRB.CreateLShr(fatherL, 4Lu),
+                ConstantInt::get(IntptrTy, 1Lu)),
+            ConstantInt::get(IntptrTy, 0x8Lu)),
         4Lu);
     sonTag =
         IRB.CreateOr(sonL, ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit
@@ -2080,9 +2102,6 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     //                     "\t[FieldArmor - DBG] GEP son struct T: %lu, L:
     //                     %lu\n"),
     //                 ConstantInt::get(IntptrTy, 0x0Lu), sonL});
-    /**DEBUG: TODO remove what follows later */
-    Value *sonT = ConstantInt::get(IntptrTy, 0x0Lu);
-    sonTag = sonT;
   }
 
   Value *taggedPointer =
@@ -2097,7 +2116,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
   std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                      : "gep." + itostr(NumInstrumentedGEPs);
-  taggedPointer->setName(Name + ".fieldarmor");
+  taggedPointer->setName(Name + ".fieldarmor" +
+                         (sonType->isStructTy() ? ".struct" : ".scalar"));
 
   Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
 
@@ -2130,30 +2150,34 @@ void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
   }
 }
 
-bool followOpDefUseChainForArithmetic(Value *V) { 
-  // this is flaky, cases other than PtrToInt are not handled well in the caller.
+bool followOpDefUseChainForArithmetic(Value *V) {
+  // this is flaky, cases other than PtrToInt are not handled well in the
+  // caller.
   bool isAllocaPtr = false;
   isAllocaPtr = isa<AllocaInst>(V->stripPointerCasts());
   bool isCallReturn = isa<CallInst>(V->stripPointerCasts());
-  if(isCallReturn) {
-    
+  if (isCallReturn) {
+
     CallInst *CI = cast<CallInst>(V->stripPointerCasts());
 
     Function *CalledFunc = CI->getCalledFunction();
-    
+
     if (CalledFunc) {
-      LLVM_DEBUG(dbgs() << "[FieldArmor] Arithmetic operand " << *V << " comes from call to function: " << CalledFunc->getName() << "\n");
+      LLVM_DEBUG(dbgs() << "[FieldArmor] Arithmetic operand " << *V
+                        << " comes from call to function: "
+                        << CalledFunc->getName() << "\n");
       return CalledFunc->getReturnType()->isPointerTy();
-      // What if the called function converts a pointer to an integer and returns?
+      // What if the called function converts a pointer to an integer and
+      // returns?
       // TODO: handle!!!
     }
   }
-  return isa<PtrToIntInst>(V) || isAllocaPtr; 
+  return isa<PtrToIntInst>(V) || isAllocaPtr;
 }
 
 void HWAddressSanitizer::InstrumentArithmetic(BinaryOperator *CI) {
   // IS THIS ENOUGH? NO
-  
+
   auto op1 = CI->getOperand(0);
   auto op2 = CI->getOperand(1);
 
@@ -2165,14 +2189,15 @@ void HWAddressSanitizer::InstrumentArithmetic(BinaryOperator *CI) {
 
     if (isPointerO1) {
       auto typeOp1 = cast<PtrToIntInst>(op1)->getType();
-      
+
       Value *untaggedop1 =
           IRB.CreateAnd(op1, ConstantInt::get(typeOp1, ~(0x7FLu << 56Lu)));
       CI->replaceUsesOfWith(op1, untaggedop1);
     }
 
     if (isPointerO2) {
-      auto typeOp2 = cast<PtrToIntInst>(op2)->getType(); // this fails it not right Type
+      auto typeOp2 =
+          cast<PtrToIntInst>(op2)->getType(); // this fails it not right Type
       Value *untaggedop2 =
           IRB.CreateAnd(op2, ConstantInt::get(typeOp2, ~(0x7FLu << 56Lu)));
       CI->replaceUsesOfWith(op2, untaggedop2);
@@ -2186,12 +2211,12 @@ void HWAddressSanitizer::InstrumentArithmetic(BinaryOperator *CI) {
 } // InstrumentArithmetic
 
 void HWAddressSanitizer::InstrumentPtrToInt(PtrToIntInst *PI) {
+  // might be removing too many tags
   LLVM_DEBUG(dbgs() << "[FieldArmor] Instrumenting PtrToInt: " << *PI << "\n");
   IRBuilder<> IRB(PI);
   Value *untaggedPtr =
       untagPointer(IRB, IRB.CreatePtrToInt(PI->getPointerOperand(), IntptrTy));
   untaggedPtr->setName(PI->getName() + ".untagged");
-  // PI->replaceUses(PI, untaggedPtr);
   PI->replaceAllUsesWith(untaggedPtr);
 }
 
