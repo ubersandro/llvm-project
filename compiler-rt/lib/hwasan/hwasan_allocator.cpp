@@ -198,7 +198,7 @@ static void *HwasanAllocate(StackTrace *stack, uptr orig_size, uptr alignment,
       return nullptr;
     ReportRssLimitExceeded(stack);
   }
-  VPrintf(1 , "[FieldArmor] HwasanAllocate: size=%zx align=%zx\n", orig_size, alignment);
+  // VPrintf(1 , "[FieldArmor] HwasanAllocate: size=%zx align=%zx\n", orig_size, alignment);
   alignment = Max(alignment, kShadowAlignment);
   uptr size = TaggedSize(orig_size);
   Thread *t = GetCurrentThread();
@@ -261,7 +261,7 @@ static void *HwasanAllocate(StackTrace *stack, uptr orig_size, uptr alignment,
 #endif
   meta->SetAllocated(StackDepotPut(*stack), orig_size);
   RunMallocHooks(user_ptr, orig_size);
-  VPrintf(1 , "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n", orig_size, alignment, user_ptr);
+  // VPrintf(1 , "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n", orig_size, alignment, user_ptr);
   return user_ptr;
 }
 

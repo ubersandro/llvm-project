@@ -150,8 +150,8 @@ static cl::opt<bool> ClInstrumentGEPs(
 
 static cl::opt<bool> ClInstrumentArithmetic(
     "fieldarmor-instrument-arithmetic",
-    cl::desc("instrument arithmetic instructions to untag results"),
-    cl::Hidden, cl::init(true));
+    cl::desc("instrument arithmetic instructions to untag results"), cl::Hidden,
+    cl::init(true));
 
 static cl::opt<bool>
     ClUseStackSafety("hwasan-use-stack-safety", cl::Hidden, cl::init(true),
@@ -209,7 +209,7 @@ static cl::opt<int> ClHotPercentileCutoff("hwasan-percentile-cutoff-hot",
 STATISTIC(NumTotalFuncs, "Number of total funcs");
 STATISTIC(NumInstrumentedFuncs, "Number of instrumented funcs");
 STATISTIC(NumNoProfileSummaryFuncs, "Number of funcs without PS");
-STATISTIC(NumLiteralStructs, "Number of literal structs encountered");
+// STATISTIC(NumLiteralStructs, "Number of literal structs encountered");
 STATISTIC(NumInstrumentedGEPs, "Number of instrumented GEP instructions");
 STATISTIC(NumInstrumentedGlobals, "Number of instrumented global variables");
 STATISTIC(NumDefinedTagVectors, "Number of defined tag vectors");
@@ -307,6 +307,7 @@ private:
 
   // FieldArmor addenda
   void InstrumentGEP(GetElementPtrInst *GEPI);
+  void handleGEP2operands(GetElementPtrInst *GEPI);
   void InstrumentCMP(CmpInst *CI);
   void InstrumentPtrToInt(PtrToIntInst *PI);
   void InstrumentArithmetic(BinaryOperator *BO);
@@ -788,6 +789,25 @@ void HWAddressSanitizer::initializeCallbacks(Module &M) {
       M.getOrInsertFunction("__hwasan_handle_vfork", VoidTy, IntptrTy);
 }
 
+void dbgPrintStructType(StructType *t) {
+  bool isUnion = false;
+  bool isLiteral = t->isLiteral();
+  bool isOpaque = t->isOpaque();
+  bool isSized = t->isSized();
+
+  isUnion =
+      !isLiteral && t->getName().str().find("union.") != std::string::npos;
+  LLVM_DEBUG(dbgs() << "[FieldArmor - createTagVectors] Identified struct: "
+                    << t->getName() << "\n");
+  LLVM_DEBUG(dbgs() << "\t\ttype: ");
+  LLVM_DEBUG(t->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\n");
+  LLVM_DEBUG(dbgs() << "\t\tisLiteral: " << isLiteral << "\n");
+  LLVM_DEBUG(dbgs() << "\t\tisOpaque: " << isOpaque << "\n");
+  LLVM_DEBUG(dbgs() << "\t\tisSized: " << isSized << "\n");
+  LLVM_DEBUG(dbgs() << "\t\tisUnion: " << isUnion << "\n");
+}
+
 Value *HWAddressSanitizer::getOpaqueNoopCast(IRBuilder<> &IRB, Value *Val) {
   // An empty inline asm with input reg == output reg.
   // An opaque no-op cast, basically.
@@ -1150,27 +1170,8 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
                                              DomTreeUpdater &DTU, LoopInfo *LI,
                                              const DataLayout &DL) {
   Value *Addr = O.getPtr();
-
-  // LLVM_DEBUG(dbgs() << "{++] Instrumenting MEMACCESS ");
-  // LLVM_DEBUG(O.getInsn()->print(dbgs()));
-  // LLVM_DEBUG(dbgs() << "\n");
-  // LLVM_DEBUG(O.OpType->print(dbgs()));
-
-  // if (O.OpType->isPointerTy()) {
-  //   auto instruction = O.getInsn();
-  //   if (dyn_cast<LoadInst>(instruction)) {
-  //     LoadInst *LI = cast<LoadInst>(instruction);
-  //     LLVM_DEBUG(dbgs() << " -> load instruction\n");
-  //     LLVM_DEBUG(dbgs() << "load type: ");
-  //     LLVM_DEBUG(LI->getType()->print(dbgs()));
-  //   } else if (dyn_cast<StoreInst>(instruction)) {
-  //     LLVM_DEBUG(dbgs() << " -> store instruction\n");
-  //   } else {
-  //     LLVM_DEBUG(dbgs() << " -> other instruction\n");
-  //   }
-  // }
-  // LLVM_DEBUG(dbgs() << "\n");
-
+  LLVM_DEBUG(dbgs() << "[FieldArmor]: Instrumenting memory access: "
+                    << *O.getInsn() << "\n");
   // If the pointer is statically known to be zero, the tag check will pass
   // since:
   // 1) it has a zero tag
@@ -1191,34 +1192,37 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
       (!O.Alignment || *O.Alignment >= Mapping.getObjectAlignment() ||
        *O.Alignment >= O.TypeStoreSize / 8)) {
     size_t AccessSizeIndex = TypeSizeToSizeIndex(O.TypeStoreSize);
-    if (InstrumentWithCalls) {
-      // LLVM_DEBUG(dbgs() << "Using call-based instrumentation\n");
-      errs() << "[++] Using call-based instrumentation\n";
-      SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
-      if (UseMatchAllCallback)
-        Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
-      IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
-                     Args);
-    } else if (OutlinedChecks) {
-      // LLVM_DEBUG(dbgs() << "Outlining the check\n");
-      instrumentMemAccessOutline(Addr, O.IsWrite, AccessSizeIndex, O.getInsn(),
-                                 DTU, LI);
-    } else {
-      // LLVM_DEBUG(dbgs() << "Inlining the check\n");
-      instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, O.getInsn(),
-                                DTU, LI);
-    }
+    // if (InstrumentWithCalls) {
+    // LLVM_DEBUG(dbgs() << "Using call-based instrumentation\n");
+    // errs() << "[++] Using call-based instrumentation\n";
+    SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
+    // if (UseMatchAllCallback)
+    //   Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag)); // TODO:
+    //   potentially remove
+    IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
+                   Args);
+    // } else if (OutlinedChecks) {
+    //   // LLVM_DEBUG(dbgs() << "Outlining the check\n");
+    //   instrumentMemAccessOutline(Addr, O.IsWrite, AccessSizeIndex,
+    //   O.getInsn(),
+    //                              DTU, LI);
+    // } else {
+    //   // LLVM_DEBUG(dbgs() << "Inlining the check\n");
+    //   instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex,
+    //   O.getInsn(),
+    //                             DTU, LI);
+    // }
   } else {
-    // LLVM_DEBUG(dbgs() << "Using call-based instrumentation, else case\n");
     SmallVector<Value *, 3> Args{
         IRB.CreatePointerCast(Addr, IntptrTy),
         IRB.CreateUDiv(IRB.CreateTypeSize(IntptrTy, O.TypeStoreSize),
                        ConstantInt::get(IntptrTy, 8))};
-    if (UseMatchAllCallback)
-      Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
+    // if (UseMatchAllCallback)
+    //   Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
     IRB.CreateCall(HwasanMemoryAccessCallbackSized[O.IsWrite], Args);
   }
-  untagPointerOperand(O.getInsn(), Addr); // TODO: check on this
+  untagPointerOperand(
+      O.getInsn(), Addr); // This is the right way of handling pointer operands
 
   return true;
 }
@@ -1707,7 +1711,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     InstrumentArithmetic(BO);
   }
   // NOTE: this brings us to lose TAG.
-  for(auto &PI: PointerToIntInstructions) {
+  for (auto &PI : PointerToIntInstructions) {
     InstrumentPtrToInt(PI);
   }
 
@@ -1956,6 +1960,42 @@ void handleDynamicallyAllocatedGEP(GetElementPtrInst *GEPI,
   //   }
   // }
 } // handle DynamicallyAllocatedGEP
+// TODO: precisely reconstruct dst type. If it's a union, treat it as a scalar.
+
+void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
+  auto GEPType = GEPI->getSourceElementType();
+  if (StructType *ST = dyn_cast<StructType>(GEPType)) {
+    bool isLiteral = ST->isLiteral();
+    if (!isLiteral && ST->getName().str().find("union.") != std::string::npos) {
+      IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
+      Value *resultLong = IRB.CreatePointerCast(GEPI, IntptrTy);
+
+      Value *untaggedResLong = untagPointer(IRB, resultLong);
+
+      Value *untaggedResLongPtr =
+          IRB.CreatePointerCast(untaggedResLong, IntptrTy);
+
+      auto taggedPointer =
+          tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
+                     ConstantInt::get(IntptrTy, 0xddLu)); // 0xdd TAG
+
+      std::string Name = GEPI->hasName() ? GEPI->getName().str()
+                                         : "gep." + itostr(NumInstrumentedGEPs);
+      taggedPointer->setName(Name + ".arrayidx.fieldarmor.union");
+      Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
+
+      GEPI->replaceUsesWithIf(
+          taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
+            auto *User = U.getUser();
+            return User != resultLong && User != GEPICastToPtr &&
+                   !isa<LifetimeIntrinsic>(User);
+          });
+      NumInstrumentedGEPs++;
+
+      return;
+    }
+  }
+}
 
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   /** DEBUG */
@@ -1965,24 +2005,66 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   //     "fprintf", FunctionType::get(Int32Ty, {PtrTy, PtrTy}, true));
 
   /** DEBUG */
-  dumpGEPDebug(GEPI);
+  // dumpGEPDebug(GEPI);
   auto nOperands = GEPI->getNumOperands();
-  assert(nOperands <= 3); // This check WILL fail.
+  assert(nOperands <= 3); // This check never fails if un-squashing the GEPs.
   if (nOperands != 3) {   // it means it has 2 operands (?)
-    LLVM_DEBUG(
-        dbgs() << "[FieldArmor] GEP with more than 1 index operand. Skipping: "
-               << *GEPI << "\n");
-    return;
+    handleGEP2operands(GEPI);
+    return; // TODO: look into this
   }
+  // NOTE: skipping 2 elems GEPs means skipping geps on arrays, which leaves
+  // some ptrs untagged. If those pointers point to a union, we lose this
+  // information.
+
   LLVM_DEBUG(dbgs() << "[FieldArmor] Instrumenting GEP: " << *GEPI << "\n");
+  /**
+   * CASES:
+   *  1. SRC is array. If returning a pointer to a struct, tag it as root
+   * pointer.
+   *  2. SRC is struct.
+   *   2a) SRC is not literal.
+   *    2aa) SRC is struct. Business as usual.
+   *     2ab) SRC is union. Every GEP into a union returns a pointer tagged as
+   * SCALAR with the same tag as the union. 2b) SRC is literal. Untag the
+   * pointer and mark it as untagged. Further GEPs must propagate this untagged
+   * status.
+   */
 
   // Instruction *endOfTheChain = nullptr;
   // auto dynamicallyAllocated = isDynamicallyAllocated(GEPI, &endOfTheChain);
   // if (dynamicallyAllocated) {
-  // return; // TODO for later
+  // return; // TODO handle GEPs into dynamically allocated memory properly.
   // }
 
   auto fatherType = GEPI->getSourceElementType();
+  // EXAMPLE:   %arrayidx = getelementptr inbounds %union.yyGLRStackItem, ptr
+  // %857, i64 %idxprom, !dbg !6862 array of unions -> should be tagged as
+  // scalar
+
+  // CHECK OPERAND NAME! Does not make much sense
+  if (GEPI->getOperand(0)->hasName() &&
+      GEPI->getOperand(0)->getName().str().find(".fieldarmor.union") !=
+          std::string::npos) {
+    // propagate the name to the result of the gep
+    std::string Name = GEPI->hasName() ? GEPI->getName().str()
+                                       : "gep." + itostr(NumInstrumentedGEPs);
+    GEPI->setName(Name + ".fieldarmor.union"); // propagate
+    NumInstrumentedGEPs++;
+    return;
+  }
+
+  // handle GEPs into untagged pointers (tags are removed in case of literal
+  // structs)
+  if (GEPI->getOperand(0)->hasName() &&
+      GEPI->getOperand(0)->getName().str().find(".untagged") !=
+          std::string::npos) {
+    // propagate the name to the result of the gep
+    std::string Name = GEPI->hasName() ? GEPI->getName().str()
+                                       : "gep." + itostr(NumInstrumentedGEPs);
+    GEPI->setName(Name + ".fieldarmor.untagged");
+    NumInstrumentedGEPs++;
+    return;
+  }
 
   IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
   /** DEBUG */
@@ -2007,6 +2089,56 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   //      IRB.CreateIntToPtr(untaggedResLong, PtrTy)});
 
   Value *untaggedResLongPtr = IRB.CreatePointerCast(untaggedResLong, IntptrTy);
+  auto fatherTypeIsUnion =
+      (fatherType->isStructTy() &&
+       !dyn_cast<StructType>(fatherType)->isLiteral() &&
+       (dyn_cast<StructType>(fatherType)->getName().str().find("union.") !=
+        std::string::npos));
+
+  if (fatherTypeIsUnion) {
+
+    auto taggedPointer =
+        tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
+                   ConstantInt::get(IntptrTy, 0xddLu)); // 0xdd TAG
+
+    std::string Name = GEPI->hasName() ? GEPI->getName().str()
+                                       : "gep." + itostr(NumInstrumentedGEPs);
+    taggedPointer->setName(Name + ".fieldarmor.union");
+    Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
+
+    GEPI->replaceUsesWithIf(
+        taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
+          auto *User = U.getUser();
+          return User != resultLong && User != GEPICastToPtr &&
+                 !isa<LifetimeIntrinsic>(User);
+        });
+    NumInstrumentedGEPs++;
+    return;
+  } // if father is union
+
+  if (fatherType->isStructTy() &&
+      dyn_cast<StructType>(fatherType)->isLiteral()) {
+    // untag the pointer on access to it. Maybe it's better to untag it when it
+    // is the dst ptr?
+    auto taggedPointer =
+        tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
+                   ConstantInt::get(IntptrTy, 0x0Lu)); // NULL TAG
+
+    std::string Name = GEPI->hasName() ? GEPI->getName().str()
+                                       : "gep." + itostr(NumInstrumentedGEPs);
+    taggedPointer->setName(Name + ".fieldarmor.untagged");
+    Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
+
+    GEPI->replaceUsesWithIf(
+        taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
+          auto *User = U.getUser();
+          return User != resultLong && User != GEPICastToPtr &&
+                 !isa<LifetimeIntrinsic>(User);
+        });
+    NumInstrumentedGEPs++;
+    return;
+  } // if struct and literal
+
   Value *fatherTL = IRB.CreateLShr(
       IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x7FLu << 56Lu)),
       PointerTagShift); // UNSET RP
@@ -2023,22 +2155,45 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   //                 fatherT, fatherL});
 
   auto sonType = GEPI->getResultElementType();
-
+  // it can be a) struct, b) array, c) scalar. In case of struct, it can be a)
+  // literal, b) named. Struct can also be a union.
   if (fatherType->isArrayTy()) {
-    // TODO: this is totally untested, find a SPEC benchmark doing weird struct
-    // arithmetics.
     if (!sonType->isStructTy()) {
-      LLVM_DEBUG(dbgs() << "[FieldArmor] GEP: array -> non-struct. Skipping: "
-                        << *GEPI << "\n");
+      /** it could be a) another array, b) scalar. Pointer has the same tag as
+       * father. */
+      // auto taggedPointer =
+      //     tagPointer(IRB, GEPI->getType(), untaggedResLongPtr, fatherTL);
       return;
     } else {
       // GEPPING into an array of structs -> return a ROOT POINTER to the struct
-      LLVM_DEBUG(dbgs() << "[FieldArmor] GEP: array -> struct: " << *GEPI
-                        << "\n");
-      LLVM_DEBUG(dbgs() << "[FieldArmor] GEPI->getType(): ");
-      LLVM_DEBUG(GEPI->getType()->print(dbgs()));
-      LLVM_DEBUG(dbgs() << "\n");
+      // OR a pointer to a union is that the struct is a union
+      auto sonTypeCast = dyn_cast<StructType>(sonType);
+      auto sonIsUnion =
+          (sonType->isStructTy() && !sonTypeCast->isLiteral() &&
+           (sonTypeCast->getName().str().find("union.") != std::string::npos));
+      if (sonIsUnion) {
+        LLVM_DEBUG(dbgs() << "[FieldArmor] GEP on arr of unions: " << *sonType
+                          << "\n");
+        auto taggedPointer =
+            tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
+                       ConstantInt::get(IntptrTy, 0xddLu)); // tag UNION
 
+        std::string Name = GEPI->hasName()
+                               ? GEPI->getName().str()
+                               : "gep." + itostr(NumInstrumentedGEPs);
+        taggedPointer->setName(Name + ".fieldarmor.union");
+
+        Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
+
+        GEPI->replaceUsesWithIf(
+            taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
+              auto *User = U.getUser();
+              return User != resultLong && User != GEPICastToPtr &&
+                     !isa<LifetimeIntrinsic>(User); // NOOOO
+            });
+        NumInstrumentedGEPs++;
+        return;
+      }
       auto taggedPointer =
           tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
                      ConstantInt::get(IntptrTy, 0x80Lu)); // tag RP LEVEL 0
@@ -2058,62 +2213,95 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       return;
     } // GEP array -> struct
   } // GEP from array type
-
-  // NOTE: scalar array pointers must have the same color! WHICH IS EITHER 0 OR
-  // SOMETHING ELSE IFF NESTED
-
+  // dbgPrintStructType(dyn_cast<StructType>(fatherType));
+  // at this point, father is struct
   auto sonIdx =
       IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
-                    ConstantInt::get(IntptrTy, 0x1Lu)); // THIS MIGHT BE BROKEN?
-  // GEPI->getOperand(2) OOB
+                    ConstantInt::get(IntptrTy, 0x1Lu));
+  // GEPI->getOperand(2) OOB ->
   // LEVEL is aligned and ready to be applied
 
   Value *sonTag = nullptr;
 
+  // scalar and union case
+  // auto dstIsUnion =
+  //     (sonType->isStructTy() && !dyn_cast<StructType>(sonType)->isLiteral()
+  //     &&
+  //      (dyn_cast<StructType>(sonType)->getName().str().find("union.") !=
+  //       std::string::npos));
+  // // LLVM_DEBUG(dbgs() << "GEP DST TYPE IS UNION? "  << dstIsUnion << "\n");
+
+  // if (dstIsUnion) {
+  //   sonTag = ConstantInt::get(IntptrTy, 0xddLu);
+  //   // tag unions with a fixed tag // TODO REMOVE
+  // } else
   if (!sonType->isStructTy()) {
 
-    // NOTE: THIS BREAKS IF PTR TO INT CASTS ARE NOT FIXED DETAGGING THE POINTER
     Value *sonT = IRB.CreateAnd(IRB.CreateAdd(fatherT, sonIdx),
                                 ConstantInt::get(IntptrTy, 0xFFLu));
     sonTag = IRB.CreateOr(sonT, fatherL);
-
-    /** DEBUG */
-    // IRB.CreateCall(Fprintf, {Stderr,
-    //                          IRB.CreateGlobalString(
-    //                              "\t[FieldArmor - DBG] GEP son non-struct T:
-    //                              "
-    //                              "%lu, L: %lu, SON IDX: %lu\n"),
-    //                          sonT, fatherL, sonIdx});
   }
 
   else {
+    // son is a struct: might be a union!
+    // dbgPrintStructType(dyn_cast<StructType>(sonType));
+    // NOTE: literal structs pointers are treated as regular structs.
+    bool sonIsUnion =
+        sonType->isStructTy() && !dyn_cast<StructType>(sonType)->isLiteral() &&
+        (dyn_cast<StructType>(sonType)->getName().str().find("union.") !=
+         std::string::npos); // quite flaky! TODO CHANGE
+    // augment the above with the following
+    auto FatherTypeCast = dyn_cast<StructType>(fatherType);
+    auto sonTypeRetrieved = FatherTypeCast->getElementType(
+        cast<ConstantInt>(GEPI->getOperand(2))->getZExtValue());
+    sonIsUnion |= (sonTypeRetrieved->isStructTy() &&
+                   !dyn_cast<StructType>(sonTypeRetrieved)->isLiteral() &&
+                   (dyn_cast<StructType>(sonTypeRetrieved)
+                        ->getName()
+                        .str()
+                        .find("union.") != std::string::npos));
+    // ALSO RETRIEVE THE ACTUAL VAR NAME FROM DATA LAYOUT?
+    // get struct layout
+    // StructLayout *SL =
+    //     M.getDataLayout().getStructLayout(FatherTypeCast);
+    // auto offset = SL->getElementOffset(
+    //     cast<ConstantInt>(GEPI->getOperand(2))->getZExtValue());
+    if (sonIsUnion) {
+      LLVM_DEBUG(dbgs() << "[FieldArmor] GEP DST TYPE IS UNION: " << *sonType
+                        << "\n");
+      sonTag = ConstantInt::get(IntptrTy, 0xDDLu);
+      Value *taggedPointer =
+          tagPointer(IRB, GEPI->getType(), untaggedResLongPtr, sonTag);
 
-    Value *sonL = IRB.CreateShl(
-        IRB.CreateURem(
-            IRB.CreateAdd(
-                IRB.CreateLShr(fatherL, 4Lu),
-                ConstantInt::get(IntptrTy, 1Lu)),
-            ConstantInt::get(IntptrTy, 0x8Lu)),
-        4Lu);
-    sonTag =
-        IRB.CreateOr(sonL, ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit
-    // IRB.CreateCall(Fprintf,
-    //                {Stderr,
-    //                 IRB.CreateGlobalString(
-    //                     "\t[FieldArmor - DBG] GEP son struct T: %lu, L:
-    //                     %lu\n"),
-    //                 ConstantInt::get(IntptrTy, 0x0Lu), sonL});
+      std::string Name = GEPI->hasName() ? GEPI->getName().str()
+                                         : "gep." + itostr(NumInstrumentedGEPs);
+      taggedPointer->setName(Name + ".fieldarmor.union");
+
+      Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
+
+      GEPI->replaceUsesWithIf(
+          taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
+            auto *User = U.getUser();
+            return User != resultLong && User != GEPICastToPtr &&
+                   !isa<LifetimeIntrinsic>(User); // NOOOO
+          });
+      NumInstrumentedGEPs++;
+      return;
+
+    } // if son is union
+    else {
+      Value *sonL = IRB.CreateShl(
+          IRB.CreateURem(IRB.CreateAdd(IRB.CreateLShr(fatherL, 4Lu),
+                                       ConstantInt::get(IntptrTy, 1Lu)),
+                         ConstantInt::get(IntptrTy, 0x8Lu)),
+          4Lu);
+      sonTag =
+          IRB.CreateOr(sonL, ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit
+    }
   }
 
   Value *taggedPointer =
       tagPointer(IRB, GEPI->getType(), untaggedResLongPtr, sonTag);
-  // IRB.CreateCall(Fprintf,
-  //                {Stderr,
-  //                 IRB.CreateGlobalString(
-  //                     "\t[FieldArmor - DBG] GEP tagged result ptr: %p\n"),
-  //                 IRB.CreateIntToPtr(
-  //                     IRB.CreatePointerCast(taggedPointer, IntptrTy),
-  //                     PtrTy)});
 
   std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                      : "gep." + itostr(NumInstrumentedGEPs);
@@ -2177,8 +2365,6 @@ bool followOpDefUseChainForArithmetic(Value *V) {
 }
 
 void HWAddressSanitizer::InstrumentArithmetic(BinaryOperator *CI) {
-  // IS THIS ENOUGH? NO
-
   auto op1 = CI->getOperand(0);
   auto op2 = CI->getOperand(1);
 
@@ -2217,7 +2403,8 @@ void HWAddressSanitizer::InstrumentPtrToInt(PtrToIntInst *PI) {
   LLVM_DEBUG(dbgs() << "[FieldArmor] Instrumenting PtrToInt: " << *PI << "\n");
   Value *untaggedPtrLong =
       untagPointer(IRB, IRB.CreatePtrToInt(PI->getPointerOperand(), IntptrTy));
-  PI->setOperand(0, IRB.CreateIntToPtr(untaggedPtrLong, PI->getPointerOperand()->getType()));
+  PI->setOperand(0, IRB.CreateIntToPtr(untaggedPtrLong,
+                                       PI->getPointerOperand()->getType()));
   // Q: do I still need to replace the uses?
 }
 
@@ -2523,40 +2710,35 @@ Value *HWAddressSanitizer::getRPTag(IRBuilder<> &IRB) {
 
 // TODO: remove
 
+/** This method is called on whatever struct that was identified in the
+ * frontend. This includes unions and literal structs. */
 void HWAddressSanitizer::createTagVector(StructType *t) {
-  if (t->isLiteral()) { // TODO: handle literal structs.
-    // THIS SEEMS TO BE A PROBLEM ONLY IN GLOBALS...
-    ++NumLiteralStructs;
-    LLVM_DEBUG(
-        dbgs()
-        << "[FieldArmor - createTagVector] NO PRECOMP FOR LITERAL STRUCT: "
-        << t->getName() << "\n");
-    return;
-  }
 
   std::string TagVecName = t->getStructName().str() + ".fieldarmor.tagvec";
   auto *TagVec = M.getGlobalVariable(TagVecName, true);
   if (TagVec) {
-    LLVM_DEBUG(dbgs() << "[FieldArmor - createTagVector] Tag vector already "
-                         "exists for struct: "
-                      << t->getName() << "\n");
     return;
   }
   auto size = M.getDataLayout().getTypeAllocSize(t);
 
-  bool isUnion = t->getName().str().find("union.") != std::string::npos;
   u_int8_t *tags = nullptr;
+  bool isLiteral = t->isLiteral();
+  bool isUnion = t->getName().str().find("union.") != std::string::npos;
+
   if (isUnion) {
-    // create constant tag vector with all 1s
+    /** Non-literal union: treat it as a scalar field. */
     LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Tagging union with "
-                         "constant tag. Type ");
+                         "constant tag 0xdd. Type ");
     LLVM_DEBUG(t->print(dbgs()));
     LLVM_DEBUG(dbgs() << "\n");
     tags = new uint8_t[size]; // TODO: get rid of this, maybe causing OOM
-    memset(tags, 0x1, size);
+    memset(tags, (unsigned char)0xdd, size);
+    // TODO: this is just for convenience.
     NumProtectedUnions++;
   } // if isUnion
   else {
+    // Not a non-literal union: can be a struct (literal or named), can a
+    // literal union, can be a scalar
     LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Its not a union: "
                       << t->getName() << "\n");
     tags = computeTags(t);
@@ -2581,26 +2763,12 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
   NumDefinedTagVectors++;
 }
 
-void dbgPrintStructType(StructType *t) {
-  bool isUnion = false;
-  isUnion = t->getName().str().find("union.") != std::string::npos;
-  LLVM_DEBUG(dbgs() << "[FieldArmor - createTagVectors] Identified struct: "
-                    << t->getName() << "\n");
-  LLVM_DEBUG(dbgs() << "\t\ttype: ");
-  LLVM_DEBUG(t->print(dbgs()));
-  LLVM_DEBUG(dbgs() << "\n");
-  LLVM_DEBUG(dbgs() << "\t\tisLiteral: " << t->isLiteral() << "\n");
-  LLVM_DEBUG(dbgs() << "\t\tisOpaque: " << t->isOpaque() << "\n");
-  LLVM_DEBUG(dbgs() << "\t\tisSized: " << t->isSized() << "\n");
-  LLVM_DEBUG(dbgs() << "\t\tisUnion: " << isUnion << "\n");
-}
-
 void HWAddressSanitizer::createTagVectors() {
   /** you only do this for each struct... */
   auto identifiedStructTypes = M.getIdentifiedStructTypes();
 
   for (auto t : identifiedStructTypes) {
-    dbgPrintStructType(t);
+    // dbgPrintStructType(t);
     createTagVector(t);
   }
 }
@@ -2649,36 +2817,12 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
     sonIdx = std::get<3>(el_pair);
     size_t sonOffset = std::get<4>(el_pair);
 
-    if (sonType->isStructTy()) {
-      auto structTy = cast<StructType>(sonType);
-      if (structTy->isLiteral()) {
-        // NOTE: getName fires an assertion on literal structs
-        // NOTE: many std c++ types are implemented as literal structs
-        LLVM_DEBUG(
-            dbgs()
-            << " [FieldArmor - ComputeTags] NO PRECOMP FOR LITERAL STRUCT: ");
-        LLVM_DEBUG(sonType->print(dbgs()));
-        LLVM_DEBUG(dbgs() << "\n");
-        ++NumLiteralStructs;
-        // continue;
-      } else {
-        bool nestedUnion =
-            structTy->getStructName().str().find("union.") != std::string::npos;
-        if (nestedUnion) {
-          LLVM_DEBUG(dbgs()
-                     << " [FieldArmor - ComputeTags] Identified nested union "
-                        "struct tagging. Type ");
-          LLVM_DEBUG(sonType->print(dbgs()));
-          LLVM_DEBUG(dbgs() << "\n");
-        }
-      }
+    auto ST_son = dyn_cast<StructType>(sonType);
+    auto isLiteralStruct = ST_son && ST_son->isLiteral();
+    auto isUnion = ST_son && !isLiteralStruct &&
+                   (ST_son->getName().find("union.") != std::string::npos);
 
-      // uint8_t sonT =
-      //     (fatherT + sonIdx) % 16; // tag of ptr to this field, expected tag
-      // uint8_t sonMask = sonType->getNumContainedTypes() % 16u;
-      // auto rotatedMask = rotateOn4bits(sonMask, sonIdx);
-      // auto newBaseTag = (rotatedMask ^ sonT);
-
+    if (ST_son && !isLiteralStruct && !isUnion) {
       u_int8_t newBaseTag = 0; // FLAT scheme introduced here
       uint8_t count = 0;
       auto sonSubfieldsCount = sonType->getNumContainedTypes();
@@ -2773,13 +2917,11 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
     } // if array
 
     else {
-      // scalar fields
-      LLVM_DEBUG(
-          dbgs() << " [FieldArmor - computeTags] Tagging scalar field. Type ");
-      LLVM_DEBUG(sonType->print(dbgs()));
-      LLVM_DEBUG(dbgs() << "\n");
+      // scalar fields, literal structs, unions == ALL SCALAR
       uint8_t sonT = (fatherT + sonIdx) % 16;
       uint8_t sonTag = sonT | (fatherL << 4);
+      if (isUnion)
+        sonTag = 0xdd; // constant tag for unions
 
       assert((sonT & 0x80) == 0 &&
              "ROOT POINTER BIT must be set to 0 in memory tags");

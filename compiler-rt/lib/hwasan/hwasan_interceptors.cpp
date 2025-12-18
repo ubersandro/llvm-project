@@ -36,11 +36,12 @@ struct HWAsanInterceptorContext {
   const char* interceptor_name;
 };
 
-#  define ACCESS_MEMORY_RANGE(offset, size, access)                         \
-    do {                                                                    \
-      VPrintf(1, "[HWASAN] %s RANGE %p size=%llu\n",                        \
-              access == AccessType::Load ? "READ" : "WRITE", offset, size); \
+#  define ACCESS_MEMORY_RANGE(offset, size, access) \
+    do {                                            \
     } while (0)
+// do {                                                                    \
+//   VPrintf(1, "[HWASAN] %s RANGE %p size=%llu\n",                        \
+//           access == AccessType::Load ? "READ" : "WRITE", offset, size); \
 // __hwasan::CheckAddressSized<ErrorAction::Recover, access>((uptr)offset,
 // size); \  TODO bring back
 

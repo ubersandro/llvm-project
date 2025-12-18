@@ -497,12 +497,12 @@ void Thread::InitStackAndTls(const InitState *) {
 uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector) {
   // TODO complete
   u_int8_t * ptr = (u_int8_t *)tag_vector;
-  
+  VPrintf(2, "[FieldArmor] TagMemory_mod : NEW VAR -> P: %p size: %p tag_vector: %p\n", (void *)p, (void *)size, (void *)tag_vector);
   uptr tagged = AddTagToPointer(p, 0b10000000);
 
   for(uptr i=0; i<size; i++){
     u_int8_t tag = ptr ? ptr[i] : 0; // TODO this sucks
-    VPrintf(2, "\t\t[FieldaArmor] TagMemory_mod: A: %p shadow[A]  -> T: 0x%02x\n", (void *)(p + i), tag);
+    VPrintf(2, "\t\t[FieldArmor] TagMemory_mod: A: %p shadow[A]  -> T: 0x%02x\n", (void *)(p + i), tag);
     *(char *)(MemToShadow(p + i)) = tag;
   }
   return ptr ? tagged : p;

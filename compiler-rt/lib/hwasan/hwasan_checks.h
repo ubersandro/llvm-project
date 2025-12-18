@@ -181,7 +181,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   // sz,
   //         R, L, T);
   tag_t mem_tag = *(tag_t*)MemToShadow((uptr)untagged_ptr);
-  if (mem_tag == 0) {
+  if (mem_tag == 0 || ptr_tag == 0) {
     // VPrintf(1, "\033[1;33m[FieldArmor] MEM %p UNTAGGED, <SKIP>\033[0m\n",
     //         (void*)untagged_ptr);
     return;
@@ -304,8 +304,8 @@ template <ErrorAction EA, AccessType AT, unsigned LogSize>
 __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   if (!InTaggableRegion(p))
     return;
-  VPrintf(1, "[FieldArmor] CA -> A=%p SZ=%u\n", (void*)p, 1 << LogSize);
-  VPrintf(1, "\t[FieldArmor] CALL CAS A=%p SZ=%u\n", (void*)p, 1 << LogSize);
+  // VPrintf(1, "[FieldArmor] CA -> A=%p SZ=%u\n", (void*)p, 1 << LogSize);
+  // VPrintf(1, "\t[FieldArmor] CALL CAS A=%p SZ=%u\n", (void*)p, 1 << LogSize);
   CheckAddressSized<EA, AT>(p, 1 << LogSize);
 }
 

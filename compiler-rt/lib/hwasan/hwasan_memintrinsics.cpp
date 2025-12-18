@@ -29,8 +29,8 @@ void *__hwasan_memset(void *block, int c, uptr size) {
 
 void *__hwasan_memcpy(void *to, const void *from, uptr size) {
   
-  VPrintf(1, "[HWASAN] __hwasan_memcpy to=%p from=%p size=%llu\n", to,
-          from, size);
+  // VPrintf(1, "[HWASAN] __hwasan_memcpy to=%p from=%p size=%llu\n", to,
+          // from, size);
   // TODO: bring back!!!
   // CheckAddressSized<ErrorAction::Recover, AccessType::Store>(
   //     reinterpret_cast<uptr>(to), size);
@@ -57,8 +57,8 @@ void *__hwasan_memset_match_all(void *block, int c, uptr size,
 
 void *__hwasan_memcpy_match_all(void *to, const void *from, uptr size,
                                 u8 match_all_tag) {
-  VPrintf(1, "[HWASAN] __hwasan_memcpy_match_all to=%p from=%p size=%llu\n", to,
-          from, size);
+  // VPrintf(1, "[HWASAN] __hwasan_memcpy_match_all to=%p from=%p size=%llu\n", to,
+          // from, size);
   // if (GetTagFromPointer(reinterpret_cast<uptr>(to)) != match_all_tag)
   //   CheckAddressSized<ErrorAction::Recover, AccessType::Store>(
   //       reinterpret_cast<uptr>(to), size);
