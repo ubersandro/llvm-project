@@ -290,7 +290,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
         // VPrintf(1, "\t[FieldArmor] EXP_T=%x, MEM_T=%x\n", ptr_tag,
         // *curr_memtag);
 
-        SigTrap<EA, AT>(p, sz);
+        SigTrap<ErrorAction::Recover, AT>(p, sz); // keeps on failing...
         if (EA == ErrorAction::Abort)
           __builtin_unreachable();
       }

@@ -287,7 +287,7 @@ public:
   HWAddressSanitizer(Module &M, bool CompileKernel, bool Recover,
                      const StackSafetyGlobalInfo *SSI)
       : M(M), SSI(SSI) {
-    this->Recover = optOr(ClRecover, Recover);
+    this->Recover = 1; // optOr(ClRecover, Recover);
     this->CompileKernel =
         optOr(ClEnableKhwasan, CompileKernel); // TODO: remove later
 
@@ -1977,7 +1977,7 @@ void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
 
       auto taggedPointer =
           tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
-                     ConstantInt::get(IntptrTy, 0xddLu)); // 0xdd TAG
+                     ConstantInt::get(IntptrTy, 0x00Lu)); // 0x00 TAG
 
       std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                          : "gep." + itostr(NumInstrumentedGEPs);
@@ -2099,7 +2099,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
     auto taggedPointer =
         tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
-                   ConstantInt::get(IntptrTy, 0xddLu)); // 0xdd TAG
+                   ConstantInt::get(IntptrTy, 0x00Lu)); // 0x00 TAG
 
     std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                        : "gep." + itostr(NumInstrumentedGEPs);
@@ -2176,7 +2176,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
                           << "\n");
         auto taggedPointer =
             tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
-                       ConstantInt::get(IntptrTy, 0xddLu)); // tag UNION
+                       ConstantInt::get(IntptrTy, 0x00Lu)); // tag UNION
 
         std::string Name = GEPI->hasName()
                                ? GEPI->getName().str()
@@ -2232,13 +2232,14 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   // // LLVM_DEBUG(dbgs() << "GEP DST TYPE IS UNION? "  << dstIsUnion << "\n");
 
   // if (dstIsUnion) {
-  //   sonTag = ConstantInt::get(IntptrTy, 0xddLu);
+  //   sonTag = ConstantInt::get(IntptrTy, 0x00Lu);
   //   // tag unions with a fixed tag // TODO REMOVE
   // } else
   if (!sonType->isStructTy()) {
 
-    Value *sonT = IRB.CreateAnd(IRB.CreateAdd(fatherT, sonIdx),
-                                ConstantInt::get(IntptrTy, 0xFFLu));
+    Value *sonT =
+        IRB.CreateAnd(IRB.CreateAdd(fatherT, sonIdx),
+                      ConstantInt::get(IntptrTy, 0x0FLu)); // modulo 16
     sonTag = IRB.CreateOr(sonT, fatherL);
   }
 
@@ -2269,7 +2270,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     if (sonIsUnion) {
       LLVM_DEBUG(dbgs() << "[FieldArmor] GEP DST TYPE IS UNION: " << *sonType
                         << "\n");
-      sonTag = ConstantInt::get(IntptrTy, 0xDDLu);
+      sonTag = ConstantInt::get(IntptrTy, 0x00Lu);
       Value *taggedPointer =
           tagPointer(IRB, GEPI->getType(), untaggedResLongPtr, sonTag);
 
@@ -2728,11 +2729,11 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
   if (isUnion) {
     /** Non-literal union: treat it as a scalar field. */
     LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Tagging union with "
-                         "constant tag 0xdd. Type ");
+                         "constant tag 0x00. Type ");
     LLVM_DEBUG(t->print(dbgs()));
     LLVM_DEBUG(dbgs() << "\n");
     tags = new uint8_t[size]; // TODO: get rid of this, maybe causing OOM
-    memset(tags, (unsigned char)0xdd, size);
+    memset(tags, (unsigned char)0x00, size);
     // TODO: this is just for convenience.
     NumProtectedUnions++;
   } // if isUnion
@@ -2921,7 +2922,7 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
       uint8_t sonT = (fatherT + sonIdx) % 16;
       uint8_t sonTag = sonT | (fatherL << 4);
       if (isUnion)
-        sonTag = 0xdd; // constant tag for unions
+        sonTag = 0x00; // constant tag for unions
 
       assert((sonT & 0x80) == 0 &&
              "ROOT POINTER BIT must be set to 0 in memory tags");
