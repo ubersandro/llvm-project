@@ -38,7 +38,7 @@ struct hwasan_global {
   s32 gv_relptr;
   u32 info;
   u32 tag_vector_relptr; // THIS IS WHERE THE TAG LIVES
-  u32 padding; // THIS IS WHERE THE TAG LIVES -> TODO remove it later, someday, not too soon...
+  u32 padding;
 };
 
 // Walk through the specific DSO (as specified by the base, phdr, and phnum),

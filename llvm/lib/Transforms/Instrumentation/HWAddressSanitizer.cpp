@@ -697,8 +697,10 @@ void HWAddressSanitizer::initializeModule() {
                               // runtime function __hwasan_init
 
     createTagVectors();
-    if (InstrumentGlobals)
-      instrumentGlobals();
+    // if (InstrumentGlobals)
+    //   instrumentGlobals();
+    // NOTE: instrumenting the globals like this poses a challenge because it
+    // somehow breaks the program.
 
     bool InstrumentPersonalityFunctions =
         optOr(ClInstrumentPersonalityFunctions, NewRuntime);
@@ -1373,7 +1375,9 @@ Value *HWAddressSanitizer::tagPointer(IRBuilder<> &IRB, Type *Ty,
 
   Value *TaggedPtrLong;
   Value *ShiftedTag = IRB.CreateShl(Tag, PointerTagShift);
+  ShiftedTag->setName("ShiftedTag");
   TaggedPtrLong = IRB.CreateOr(PtrLong, ShiftedTag);
+  TaggedPtrLong->setName("TaggedPtrLong");
   return IRB.CreateIntToPtr(TaggedPtrLong, Ty);
 }
 
@@ -2142,11 +2146,12 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   Value *fatherTL = IRB.CreateLShr(
       IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x7FLu << 56Lu)),
       PointerTagShift); // UNSET RP
-
+  fatherTL->setName("fatherTL");
   Value *fatherT = IRB.CreateAnd(fatherTL, ConstantInt::get(IntptrTy, 0x0FLu));
-
+  fatherT->setName("fatherT");
   Value *fatherL =
       IRB.CreateAnd(fatherTL, ConstantInt::get(IntptrTy, 0x70Lu)); /*01110000*/
+  fatherL->setName("fatherL");
   // fatherTL.setName("gep.father.TL");
   // IRB.CreateCall(Fprintf,
   //                {Stderr,
@@ -2215,9 +2220,11 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   } // GEP from array type
   // dbgPrintStructType(dyn_cast<StructType>(fatherType));
   // at this point, father is struct
-  auto sonIdx =
+  auto sonIdx = IRB.CreateAnd(
       IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
-                    ConstantInt::get(IntptrTy, 0x1Lu));
+                    ConstantInt::get(IntptrTy, 0x1Lu)),
+      ConstantInt::get(IntptrTy, 0x0FLu)); // modulo 16
+  sonIdx->setName("sonIdx_plus1_mod16");
   // GEPI->getOperand(2) OOB ->
   // LEVEL is aligned and ready to be applied
 
@@ -2241,6 +2248,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         IRB.CreateAnd(IRB.CreateAdd(fatherT, sonIdx),
                       ConstantInt::get(IntptrTy, 0x0FLu)); // modulo 16
     sonTag = IRB.CreateOr(sonT, fatherL);
+    sonTag->setName("sonTag");
   }
 
   else {
@@ -2296,8 +2304,10 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
                                        ConstantInt::get(IntptrTy, 1Lu)),
                          ConstantInt::get(IntptrTy, 0x8Lu)),
           4Lu);
+      sonL->setName("sonL");
       sonTag =
           IRB.CreateOr(sonL, ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit
+      sonTag->setName("sonTag_struct");
     }
   }
 
@@ -2438,7 +2448,7 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     // TODO: handle unions!!!
   }
 
-  uint8_t Tag = 0b10000000;
+  
   uint64_t SizeInBytes =
       M.getDataLayout().getTypeAllocSize(Initializer->getType());
 
@@ -2486,14 +2496,12 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
                 Int64Ty,
                 DescriptorPos)), // NOTE: when descriptor pos is 0, omitted
         Int32Ty);
-
+    // NOTE: the above might be breaking global variable resolution -> ??????
     // NOTE: if the struct is a literal struct, getStructName cannot be
     // called.
     auto *TagVector =
         M.getNamedGlobal(type->getStructName().str() + ".fieldarmor.tagvec");
-    // else if (type->isArrayTy()) {
 
-    // }
     assert(TagVector &&
            "Tag vector global must exist and be properly initialized.");
     auto *TVRelPtr = ConstantExpr::getTrunc(
@@ -2510,14 +2518,18 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     Descriptor->setSection("hwasan_globals");
     Descriptor->setMetadata(LLVMContext::MD_associated,
                             MDNode::get(*C, ValueAsMetadata::get(NewGV)));
+    // Descriptor->setAlignment(Align(16)); // doesnt really matter
     appendToCompilerUsed(M, Descriptor);
   }
-
+  
+  // uint8_t Tag = 0b10000000U;
+  uint8_t Tag = 0x00U; // global tags must be handled carefully, the linker does not know how to relocate it if the MSB is set!!!
+  // in the asm, this gets evaluated to 2^^32. The linker, subsequently, does the relocation magic and replaces that with something else like the thing down here
   Constant *Aliasee = ConstantExpr::getIntToPtr(
       ConstantExpr::getAdd(
           ConstantExpr::getPtrToInt(NewGV, Int64Ty),
-          ConstantInt::get(Int64Ty, uint64_t(Tag) << PointerTagShift)),
-      GV->getType());
+          ConstantInt::get(Int64Ty, (uint64_t)(Tag) << PointerTagShift)),
+      GV->getType()); // NOTE: this does not work!!!!! Ptrs cannot be tagged this way because it breaks global references
   auto *Alias = GlobalAlias::create(GV->getValueType(), GV->getAddressSpace(),
                                     GV->getLinkage(), "", Aliasee, &M);
   Alias->setVisibility(GV->getVisibility());
@@ -2756,8 +2768,8 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
   llvm::Constant *Init = llvm::ConstantArray::get(TagArrayType, Elements);
   auto *NewTagVector_global = new GlobalVariable(
       M, TagArrayType, true, GlobalVariable::PrivateLinkage, Init, TagVecName);
-  NewTagVector_global->setSection("hwanal_global"); // is this better?
-  appendToCompilerUsed(M, NewTagVector_global); // does this break something?
+  NewTagVector_global->setSection("porcodiddio"); // is this better?
+  appendToCompilerUsed(M, NewTagVector_global);   // does this break something?
   LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Created global "
                        "variable for type tag vector: "
                     << NewTagVector_global->getName() << "\n");

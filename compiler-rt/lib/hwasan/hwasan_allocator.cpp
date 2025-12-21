@@ -235,8 +235,9 @@ static void* HwasanAllocate(StackTrace* stack, uptr orig_size, uptr alignment,
     user_ptr = (void*)TagMemoryAligned((uptr)user_ptr, full_granule_size, tag);
     if (full_granule_size != tag_size) {
       u8* short_granule = reinterpret_cast<u8*>(allocated) + full_granule_size;
-      TagMemoryAligned((uptr)short_granule, kShadowAlignment,
-                       tag_size % kShadowAlignment);
+      // TagMemoryAligned((uptr)short_granule, kShadowAlignment,
+      //                  tag_size % kShadowAlignment);
+      TagMemoryAligned((uptr)short_granule, kShadowAlignment, 0);
       short_granule[kShadowAlignment - 1] = tag;
     }
   } else {
