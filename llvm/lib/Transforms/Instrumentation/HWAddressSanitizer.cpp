@@ -1595,18 +1595,23 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   // if (selectiveInstrumentationShouldSkip(F, FAM))
   //   return; // ALE: DISABLE SELECTIVE INSTRUMENTATION FOR NOW
-  // TODO: bring this back later. If it's something hot, theoretically, it
-  // should break at some point even without the sanitizer?
+  // TODO: bring this back later.
+  // NOTE: this was removed because I want every function to be instrumented to
+  // get as much coverage as possible. Also, if something is hot, it should get
+  // inlined?
   NumInstrumentedFuncs++;
 
   SmallVector<InterestingMemoryOperand, 16> OperandsToInstrument;
   SmallVector<MemIntrinsic *, 16> IntrinToInstrument;
   SmallVector<Instruction *, 8> LandingPadVec;
+
+  // FieldArmor
   SmallVector<GetElementPtrInst *, 40> GEPsToInstrument;
   SmallVector<CmpInst *, 40> CMPsToInstrument;
   SmallVector<BinaryOperator *, 40> ArithInstructions;
   SmallVector<PtrToIntInst *, 40> PointerToIntInstructions;
   SmallVector<ConstantExpr *, 40> ConstGEPsToInstrument;
+  // FieldArmor
 
   const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
 
@@ -1623,9 +1628,9 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     // TODO: filter out something
     getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
 
-    if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
-      if (!ignoreMemIntrinsic(ORE, MI))
-        IntrinToInstrument.push_back(MI);
+    // if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
+    //   if (!ignoreMemIntrinsic(ORE, MI))
+    //     IntrinToInstrument.push_back(MI);
 
     if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(&Inst)) {
       GEPsToInstrument.push_back(GEPI);
@@ -1720,8 +1725,6 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   }
 
   ShadowBase = nullptr;
-  // StackBaseTag = nullptr;
-  // CachedFP = nullptr;
 }
 
 void dumpGEPDebug(GetElementPtrInst *GEPI) {
@@ -1967,6 +1970,7 @@ void handleDynamicallyAllocatedGEP(GetElementPtrInst *GEPI,
 // TODO: precisely reconstruct dst type. If it's a union, treat it as a scalar.
 
 void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
+  // NOTE: I assume all 2-operands GEPs are array indexing.
   auto GEPType = GEPI->getSourceElementType();
   if (StructType *ST = dyn_cast<StructType>(GEPType)) {
     bool isLiteral = ST->isLiteral();
@@ -1998,29 +2002,45 @@ void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
 
       return;
     }
+    // NOTE: literal structs (union+structs) are not handled here.
   }
 }
 
+/** Filter out GEPs on structs based on the type of the struct. */
+bool shouldBlocklistGEP(GetElementPtrInst *GEPI) {
+  auto fatherType = GEPI->getSourceElementType();
+  if (fatherType->isStructTy()) {
+
+    StructType *ST = dyn_cast<StructType>(fatherType);
+    if (!ST->isLiteral())
+      return (ST->getName().str().find("union.") != std::string::npos) ||
+             (ST->getName().str().find("std::pair") != std::string::npos);
+    // Q: tuples? Other structs?
+  }
+  return false;
+}
+
+/**
+ * GEP instrumentation.
+ */
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   /** DEBUG */
   // FunctionCallee Printf =
   //     M.getOrInsertFunction("printf", Int32Ty, PtrTy, /*vararg*/ true);
   // FunctionCallee Fprintf = M.getOrInsertFunction(
   //     "fprintf", FunctionType::get(Int32Ty, {PtrTy, PtrTy}, true));
-
   /** DEBUG */
+
   // dumpGEPDebug(GEPI);
   auto nOperands = GEPI->getNumOperands();
-  assert(nOperands <= 3); // This check never fails if un-squashing the GEPs.
-  if (nOperands != 3) {   // it means it has 2 operands (?)
+  // NOTE: this check never fails if un-squashing the GEPs.
+  assert(nOperands <= 3);
+  if (nOperands != 3) { // 2 op GEPs
     handleGEP2operands(GEPI);
-    return; // TODO: look into this
-  }
-  // NOTE: skipping 2 elems GEPs means skipping geps on arrays, which leaves
-  // some ptrs untagged. If those pointers point to a union, we lose this
-  // information.
+    return;
+  } // if not 3 operands
 
-  LLVM_DEBUG(dbgs() << "[FieldArmor] Instrumenting GEP: " << *GEPI << "\n");
+  // LLVM_DEBUG(dbgs() << "[FieldArmor] Instrumenting GEP: " << *GEPI << "\n");
   /**
    * CASES:
    *  1. SRC is array. If returning a pointer to a struct, tag it as root
@@ -2034,18 +2054,28 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
    * status.
    */
 
-  // Instruction *endOfTheChain = nullptr;
-  // auto dynamicallyAllocated = isDynamicallyAllocated(GEPI, &endOfTheChain);
-  // if (dynamicallyAllocated) {
-  // return; // TODO handle GEPs into dynamically allocated memory properly.
+  // NOTE: GEPs on pointers that are dynamically allocated have an operand that
+  // a) gets returned by a call to malloc in the same function, b) is part of a
+  // dynamically allocated chunk someplace else. Case a) is trivial. Case b) is
+  // hard to track. For now, we just skip these GEPs.
+
+  // Instruction *endOfTheChain
+  // = nullptr; auto dynamicallyAllocated = isDynamicallyAllocated(GEPI,
+  // &endOfTheChain); if (dynamicallyAllocated) { return; // TODO handle GEPs
+  // into dynamically allocated memory properly.
   // }
 
   auto fatherType = GEPI->getSourceElementType();
+  bool shouldSkip = shouldBlocklistGEP(GEPI);
+  if (shouldSkip)
+    return;
+
+  // NOTE: the above leaves ptr to std::pair tagged.
   // EXAMPLE:   %arrayidx = getelementptr inbounds %union.yyGLRStackItem, ptr
   // %857, i64 %idxprom, !dbg !6862 array of unions -> should be tagged as
   // scalar
 
-  // CHECK OPERAND NAME! Does not make much sense
+  // GEPs on unions are not instrumented!
   if (GEPI->getOperand(0)->hasName() &&
       GEPI->getOperand(0)->getName().str().find(".fieldarmor.union") !=
           std::string::npos) {
@@ -2057,8 +2087,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     return;
   }
 
-  // handle GEPs into untagged pointers (tags are removed in case of literal
-  // structs)
+  // if the pointer is untagged, propagate the untagged status. TODO: remove as
+  // soon as variables coverage gets better.
   if (GEPI->getOperand(0)->hasName() &&
       GEPI->getOperand(0)->getName().str().find(".untagged") !=
           std::string::npos) {
@@ -2100,14 +2130,13 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         std::string::npos));
 
   if (fatherTypeIsUnion) {
-
-    auto taggedPointer =
-        tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
-                   ConstantInt::get(IntptrTy, 0x00Lu)); // 0x00 TAG
+    // if GEPping into a union, untag the pointer
+    auto taggedPointer = tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
+                                    ConstantInt::get(IntptrTy, 0x00Lu));
 
     std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                        : "gep." + itostr(NumInstrumentedGEPs);
-    taggedPointer->setName(Name + ".fieldarmor.union");
+    taggedPointer->setName(Name + ".fieldarmor.union"); // this is propagating
     Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
 
     GEPI->replaceUsesWithIf(
@@ -2122,8 +2151,9 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
   if (fatherType->isStructTy() &&
       dyn_cast<StructType>(fatherType)->isLiteral()) {
-    // untag the pointer on access to it. Maybe it's better to untag it when it
-    // is the dst ptr?
+    // in this case, the struct might either be a union or an actual struct.
+    // Since we cannot use the name to distinguish them, we conservatively untag
+    // the pointer.
     auto taggedPointer =
         tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
                    ConstantInt::get(IntptrTy, 0x0Lu)); // NULL TAG
@@ -2159,26 +2189,51 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   //                     "\t[FieldArmor - DBG] GEP father T: %lu, L: %lu\n"),
   //                 fatherT, fatherL});
 
-  auto sonType = GEPI->getResultElementType();
+  auto sonType =
+      GEPI->getResultElementType(); // the type of the retrieve pointer
   // it can be a) struct, b) array, c) scalar. In case of struct, it can be a)
   // literal, b) named. Struct can also be a union.
+
   if (fatherType->isArrayTy()) {
     if (!sonType->isStructTy()) {
-      /** it could be a) another array, b) scalar. Pointer has the same tag as
-       * father. */
-      // auto taggedPointer =
-      //     tagPointer(IRB, GEPI->getType(), untaggedResLongPtr, fatherTL);
+      // It could be a) another array, b) scalar. Pointer has the same tag as
+      // father.
       return;
-    } else {
+    } // son is not a struct.
+    else {
       // GEPPING into an array of structs -> return a ROOT POINTER to the struct
       // OR a pointer to a union is that the struct is a union
-      auto sonTypeCast = dyn_cast<StructType>(sonType);
+      StructType* sonTypeCast = dyn_cast<StructType>(sonType);
+      if (sonTypeCast->isLiteral()) {
+        // literal struct inside array -> untagged
+        auto taggedPointer =
+            tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
+                       ConstantInt::get(IntptrTy, 0x00Lu)); // tag UNION
+
+        std::string Name = GEPI->hasName()
+                               ? GEPI->getName().str()
+                               : "gep." + itostr(NumInstrumentedGEPs);
+        taggedPointer->setName(Name + ".fieldarmor.untagged");
+
+        Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
+
+        GEPI->replaceUsesWithIf(
+            taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
+              auto *User = U.getUser();
+              return User != resultLong && User != GEPICastToPtr &&
+                     !isa<LifetimeIntrinsic>(User);
+            });
+        NumInstrumentedGEPs++;
+        return;
+      } // untag GEPs on arrays of literal structs
+
       auto sonIsUnion =
-          (sonType->isStructTy() && !sonTypeCast->isLiteral() &&
+          (!sonTypeCast->isLiteral() &&
            (sonTypeCast->getName().str().find("union.") != std::string::npos));
       if (sonIsUnion) {
-        LLVM_DEBUG(dbgs() << "[FieldArmor] GEP on arr of unions: " << *sonType
-                          << "\n");
+        // LLVM_DEBUG(dbgs() << "[FieldArmor] GEP on arr of unions: " <<
+        // *sonType
+        //                   << "\n");
         auto taggedPointer =
             tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
                        ConstantInt::get(IntptrTy, 0x00Lu)); // tag UNION
@@ -2194,18 +2249,19 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
             taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
               auto *User = U.getUser();
               return User != resultLong && User != GEPICastToPtr &&
-                     !isa<LifetimeIntrinsic>(User); // NOOOO
+                     !isa<LifetimeIntrinsic>(User);
             });
         NumInstrumentedGEPs++;
         return;
-      }
+      } // son is union
+      // after this point, son is a non-literal struct!
       auto taggedPointer =
           tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
                      ConstantInt::get(IntptrTy, 0x80Lu)); // tag RP LEVEL 0
 
       std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                          : "gep." + itostr(NumInstrumentedGEPs);
-      taggedPointer->setName(Name + ".fieldarmor.array");
+      taggedPointer->setName(Name + ".fieldarmor.structarray");
       Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
 
       GEPI->replaceUsesWithIf(
@@ -2218,7 +2274,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       return;
     } // GEP array -> struct
   } // GEP from array type
-  // dbgPrintStructType(dyn_cast<StructType>(fatherType));
+
   // at this point, father is struct
   auto sonIdx = IRB.CreateAnd(
       IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
@@ -2230,20 +2286,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
   Value *sonTag = nullptr;
 
-  // scalar and union case
-  // auto dstIsUnion =
-  //     (sonType->isStructTy() && !dyn_cast<StructType>(sonType)->isLiteral()
-  //     &&
-  //      (dyn_cast<StructType>(sonType)->getName().str().find("union.") !=
-  //       std::string::npos));
-  // // LLVM_DEBUG(dbgs() << "GEP DST TYPE IS UNION? "  << dstIsUnion << "\n");
-
-  // if (dstIsUnion) {
-  //   sonTag = ConstantInt::get(IntptrTy, 0x00Lu);
-  //   // tag unions with a fixed tag // TODO REMOVE
-  // } else
   if (!sonType->isStructTy()) {
-
     Value *sonT =
         IRB.CreateAnd(IRB.CreateAdd(fatherT, sonIdx),
                       ConstantInt::get(IntptrTy, 0x0FLu)); // modulo 16
@@ -2253,13 +2296,11 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
   else {
     // son is a struct: might be a union!
-    // dbgPrintStructType(dyn_cast<StructType>(sonType));
-    // NOTE: literal structs pointers are treated as regular structs.
     bool sonIsUnion =
         sonType->isStructTy() && !dyn_cast<StructType>(sonType)->isLiteral() &&
         (dyn_cast<StructType>(sonType)->getName().str().find("union.") !=
-         std::string::npos); // quite flaky! TODO CHANGE
-    // augment the above with the following
+         std::string::npos);
+    // augment the above with the following. But is it actually necessary?
     auto FatherTypeCast = dyn_cast<StructType>(fatherType);
     auto sonTypeRetrieved = FatherTypeCast->getElementType(
         cast<ConstantInt>(GEPI->getOperand(2))->getZExtValue());
@@ -2269,16 +2310,11 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
                         ->getName()
                         .str()
                         .find("union.") != std::string::npos));
-    // ALSO RETRIEVE THE ACTUAL VAR NAME FROM DATA LAYOUT?
-    // get struct layout
-    // StructLayout *SL =
-    //     M.getDataLayout().getStructLayout(FatherTypeCast);
-    // auto offset = SL->getElementOffset(
-    //     cast<ConstantInt>(GEPI->getOperand(2))->getZExtValue());
+
     if (sonIsUnion) {
-      LLVM_DEBUG(dbgs() << "[FieldArmor] GEP DST TYPE IS UNION: " << *sonType
-                        << "\n");
-      sonTag = ConstantInt::get(IntptrTy, 0x00Lu);
+      // LLVM_DEBUG(dbgs() << "[FieldArmor] GEP DST TYPE IS UNION: " << *sonType
+      //                   << "\n");
+      sonTag = ConstantInt::get(IntptrTy, 0x00Lu); // untag son
       Value *taggedPointer =
           tagPointer(IRB, GEPI->getType(), untaggedResLongPtr, sonTag);
 
@@ -2292,21 +2328,49 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
             auto *User = U.getUser();
             return User != resultLong && User != GEPICastToPtr &&
-                   !isa<LifetimeIntrinsic>(User); // NOOOO
+                   !isa<LifetimeIntrinsic>(User);
           });
       NumInstrumentedGEPs++;
       return;
 
     } // if son is union
     else {
-      Value *sonL = IRB.CreateShl(
-          IRB.CreateURem(IRB.CreateAdd(IRB.CreateLShr(fatherL, 4Lu),
-                                       ConstantInt::get(IntptrTy, 1Lu)),
-                         ConstantInt::get(IntptrTy, 0x8Lu)),
-          4Lu);
-      sonL->setName("sonL");
-      sonTag =
-          IRB.CreateOr(sonL, ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit
+      // son is not a union. Might still be a literal struct.
+      StructType *SonTy = dyn_cast<StructType>(sonType);
+      if (SonTy->isLiteral() ||
+          (SonTy->getName().str().find("std::pair") != std::string::npos)) {
+        // if son is a literal struct, or a std::pair, untag the pointer
+        sonTag = ConstantInt::get(IntptrTy, 0x0Lu); // untag son
+        Value *taggedPointer =
+            tagPointer(IRB, GEPI->getType(), untaggedResLongPtr, sonTag);
+
+        std::string Name = GEPI->hasName()
+                               ? GEPI->getName().str()
+                               : "gep." + itostr(NumInstrumentedGEPs);
+        taggedPointer->setName(Name + ".fieldarmor.untagged");
+
+        Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
+
+        GEPI->replaceUsesWithIf(
+            taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
+              auto *User = U.getUser();
+              return User != resultLong && User != GEPICastToPtr &&
+                     !isa<LifetimeIntrinsic>(User);
+            });
+        NumInstrumentedGEPs++;
+        return;
+      } // untag if son is literal struct or pair
+      else {
+        // son is neither literal, nor pair. Also, it's not a union.
+        Value *sonL = IRB.CreateShl(
+            IRB.CreateURem(IRB.CreateAdd(IRB.CreateLShr(fatherL, 4Lu),
+                                         ConstantInt::get(IntptrTy, 1Lu)),
+                           ConstantInt::get(IntptrTy, 0x8Lu)),
+            4Lu);
+        sonL->setName("sonL");
+        sonTag = IRB.CreateOr(sonL,
+                              ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit
+      }
       sonTag->setName("sonTag_struct");
     }
   }
@@ -2325,7 +2389,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
         auto *User = U.getUser();
         return User != resultLong && User != GEPICastToPtr &&
-               !isa<LifetimeIntrinsic>(User); // NOOOO
+               !isa<LifetimeIntrinsic>(User);
       });
   NumInstrumentedGEPs++;
 } // InstrumentGEP
@@ -2448,7 +2512,6 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     // TODO: handle unions!!!
   }
 
-  
   uint64_t SizeInBytes =
       M.getDataLayout().getTypeAllocSize(Initializer->getType());
 
@@ -2521,15 +2584,19 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     // Descriptor->setAlignment(Align(16)); // doesnt really matter
     appendToCompilerUsed(M, Descriptor);
   }
-  
+
   // uint8_t Tag = 0b10000000U;
-  uint8_t Tag = 0x00U; // global tags must be handled carefully, the linker does not know how to relocate it if the MSB is set!!!
-  // in the asm, this gets evaluated to 2^^32. The linker, subsequently, does the relocation magic and replaces that with something else like the thing down here
+  uint8_t Tag = 0x00U; // global tags must be handled carefully, the linker does
+                       // not know how to relocate it if the MSB is set!!!
+  // in the asm, this gets evaluated to 2^^32. The linker, subsequently, does
+  // the relocation magic and replaces that with something else like the thing
+  // down here
   Constant *Aliasee = ConstantExpr::getIntToPtr(
       ConstantExpr::getAdd(
           ConstantExpr::getPtrToInt(NewGV, Int64Ty),
           ConstantInt::get(Int64Ty, (uint64_t)(Tag) << PointerTagShift)),
-      GV->getType()); // NOTE: this does not work!!!!! Ptrs cannot be tagged this way because it breaks global references
+      GV->getType()); // NOTE: this does not work!!!!! Ptrs cannot be tagged
+                      // this way because it breaks global references
   auto *Alias = GlobalAlias::create(GV->getValueType(), GV->getAddressSpace(),
                                     GV->getLinkage(), "", Aliasee, &M);
   Alias->setVisibility(GV->getVisibility());
@@ -2608,7 +2675,7 @@ void HWAddressSanitizer::instrumentGlobals() {
     //     LLVM_DEBUG(dbgs() << "  CONST GEP (const expr): ");
     //     LLVM_DEBUG(U->print(dbgs()));
     //     LLVM_DEBUG(dbgs() << "\n");
-    //     // InstrumentGEP(cast<GetElementPtrInst>(U)); // NOOOO
+    //     // InstrumentGEP(cast<GetElementPtrInst>(U));
     //     InstrumentConstGEP(cast<ConstantExpr>(U),
     //                        GV->getInitializer()->getType());
     //   }
@@ -2740,10 +2807,10 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
 
   if (isUnion) {
     /** Non-literal union: treat it as a scalar field. */
-    LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Tagging union with "
-                         "constant tag 0x00. Type ");
-    LLVM_DEBUG(t->print(dbgs()));
-    LLVM_DEBUG(dbgs() << "\n");
+    // LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Tagging union with "
+    //                      "constant tag 0x00. Type ");
+    // LLVM_DEBUG(t->print(dbgs()));
+    // LLVM_DEBUG(dbgs() << "\n");
     tags = new uint8_t[size]; // TODO: get rid of this, maybe causing OOM
     memset(tags, (unsigned char)0x00, size);
     // TODO: this is just for convenience.
@@ -2752,8 +2819,8 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
   else {
     // Not a non-literal union: can be a struct (literal or named), can a
     // literal union, can be a scalar
-    LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Its not a union: "
-                      << t->getName() << "\n");
+    // LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Its not a union: "
+    //                   << t->getName() << "\n");
     tags = computeTags(t);
   }
 
@@ -2770,9 +2837,9 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
       M, TagArrayType, true, GlobalVariable::PrivateLinkage, Init, TagVecName);
   NewTagVector_global->setSection("porcodiddio"); // is this better?
   appendToCompilerUsed(M, NewTagVector_global);   // does this break something?
-  LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Created global "
-                       "variable for type tag vector: "
-                    << NewTagVector_global->getName() << "\n");
+  // LLVM_DEBUG(dbgs() << " [FieldArmor - createTagVector] Created global "
+  //                      "variable for type tag vector: "
+  //                   << NewTagVector_global->getName() << "\n");
   NumDefinedTagVectors++;
 }
 
@@ -2781,7 +2848,12 @@ void HWAddressSanitizer::createTagVectors() {
   auto identifiedStructTypes = M.getIdentifiedStructTypes();
 
   for (auto t : identifiedStructTypes) {
-    // dbgPrintStructType(t);
+    StructType *ty = dyn_cast<StructType>(t);
+    if (ty && !ty->isLiteral() &&
+        ty->getName().str().find("std::pair") != std::string::npos) {
+      // skip pairs
+      continue;
+    }
     createTagVector(t);
   }
 }
@@ -2808,8 +2880,8 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
   uint16_t sonIdx = 1; // NOTE: 2^^16 max number of fields
   if (levelZeroFieldsOffsets.size() >= (1 << 16) - 1) {
 
-    LLVM_DEBUG(dbgs() << " [FieldArmor] Struct has TOO MANY FIELDS (> 65536), "
-                         "skipping tag vector computation\n");
+    // LLVM_DEBUG(dbgs() << " [FieldArmor] Struct has TOO MANY FIELDS (> 65536), "
+    //                      "skipping tag vector computation\n");
     return nullptr;
   }
 
@@ -2859,11 +2931,11 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
       Type *elementType = sonType->getArrayElementType();
 
       if (elementType->isStructTy()) {
-        LLVM_DEBUG(
-            dbgs()
-            << " [FieldArmor - ComputeTags] Tagging array of structs. Type ");
-        LLVM_DEBUG(sonType->print(dbgs()));
-        LLVM_DEBUG(dbgs() << "\n");
+        // LLVM_DEBUG(
+        //     dbgs()
+        //     << " [FieldArmor - ComputeTags] Tagging array of structs. Type ");
+        // LLVM_DEBUG(sonType->print(dbgs()));
+        // LLVM_DEBUG(dbgs() << "\n");
 
         auto structType = cast<StructType>(elementType);
         auto structName = structType->getStructName().str();
@@ -2873,19 +2945,19 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
             true); // CAVEAT -> these are for internal use...
 
         if (!tagVectorGlobal) {
-          LLVM_DEBUG(dbgs() << " [FieldArmor - ComputeTags] No precomputed tag "
-                               "vector for struct "
-                            << structName << " found. Creating it.\n");
+          // LLVM_DEBUG(dbgs() << " [FieldArmor - ComputeTags] No precomputed tag "
+          //                      "vector for struct "
+          //                   << structName << " found. Creating it.\n");
 
           createTagVector(structType);
         }
         tagVectorGlobal =
             M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
         if (!tagVectorGlobal) {
-          LLVM_DEBUG(dbgs() << " [FieldArmor - ComputeTags] STILL No "
-                               "precomputed tag vector for struct "
-                            << structName
-                            << " found. Skipping array of structs tagging.\n");
+          // LLVM_DEBUG(dbgs() << " [FieldArmor - ComputeTags] STILL No "
+          //                      "precomputed tag vector for struct "
+          //                   << structName
+          //                   << " found. Skipping array of structs tagging.\n");
           continue;
         }
         // APPLY THIS FUCKING VECTOR
@@ -2908,11 +2980,11 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
       } // if array of structs
 
       else {
-        LLVM_DEBUG(
-            dbgs()
-            << " [FieldArmor - computeTags] Tagging array of scalars. Type ");
-        LLVM_DEBUG(sonType->print(dbgs()));
-        LLVM_DEBUG(dbgs() << "\n");
+        // LLVM_DEBUG(
+        //     dbgs()
+        //     << " [FieldArmor - computeTags] Tagging array of scalars. Type ");
+        // LLVM_DEBUG(sonType->print(dbgs()));
+        // LLVM_DEBUG(dbgs() << "\n");
 
         // tag the array as a memory location
         uint8_t sonT = (fatherT + sonIdx) % 16;
@@ -3081,6 +3153,6 @@ void HWAddressSanitizer::InstrumentConstGEP(ConstantExpr *GEPI,
       taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
         auto *User = U.getUser();
         return User != resultLong && User != GEPICastToPtr &&
-               !isa<LifetimeIntrinsic>(User); // NOOOO
+               !isa<LifetimeIntrinsic>(User);
       });
 } // instrumentConstGEP
