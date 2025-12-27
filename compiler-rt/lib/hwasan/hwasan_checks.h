@@ -181,7 +181,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   // sz,
   //         R, L, T);
   tag_t mem_tag = *(tag_t*)MemToShadow((uptr)untagged_ptr);
-  if (mem_tag == 0 || ptr_tag == 0) {
+  if (mem_tag == 0) {
     // VPrintf(1, "\033[1;33m[FieldArmor] MEM %p UNTAGGED, <SKIP>\033[0m\n",
     //         (void*)untagged_ptr);
     return;
@@ -282,15 +282,16 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
     for (uptr i = 0; i < sz; i++) {
       mem_tag = *(tag_t*)MemToShadow((uptr)untagged_ptr + i);
 
-      // TODO: un-ignore levels!!!! L 
+      // TODO: un-ignore levels!!!!
       if ((getT(mem_tag)) != getT(ptr_tag)) {
-        VPrintf(1, "[FieldArmor] TAG MISMATCH A=%p SZ=%u\n", (void*)(untagged_ptr + i), sz);
+        VPrintf(1, "[FieldArmor] TAG MISMATCH A=%p SZ=%u\n",
+                (void*)(untagged_ptr + i), sz);
         VPrintf(1, "\t[FieldArmor] memory T: %u, pointer T: %u\n",
                 getT(mem_tag), getT(ptr_tag));
         // VPrintf(1, "\t[FieldArmor] EXP_T=%x, MEM_T=%x\n", ptr_tag,
         // *curr_memtag);
 
-        SigTrap<ErrorAction::Recover, AT>(p, sz); // keeps on failing...
+        SigTrap<ErrorAction::Recover, AT>(p, sz);  // keeps on failing...
         if (EA == ErrorAction::Abort)
           __builtin_unreachable();
       }

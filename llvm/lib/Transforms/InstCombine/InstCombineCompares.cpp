@@ -680,6 +680,7 @@ Instruction *InstCombinerImpl::foldGEPICmp(GEPOperator *GEPLHS, Value *RHS,
   // and would change the result of the icmp.
   // e.g. "&foo[0] <s &foo[1]" can't be folded to "true" because "foo" could be
   // the maximum signed value for the pointer type.
+  return nullptr; // @ale
   if (ICmpInst::isSigned(Cond))
     return nullptr;
 

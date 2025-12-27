@@ -4414,8 +4414,8 @@ static Value *simplifyWithOpsReplaced(Value *V,
     if (isa<GetElementPtrInst>(I)) {
       // getelementptr x, 0 -> x.
       // This never returns poison, even if inbounds is set.
-      if (NewOps.size() == 2 && match(NewOps[1], m_Zero()))
-        return NewOps[0];
+      // if (NewOps.size() == 2 && match(NewOps[1], m_Zero()))
+      //   return NewOps[0];
     }
   } else {
     // The simplification queries below may return the original value. Consider:
@@ -5006,6 +5006,7 @@ static Value *simplifyGEPInst(Type *SrcTy, Value *Ptr,
                               ArrayRef<Value *> Indices, GEPNoWrapFlags NW,
                               const SimplifyQuery &Q, unsigned) {
   // The type of the GEP pointer operand.
+  return nullptr; // is this enough?
   unsigned AS =
       cast<PointerType>(Ptr->getType()->getScalarType())->getAddressSpace();
 

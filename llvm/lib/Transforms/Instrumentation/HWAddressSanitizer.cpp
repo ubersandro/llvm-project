@@ -213,7 +213,10 @@ STATISTIC(NumNoProfileSummaryFuncs, "Number of funcs without PS");
 STATISTIC(NumInstrumentedGEPs, "Number of instrumented GEP instructions");
 STATISTIC(NumInstrumentedGlobals, "Number of instrumented global variables");
 STATISTIC(NumDefinedTagVectors, "Number of defined tag vectors");
+STATISTIC(NumInstrumentedCMPs, "Number of instrumented CMP instructions");
 STATISTIC(NumProtectedUnions, "Number of protected unions");
+STATISTIC(NumInstrumentedArithmeticOps,
+          "Number of instrumented arithmetic instructions");
 
 // Mode for selecting how to insert frame record info into the stack ring
 // buffer.
@@ -699,8 +702,7 @@ void HWAddressSanitizer::initializeModule() {
     createTagVectors();
     // if (InstrumentGlobals)
     //   instrumentGlobals();
-    // NOTE: instrumenting the globals like this poses a challenge because it
-    // somehow breaks the program.
+    // TODO: bring back
 
     bool InstrumentPersonalityFunctions =
         optOr(ClInstrumentPersonalityFunctions, NewRuntime);
@@ -1172,8 +1174,7 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
                                              DomTreeUpdater &DTU, LoopInfo *LI,
                                              const DataLayout &DL) {
   Value *Addr = O.getPtr();
-  LLVM_DEBUG(dbgs() << "[FieldArmor]: Instrumenting memory access: "
-                    << *O.getInsn() << "\n");
+
   // If the pointer is statically known to be zero, the tag check will pass
   // since:
   // 1) it has a zero tag
@@ -1194,52 +1195,25 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
       (!O.Alignment || *O.Alignment >= Mapping.getObjectAlignment() ||
        *O.Alignment >= O.TypeStoreSize / 8)) {
     size_t AccessSizeIndex = TypeSizeToSizeIndex(O.TypeStoreSize);
-    // if (InstrumentWithCalls) {
-    // LLVM_DEBUG(dbgs() << "Using call-based instrumentation\n");
-    // errs() << "[++] Using call-based instrumentation\n";
+    // enforcing call instrumentation for now. This branch installs sized CBs.
     SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
-    // if (UseMatchAllCallback)
-    //   Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag)); // TODO:
-    //   potentially remove
+    // NOTE: at this point, accesses might have been grouped to vectorize memory
+    // ops.
+
     IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
                    Args);
-    // } else if (OutlinedChecks) {
-    //   // LLVM_DEBUG(dbgs() << "Outlining the check\n");
-    //   instrumentMemAccessOutline(Addr, O.IsWrite, AccessSizeIndex,
-    //   O.getInsn(),
-    //                              DTU, LI);
-    // } else {
-    //   // LLVM_DEBUG(dbgs() << "Inlining the check\n");
-    //   instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex,
-    //   O.getInsn(),
-    //                             DTU, LI);
-    // }
+
   } else {
     SmallVector<Value *, 3> Args{
         IRB.CreatePointerCast(Addr, IntptrTy),
         IRB.CreateUDiv(IRB.CreateTypeSize(IntptrTy, O.TypeStoreSize),
                        ConstantInt::get(IntptrTy, 8))};
-    // if (UseMatchAllCallback)
-    //   Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
     IRB.CreateCall(HwasanMemoryAccessCallbackSized[O.IsWrite], Args);
   }
   untagPointerOperand(
       O.getInsn(), Addr); // This is the right way of handling pointer operands
 
   return true;
-}
-
-uint8_t rotateOn4bits(uint8_t val, uint8_t positions) {
-  positions = positions % 4;
-  LLVM_DEBUG(dbgs() << " [FieldArmor DBG] Rotating value: 0x"
-                    << utohexstr((unsigned)val) << " by " << (unsigned)positions
-                    << " positions\n");
-  val = ((val << positions) | (val >> (4 - positions)));
-  val = val & 0x0F;
-  LLVM_DEBUG(dbgs() << " [FieldArmor DBG] Rotated value: 0x"
-                    << utohexstr((unsigned)val) << "\n");
-  assert(val >> 4 == 0 && "Rotation on 4 bits failed");
-  return val;
 }
 
 void debugAggregateVisit(Type *sonType, uint8_t currNestingLevel,
@@ -2249,9 +2223,9 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         return;
       } // son is union
       // after this point, son is a non-literal struct!
-      auto taggedPointer = tagPointer(
-          IRB, GEPI->getType(), untaggedResLongPtr,
-          ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit 
+      auto taggedPointer =
+          tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
+                     ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit
 
       std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                          : "gep." + itostr(NumInstrumentedGEPs);
@@ -2362,10 +2336,11 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         //                                  ConstantInt::get(IntptrTy, 1Lu)),
         //                    ConstantInt::get(IntptrTy, 0x8Lu)),
         //     4Lu);
-        Value *sonL = ConstantInt::get(IntptrTy, 0x00Lu); // NOTE: levels are not implemented yet.
+        Value *sonL = ConstantInt::get(
+            IntptrTy, 0x00Lu); // NOTE: levels are not implemented yet.
         sonL->setName("sonL");
-        sonTag = IRB.CreateOr(
-            sonL, ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit 
+        sonTag = IRB.CreateOr(sonL,
+                              ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit
       }
       sonTag->setName("sonTag_struct");
     }
@@ -2391,29 +2366,40 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 } // InstrumentGEP
 
 void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
-  // IS THIS ENOUGH? NO
-  // LLVM_DEBUG(dbgs() << "[FieldArmor] Instrumenting CMP: " << *CI << "\n");
+  // EXAMPLE
+  /**
+   * %fImpl = getelementptr inbounds nuw %"class.xercesc_2_7::DOM_NodeIterator",
+   * ptr %this, i32 0, i32 0, !dbg !402 %0 = load ptr, ptr %fImpl, align 8, !dbg
+   * !402, !tbaa !325 %fImpl2 = getelementptr inbounds nuw
+   * %"class.xercesc_2_7::DOM_NodeIterator", ptr %other, i32 0, i32 0, !dbg !403
+   * %1 = load ptr, ptr %fImpl2, align 8, !dbg !403, !tbaa !325
+   * %cmp = icmp eq ptr %0, %1, !dbg !404
+   */
   auto op1 = CI->getOperand(0);
   auto cmpType = op1->getType();
   auto op2 = CI->getOperand(1);
+  auto cmpType2 = op2->getType();
 
+  assert(
+      cmpType == cmpType2 &&
+      "[FieldArmor] CMP operand types do not match. This should not happen.");
   if (cmpType->isPointerTy()) {
     IRBuilder<> IRB(CI);
-    auto untaggedop1 = untagPointer(IRB, IRB.CreatePtrToInt(op1, IntptrTy));
-    auto untaggedop2 = untagPointer(IRB, IRB.CreatePtrToInt(op2, IntptrTy));
-    CI->replaceUsesOfWith(op1, IRB.CreateIntToPtr(untaggedop1, cmpType));
-    CI->replaceUsesOfWith(op2, IRB.CreateIntToPtr(untaggedop2, cmpType));
+    auto untaggedop1long = untagPointer(IRB, IRB.CreatePtrToInt(op1, IntptrTy));
+    auto untaggedop2long = untagPointer(IRB, IRB.CreatePtrToInt(op2, IntptrTy));
+    Value *untaggedPtr1 = IRB.CreateIntToPtr(untaggedop1long, cmpType);
+    Value *untaggedPtr2 = IRB.CreateIntToPtr(untaggedop2long, cmpType);
+
+    untaggedPtr1->setName("cmp_op1_untagged");
+    untaggedPtr2->setName("cmp_op2_untagged");
+    CI->replaceUsesOfWith(op1, untaggedPtr1);
+    CI->replaceUsesOfWith(op2, untaggedPtr2);
+    NumInstrumentedCMPs++;
   }
-  // else {
-  //   LLVM_DEBUG(
-  //       dbgs() << "[FieldArmor] CMP operands are not pointers. Skipping: "
-  //              << *CI << "\n");
-  // }
 }
 
 bool followOpDefUseChainForArithmetic(Value *V) {
-  // this is flaky, cases other than PtrToInt are not handled well in the
-  // caller.
+  // When marking something as pointer, it must be a pointer OW we disrupt integers.
   bool isAllocaPtr = false;
   isAllocaPtr = isa<AllocaInst>(V->stripPointerCasts());
   bool isCallReturn = isa<CallInst>(V->stripPointerCasts());
@@ -2424,13 +2410,7 @@ bool followOpDefUseChainForArithmetic(Value *V) {
     Function *CalledFunc = CI->getCalledFunction();
 
     if (CalledFunc) {
-      // LLVM_DEBUG(dbgs() << "[FieldArmor] Arithmetic operand " << *V
-      //                   << " comes from call to function: "
-      //                   << CalledFunc->getName() << "\n");
       return CalledFunc->getReturnType()->isPointerTy();
-      // What if the called function converts a pointer to an integer and
-      // returns?
-      // TODO: handle!!!
     }
   }
   return isa<PtrToIntInst>(V) || isAllocaPtr;
@@ -2439,7 +2419,7 @@ bool followOpDefUseChainForArithmetic(Value *V) {
 void HWAddressSanitizer::InstrumentArithmetic(BinaryOperator *CI) {
   auto op1 = CI->getOperand(0);
   auto op2 = CI->getOperand(1);
-
+  // err on the safe side, untag even if potentially untagged
   bool isPointerO1 = followOpDefUseChainForArithmetic(op1);
   bool isPointerO2 = followOpDefUseChainForArithmetic(op2);
 
@@ -2449,36 +2429,34 @@ void HWAddressSanitizer::InstrumentArithmetic(BinaryOperator *CI) {
     if (isPointerO1) {
       auto typeOp1 = cast<PtrToIntInst>(op1)->getType();
 
-      Value *untaggedop1 =
-          IRB.CreateAnd(op1, ConstantInt::get(typeOp1, ~(0x7FLu << 56Lu)));
+      Value *untaggedop1 = untagPointer(IRB, op1);
+      untaggedop1->setName("arith_op1_untagged");
       CI->replaceUsesOfWith(op1, untaggedop1);
     }
 
     if (isPointerO2) {
       auto typeOp2 =
           cast<PtrToIntInst>(op2)->getType(); // this fails it not right Type
-      Value *untaggedop2 =
-          IRB.CreateAnd(op2, ConstantInt::get(typeOp2, ~(0x7FLu << 56Lu)));
+      Value *untaggedop2 = untagPointer(IRB, op2);
+      untaggedop2->setName("arith_op2_untagged");
       CI->replaceUsesOfWith(op2, untaggedop2);
     }
+    NumInstrumentedArithmeticOps++;
+    CI->setName("arith_op_untagged");
   }
-  //  else {
-  //   LLVM_DEBUG(
-  //       dbgs()
-  //       << "[FieldArmor] ARITHMETIC operands are not pointers. Skipping: "
-  //       << *CI << "\n");
-  // }
 } // InstrumentArithmetic
 
 void HWAddressSanitizer::InstrumentPtrToInt(PtrToIntInst *PI) {
-  // REPLACE ptr operand with untagged operand in this insttruction
-  IRBuilder<> IRB(PI);
-  // LLVM_DEBUG(dbgs() << "[FieldArmor] Instrumenting PtrToInt: " << *PI <<
-  // "\n");
-  Value *untaggedPtrLong =
-      untagPointer(IRB, IRB.CreatePtrToInt(PI->getPointerOperand(), IntptrTy));
-  PI->setOperand(0, IRB.CreateIntToPtr(untaggedPtrLong,
-                                       PI->getPointerOperand()->getType()));
+  // REPLACE ptr to int with untagged ptr to int
+  LLVM_DEBUG(dbgs() << "[FieldArmor] Instrumenting PtrToInt: " << *PI << "\n");
+  IRBuilder<> IRB(PI->getNextNonDebugInstruction());
+  Value *untaggedPtr = untagPointer(IRB, PI);
+  untaggedPtr->setName(untaggedPtr->getName() + ".untagged");
+  // PI->replaceAllUsesWith(untaggedPtr); // NOTE: replace all uses except self
+  PI->replaceUsesWithIf(untaggedPtr, [PI, untaggedPtr](const Use &U) {
+    auto *User = U.getUser();
+    return User != PI && User != untaggedPtr && !isa<LifetimeIntrinsic>(User);
+  });
   // Q: do I still need to replace the uses?
 }
 
@@ -3137,9 +3115,8 @@ void HWAddressSanitizer::InstrumentConstGEP(ConstantExpr *GEPI,
     //                    ConstantInt::get(IntptrTy, 0x8u)),
     // 4u); // level aligned and ready to be applied
     Value *sonL = ConstantInt::get(IntptrTy, 0x00u); // reset level for structs
-    sonTag = IRB.CreateOr(
-        IRB.CreateOr(sonT, sonL),
-        ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit 
+    sonTag = IRB.CreateOr(IRB.CreateOr(sonT, sonL),
+                          ConstantInt::get(IntptrTy, 0x80Lu)); // set RP bit
   }
 
   Value *untaggedResLong = IRB.CreateAnd(

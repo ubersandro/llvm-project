@@ -20845,6 +20845,7 @@ void BoUpSLP::computeMinimumValueSizes() {
 }
 
 PreservedAnalyses SLPVectorizerPass::run(Function &F, FunctionAnalysisManager &AM) {
+  return PreservedAnalyses::all();
   auto *SE = &AM.getResult<ScalarEvolutionAnalysis>(F);
   auto *TTI = &AM.getResult<TargetIRAnalysis>(F);
   auto *TLI = AM.getCachedResult<TargetLibraryAnalysis>(F);

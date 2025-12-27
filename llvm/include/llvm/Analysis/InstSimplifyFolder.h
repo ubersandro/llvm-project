@@ -80,7 +80,8 @@ public:
 
   Value *FoldGEP(Type *Ty, Value *Ptr, ArrayRef<Value *> IdxList,
                  GEPNoWrapFlags NW) const override {
-    return simplifyGEPInst(Ty, Ptr, IdxList, NW, SQ);
+    return nullptr;
+                  // return simplifyGEPInst(Ty, Ptr, IdxList, NW, SQ);
   }
 
   Value *FoldSelect(Value *C, Value *True, Value *False) const override {

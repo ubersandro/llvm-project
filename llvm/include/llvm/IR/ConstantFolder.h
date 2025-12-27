@@ -106,6 +106,7 @@ public:
 
   Value *FoldGEP(Type *Ty, Value *Ptr, ArrayRef<Value *> IdxList,
                  GEPNoWrapFlags NW) const override {
+    return nullptr;
     if (!ConstantExpr::isSupportedGetElementPtr(Ty))
       return nullptr;
 

@@ -1238,11 +1238,11 @@ NewGVN::ExprResult NewGVN::createExpression(Instruction *I) const {
     if (auto Simplified = checkExprResults(E, I, V))
       return Simplified;
   } else if (auto *GEPI = dyn_cast<GetElementPtrInst>(I)) {
-    Value *V = simplifyGEPInst(GEPI->getSourceElementType(), *E->op_begin(),
-                               ArrayRef(std::next(E->op_begin()), E->op_end()),
-                               GEPI->getNoWrapFlags(), Q);
-    if (auto Simplified = checkExprResults(E, I, V))
-      return Simplified;
+    // Value *V = simplifyGEPInst(GEPI->getSourceElementType(), *E->op_begin(),
+    //                            ArrayRef(std::next(E->op_begin()), E->op_end()),
+    //                            GEPI->getNoWrapFlags(), Q);
+    // if (auto Simplified = checkExprResults(E, I, V))
+    //   return Simplified;
   } else if (AllConstant) {
     // We don't bother trying to simplify unless all of the operands
     // were constant.
