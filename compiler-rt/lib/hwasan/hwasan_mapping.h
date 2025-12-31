@@ -35,7 +35,7 @@
 
 // Reasonable values are 4 (for 1/16th shadow) and 6 (for 1/64th).
 constexpr uptr kShadowScale = 0;
-constexpr uptr kShadowAlignment = 1<<6 ; // what does this do?
+constexpr uptr kShadowAlignment = 1 ;
 
 namespace __hwasan {
 

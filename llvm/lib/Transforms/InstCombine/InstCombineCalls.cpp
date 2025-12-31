@@ -114,6 +114,7 @@ static bool hasUndefSource(AnyMemTransferInst *MI) {
 }
 
 Instruction *InstCombinerImpl::SimplifyAnyMemTransfer(AnyMemTransferInst *MI) {
+  return nullptr;
   Align DstAlign = getKnownAlignment(MI->getRawDest(), DL, MI, &AC, &DT);
   MaybeAlign CopyDstAlign = MI->getDestAlign();
   if (!CopyDstAlign || *CopyDstAlign < DstAlign) {
@@ -216,6 +217,7 @@ Instruction *InstCombinerImpl::SimplifyAnyMemTransfer(AnyMemTransferInst *MI) {
 }
 
 Instruction *InstCombinerImpl::SimplifyAnyMemSet(AnyMemSetInst *MI) {
+  return nullptr;
   const Align KnownAlignment =
       getKnownAlignment(MI->getDest(), DL, MI, &AC, &DT);
   MaybeAlign MemSetAlign = MI->getDestAlign();

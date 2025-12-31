@@ -29,6 +29,7 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/BinaryFormat/ELF.h"
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constant.h"
@@ -319,9 +320,10 @@ private:
   Value *ApplyRLT(IRBuilder<> &IRB, Instruction *AI, Type *rootType,
                   const DataLayout &DL); // TODO: refactor remove DL
 
-  u_int8_t *computeTags(StructType *t); // FieldArmor
-  void createTagVectors();              // FieldArmor
-  void createTagVector(StructType *t);  // FieldArmor
+  u_int8_t *computeTags(StructType *t);           // FieldArmor
+  void createTagVectors();                        // FieldArmor
+  void createTagVector(StructType *t);            // FieldArmor
+  bool potentiallyBlacklistFunction(Function &F); // FieldArmor
   // END FieldArmor
 
   bool selectiveInstrumentationShouldSkip(Function &F,
@@ -502,7 +504,6 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
 
     // errs() << "=== HWASan Before Function: " << F.getName() << " ===\n";
     // F.print(errs());
-
     HWASan.sanitizeFunction(F, FAM);
 
     // errs() << "=== HWASan After Function: " << F.getName() << " ===\n";
@@ -1589,6 +1590,20 @@ bool HWAddressSanitizer::selectiveInstrumentationShouldSkip(
   return Skip;
 }
 
+/** Blocklist C++ templates because they are broken with my instumentation.*/
+bool HWAddressSanitizer::potentiallyBlacklistFunction(Function &F) {
+  std::string demangledName = demangle(F.getName().str());
+
+  // blocking functions that start with std:: (enforce starts with)
+  if ((demangledName.find("std::") != std::string::npos &&
+       demangledName.find("std::") == 0) ||
+      demangledName.find("llvm::") != std::string::npos) {
+    // errs() << "[++] Blocklisting function: " << demangledName << "\n";
+    return true;
+  }
+  return false;
+}
+
 void HWAddressSanitizer::sanitizeFunction(Function &F,
                                           FunctionAnalysisManager &FAM) {
   if (&F == HwasanCtorFunction)
@@ -1603,7 +1618,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   if (F.empty())
     return;
-
+  if (potentiallyBlacklistFunction(F))
+    return;
   NumTotalFuncs++;
 
   OptimizationRemarkEmitter &ORE =
@@ -2306,9 +2322,10 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     else {
       // son is not a union. Might still be a literal struct.
       StructType *SonTy = dyn_cast<StructType>(sonType);
-      if (SonTy->isLiteral() ||
-          (SonTy->getName().str().find("std::pair") != std::string::npos)) {
-        // if son is a literal struct, or a std::pair, untag the pointer
+      // if (SonTy->isLiteral() ||
+      //     (SonTy->getName().str().find("std::pair") != std::string::npos)) {
+      if (SonTy->isLiteral()){
+        // if son is a literal struct, untag the pointer
         sonTag = ConstantInt::get(IntptrTy, 0x0Lu); // untag son
         Value *taggedPointer =
             tagPointer(IRB, GEPI->getType(), untaggedResLongPtr, sonTag);
@@ -2399,7 +2416,8 @@ void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
 }
 
 bool followOpDefUseChainForArithmetic(Value *V) {
-  // When marking something as pointer, it must be a pointer OW we disrupt integers.
+  // When marking something as pointer, it must be a pointer OW we disrupt
+  // integers.
   bool isAllocaPtr = false;
   isAllocaPtr = isa<AllocaInst>(V->stripPointerCasts());
   bool isCallReturn = isa<CallInst>(V->stripPointerCasts());

@@ -44,7 +44,7 @@ enum {
 };
 
 // Initialized in HwasanAllocatorInit, an never changed.
-alignas(16) static u8 tail_magic[kShadowAlignment - 1] = {0};
+// alignas(16) static u8 tail_magic[kShadowAlignment - 1] = {0};
 static uptr max_malloc_size;
 
 bool HwasanChunkView::IsAllocated() const {
@@ -220,7 +220,7 @@ static void* HwasanAllocate(StackTrace* stack, uptr orig_size, uptr alignment,
   if (size != orig_size) {
     u8* tail = reinterpret_cast<u8*>(allocated) + orig_size;
     uptr tail_length = size - orig_size;
-    internal_memcpy(tail, tail_magic, tail_length - 1);
+    // internal_memcpy(tail, tail_magic, tail_length - 1); // just copy 0s in the padding region
     // Short granule is excluded from magic tail, so we explicitly untag.
     tail[tail_length - 1] = 0;
   }
@@ -254,7 +254,7 @@ static void* HwasanAllocate(StackTrace* stack, uptr orig_size, uptr alignment,
 #endif
   meta->SetAllocated(StackDepotPut(*stack), orig_size);
   RunMallocHooks(user_ptr, orig_size);
-  // VPrintf(1 , "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n",
+  // VPrintf(0 , "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n",
   // orig_size, alignment, user_ptr);
   return user_ptr;
 }
@@ -272,8 +272,9 @@ static bool PointerAndMemoryTagsMatch(void* tagged_ptr) {
 static bool CheckInvalidFree(StackTrace* stack, void* untagged_ptr,
                              void* tagged_ptr) {
   // This function can return true if halt_on_error is false.
-  if (!MemIsApp(reinterpret_cast<uptr>(untagged_ptr)) ||
-      !PointerAndMemoryTagsMatch(tagged_ptr)) {
+  // if (!MemIsApp(reinterpret_cast<uptr>(untagged_ptr)) ||
+  //     !PointerAndMemoryTagsMatch(tagged_ptr)) {
+  if (!MemIsApp(reinterpret_cast<uptr>(untagged_ptr))) {
     ReportInvalidFree(stack, reinterpret_cast<uptr>(tagged_ptr));
     return true;
   }
@@ -288,8 +289,8 @@ static void HwasanDeallocate(StackTrace* stack, void* tagged_ptr) {
     return;
   // TODO: this is not ok
 
-  // if (CheckInvalidFree(stack, untagged_ptr, tagged_ptr))
-  //   return;
+  if (CheckInvalidFree(stack, untagged_ptr, tagged_ptr))
+    return;
 
   void* aligned_ptr = reinterpret_cast<void*>(
       RoundDownTo(reinterpret_cast<uptr>(untagged_ptr), kShadowAlignment));

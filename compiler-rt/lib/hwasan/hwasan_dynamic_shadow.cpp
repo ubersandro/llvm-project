@@ -139,7 +139,7 @@ uptr FindDynamicShadowStart(uptr shadow_size_bytes) {
   return MapDynamicShadowAndAliases(shadow_size_bytes, kAliasSize, kNumAliases,
                                     RingBufferSize());
 #  endif
-  return MapDynamicShadow(shadow_size_bytes, kShadowScale, kShadowBaseAlignment,
+  return MapDynamicShadow(shadow_size_bytes, 1, kShadowBaseAlignment,
                           kHighMemEnd, GetMmapGranularity());
 }
 

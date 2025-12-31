@@ -21,7 +21,7 @@ HWASAN_FLAG(bool, verbose_threads, false,
 HWASAN_FLAG(bool, tag_in_malloc, true, "")
 HWASAN_FLAG(bool, tag_in_free, true, "")
 HWASAN_FLAG(bool, print_stats, false, "")
-HWASAN_FLAG(bool, halt_on_error, true, "")
+HWASAN_FLAG(bool, halt_on_error, false, "") // don't halt!
 HWASAN_FLAG(bool, atexit, false, "")
 HWASAN_FLAG(
     bool, print_live_threads_info, true,

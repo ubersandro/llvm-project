@@ -126,7 +126,7 @@ static void InitializeShadowBaseAddress(uptr shadow_size_bytes) {
 static void MaybeDieIfNoTaggingAbi(const char *message) {
   if (!flags()->fail_without_syscall_abi)
     return;
-  Printf("FATAL: %s\n", message);
+Printf("FATAL: %s\n", message);
   Die();
 }
 
