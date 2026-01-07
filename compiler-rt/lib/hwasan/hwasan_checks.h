@@ -154,9 +154,9 @@ PossiblyShortTagMatches(tag_t mem_tag, uptr ptr, uptr sz) {
   return *(u8*)(ptr | (kShadowAlignment - 1)) == ptr_tag;
 }
 
-#define getT(tag) (tag & 0x0FUL)
-#define getL(tag) (tag & 0x30UL) >> 4
-#define getR(tag) (tag & 0x80UL) >> 7
+#define getT(tag) (tag & 0b00001111UL)
+#define getL(tag) (tag & 0b00110000UL) >> 4
+#define getR(tag) (tag & 0b01000000UL) >> 6
 
 template <ErrorAction EA, AccessType AT>
 __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
@@ -291,7 +291,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
         // VPrintf(1, "\t[FieldArmor] EXP_T=%x, MEM_T=%x\n", ptr_tag,
         // *curr_memtag);
 
-        SigTrap<ErrorAction::Recover, AT>(p, sz);  // keeps on failing...
+        SigTrap<EA, AT>(p, sz);  // keeps on failing...
         if (EA == ErrorAction::Abort)
           __builtin_unreachable();
       }
