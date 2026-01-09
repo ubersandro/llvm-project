@@ -54,7 +54,7 @@
 SANITIZER_INTERFACE_ATTRIBUTE
 THREADLOCAL uptr __hwasan_tls;
 #  endif
-
+u_int64_t RPTag = 0x40Ul; 
 namespace __hwasan {
 
 // With the zero shadow base we can not actually map pages starting from 0.
@@ -498,7 +498,7 @@ uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector) {
   // TODO complete
   u_int8_t * ptr = (u_int8_t *)tag_vector;
   VPrintf(2, "[FieldArmor] TagMemory_mod : NEW VAR -> P: %p size: %p tag_vector: %p\n", (void *)p, (void *)size, (void *)tag_vector);
-  uptr tagged = AddTagToPointer(p, 0x40Lu);
+  uptr tagged = AddTagToPointer(p, RPTag);
 
   for(uptr i=0; i<size; i++){
     u_int8_t tag = ptr ? ptr[i] : 0; // TODO this sucks
