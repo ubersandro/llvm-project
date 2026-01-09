@@ -1616,6 +1616,14 @@ bool HWAddressSanitizer::potentiallyBlacklistFunction(Function &F) {
     // errs() << "[++] Blocklisting function: " << demangledName << "\n";
     return true;
   }
+
+  if (demangledName.find("Perl_Slab") != std::string::npos) {
+    errs() << "[++] Blocklisting function: " << demangledName << "\n";
+    return true;
+    // TODO: solve bugs in there because of PTR arithmetics.
+    // PtrToInt instrumentation was solving the mess there, so it must be easy
+    // to figure bugs out. Only two functions are blocklisted.
+  }
   return false;
 }
 
@@ -2383,10 +2391,11 @@ void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
   auto cmpType = op1->getType();
   auto op2 = CI->getOperand(1);
   auto cmpType2 = op2->getType();
-  auto oneIsNull =
-      isa<ConstantPointerNull>(op1) || isa<ConstantPointerNull>(op2);
-  if (oneIsNull)
-    return;
+  // auto oneIsNull =
+  //     isa<ConstantPointerNull>(op1) || isa<ConstantPointerNull>(op2);
+  // if (oneIsNull)
+  //   return;
+  // NOTE: dont do this, it breaks 502.gcc_r. There is a tagged nullptr being dereferenced.
 
   // NOTE CMP between pointers looks like this "icmp eq ptr %0, %1"
   if (cmpType->isPointerTy()) {
