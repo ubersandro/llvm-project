@@ -210,15 +210,33 @@ static cl::opt<int> ClHotPercentileCutoff("hwasan-percentile-cutoff-hot",
 STATISTIC(NumTotalFuncs, "Number of total funcs");
 STATISTIC(NumInstrumentedFuncs, "Number of instrumented funcs");
 STATISTIC(NumNoProfileSummaryFuncs, "Number of funcs without PS");
-// STATISTIC(NumLiteralStructs, "Number of literal structs encountered");
+
+STATISTIC(NumTotalGEPs, "Number of total GEP instructions");
+STATISTIC(
+    NumUntaggedGEPResults,
+    "Number of untagged GEP results"); // proxy for how many checks we skip
 STATISTIC(NumInstrumentedGEPs, "Number of instrumented GEP instructions");
+STATISTIC(NumIgnoredGEPs, "Number of ignored GEP instructions");
+
 STATISTIC(NumInstrumentedGlobals, "Number of instrumented global variables");
-STATISTIC(NumDefinedTagVectors, "Number of defined tag vectors");
+STATISTIC(NumDefinedTagVectors, "Number of defined tag vectors (same as the "
+                                "number of totally identified struct types.)");
 STATISTIC(NumInstrumentedCMPs, "Number of instrumented CMP instructions");
-STATISTIC(NumProtectedUnions, "Number of protected unions");
+STATISTIC(NumEmbeddedUnions, "Number of unions embedded in other structs");
+STATISTIC(NumLiteralStructs, "Number of literal structs encountered");
+STATISTIC(NumLiteralStructsEmbedded,
+          "Number of literal structs embedded in other structs");
+
 STATISTIC(NumInstrumentedArithmeticOps,
           "Number of instrumented arithmetic instructions");
-
+STATISTIC(
+    NumChecksOnUntaggedPtrs,
+    "Number of checks skipped on untagged pointers"); // TODO: find a way of
+                                                      // implementing this. It's
+                                                      // impossible to get it
+                                                      // from the LOAD/STORE
+                                                      // instruction itself
+STATISTIC(NumInstrumentedMemAccesses, "Number of instrumented memory accesses");
 // Mode for selecting how to insert frame record info into the stack ring
 // buffer.
 enum RecordStackHistoryMode {
@@ -265,10 +283,6 @@ template <typename T> T optOr(cl::opt<T> &Opt, T Other) {
 bool shouldInstrumentStack(const Triple &TargetTriple) {
   return ClInstrumentStack;
 }
-/** FieldArmor flags */
-// bool shouldInstrumentPtrToInt() { return ClInstrumentPtrToInt; }
-// bool shouldInstrumentArithmetic() { return ClInstrumentArithmetic; }
-// bool shouldInstrumentGEPs() { return ClInstrumentGEPs; }
 
 bool shouldInstrumentWithCalls(const Triple &TargetTriple) {
   return optOr(ClInstrumentWithCalls, TargetTriple.getArch() == Triple::x86_64);
@@ -327,7 +341,7 @@ private:
   void InstrumentCall(CallInst *CI);
   void InstrumentPtrToInt(PtrToIntInst *PI);
   void InstrumentArithmetic(BinaryOperator *BO);
-  void InstrumentConstGEP(ConstantExpr *GEPI, Type *Ty);
+  void InstrumentConstGEP(ConstantExpr *GEPI);
   Value *getRPTag(IRBuilder<> &IRB); // FieldArmor
   Value *ApplyRLT(IRBuilder<> &IRB, Instruction *AI, Type *rootType,
                   const DataLayout &DL); // TODO: refactor remove DL
@@ -906,7 +920,6 @@ bool HWAddressSanitizer::ignoreAccess(OptimizationRemarkEmitter &ORE,
 }
 
 void HWAddressSanitizer::getInterestingMemoryOperands(
-    // TODO: explore this method
     OptimizationRemarkEmitter &ORE, Instruction *I,
     const TargetLibraryInfo &TLI,
     SmallVectorImpl<InterestingMemoryOperand> &Interesting) {
@@ -1168,6 +1181,7 @@ void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
    * we want to start catching memcpys on pointers to fields that overwrite the
    * whole struct or parts of it. */
   errs() << "[++] Instrumenting memory intrinsic: " << *MI << "\n";
+  return;
   IRBuilder<> IRB(MI);
   if (isa<MemTransferInst>(MI)) { /*memcpy, memmove*/
     SmallVector<Value *, 4> Args{
@@ -1231,7 +1245,7 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
   }
   untagPointerOperand(
       O.getInsn(), Addr); // This is the right way of handling pointer operands
-
+  NumInstrumentedMemAccesses++;
   return true;
 }
 
@@ -1677,6 +1691,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     // TODO: filter out something
     getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
 
+    /* NOTE: ideally, one wants to instrument memcpy/memmove/memset only when
+     * they operate on non-root pointers*/
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
       if (!ignoreMemIntrinsic(ORE, MI))
         IntrinToInstrument.push_back(MI);
@@ -1705,7 +1721,11 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     //     CallsToInstrument.push_back(CI);
     //   }
     // }
-
+    // if (ConstantExpr *CE = dyn_cast<ConstantExpr>(&Inst)) {
+    //   if (CE->getOpcode() == Instruction::GetElementPtr) {
+    //     ConstGEPsToInstrument.push_back(CE);
+    //   }
+    // }
     // TODO: introduce logic for figuring out the first GEP in a chain on a
     // potentially dynamically allocated chunk. Then, introduce ad hoc routine
     // to insert calls to tagging function. Finally, instrument GEPs as usual.
@@ -1758,14 +1778,22 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     }
   }
 
-  // if (ClInstrumentMemIntrinsics && !IntrinToInstrument.empty()) {
-  //   for (auto *Inst : IntrinToInstrument)
-  //     instrumentMemIntrinsic(Inst);
-  // }
+  if (ClInstrumentMemIntrinsics && !IntrinToInstrument.empty()) {
+    for (auto *Inst : IntrinToInstrument)
+      instrumentMemIntrinsic(Inst);
+  }
 
   for (auto &GEPI : GEPsToInstrument) {
     InstrumentGEP(GEPI);
   }
+
+  /** NOTE: in this LLVM version, at O2, ConstGEPs do not seem to be there in
+   * SPEC2017.
+   * TODO: investigate */
+  // for (auto &CE : ConstGEPsToInstrument) {
+  //   InstrumentConstGEP(CE);
+  // }
+
   // NOTE: cmps are instrumented because the same pointer can have different
   // tags depending on how it is retrieved.
   for (auto &CMPI : CMPsToInstrument) {
@@ -1777,6 +1805,11 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   // tag loss. However, FPs resulting from a non-root ptr used to access a
   // struct are ruled out by default.
   // NOTE: enabling this breaks 502
+
+  /* NOTE: at O2, most arithmetic operations seem to be taken care by the
+   * compiler. It folds constants in such a way that nothing is performed at
+   * runtime and that code is safe. E.g. compiling 500.perlbench_r at O0 causes
+   * an invalid malloc when size is computed using ptr arithm. */
   // for (auto &BO : ArithInstructions) {
   //   InstrumentArithmetic(BO);
   // }
@@ -2107,6 +2140,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                        : "gep." + itostr(NumInstrumentedGEPs);
     GEPI->setName(Name + ".fieldarmor.untagged");
+    NumIgnoredGEPs++;
     return;
   }
 
@@ -2118,7 +2152,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                        : "gep." + itostr(NumInstrumentedGEPs);
     GEPI->setName(Name + ".fieldarmor.union"); // propagate
-    NumInstrumentedGEPs++;
+    // NumInstrumentedGEPs++;
+    NumIgnoredGEPs++;
     return;
   }
 
@@ -2131,7 +2166,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                        : "gep." + itostr(NumInstrumentedGEPs);
     GEPI->setName(Name + ".fieldarmor.untagged");
-    NumInstrumentedGEPs++;
+    // NumInstrumentedGEPs++;
+    NumIgnoredGEPs++;
     return;
   }
 
@@ -2164,7 +2200,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       auto *User = U.getUser();
       return User != resultLong && !isa<LifetimeIntrinsic>(User);
     });
-    NumInstrumentedGEPs++;
+    // NumInstrumentedGEPs++;
+    NumIgnoredGEPs++;
     return;
   } // if father is union
 
@@ -2183,7 +2220,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       auto *User = U.getUser();
       return User != resultLong && !isa<LifetimeIntrinsic>(User);
     });
-    NumInstrumentedGEPs++;
+    // NumInstrumentedGEPs++;
+    NumIgnoredGEPs++;
     return;
   } // if struct and literal
 
@@ -2209,6 +2247,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
       if (sonTypeCast->isLiteral()) { /* untag if literal */
         taggedPointer = untaggedResLongPtr;
+        NumUntaggedGEPResults++;
         endResultName =
             (GEPI->hasName() ? GEPI->getName().str()
                              : "gep." + itostr(NumInstrumentedGEPs)) +
@@ -2220,7 +2259,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           (sonTypeCast->getName().str().find("union.") != std::string::npos);
       if (sonIsUnion) { /* GEP into array of unions -> untag*/
         taggedPointer = untaggedResLongPtr;
-
+        NumUntaggedGEPResults++;
         endResultName =
             (GEPI->hasName() ? GEPI->getName().str()
                              : "gep." + itostr(NumInstrumentedGEPs)) +
@@ -2238,11 +2277,6 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
     } // GEP into array of non-literal structs
   } // GEP from array type
-
-  // handle cases in which GEPs are used to access arrays of chars
-  // TODO: count how many
-  // if (!fatherType->isStructTy())
-  //   return;
 
   // FATHER IS STRUCT for sure now
   else if (fatherType->isStructTy()) {
@@ -2285,6 +2319,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
       if (sonIsUnion) { /* son is a union -> untag */
         taggedPointer = untaggedResLongPtr;
+        NumUntaggedGEPResults++;
         endResultName =
             (GEPI->hasName() ? GEPI->getName().str()
                              : "gep." + itostr(NumInstrumentedGEPs)) +
@@ -2298,6 +2333,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         if (SonTy->isLiteral()) {
           // if son is a literal struct, untag the pointer
           taggedPointer = untaggedResLongPtr;
+          NumUntaggedGEPResults++;
           endResultName =
               (GEPI->hasName() ? GEPI->getName().str()
                                : "gep." + itostr(NumInstrumentedGEPs)) +
@@ -2312,6 +2348,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
             // NOTE: untagging std types because my instrumentation causes some
             // issues with HWAsan runtime. TODO: come back to this later.
             taggedPointer = untaggedResLongPtr;
+            NumUntaggedGEPResults++;
             endResultName =
                 (GEPI->hasName() ? GEPI->getName().str()
                                  : "gep." + itostr(NumInstrumentedGEPs)) +
@@ -2340,6 +2377,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     return User != resultLong && !isa<LifetimeIntrinsic>(User);
   });
   NumInstrumentedGEPs++;
+  // NOTE: instrumented might also mean untagged
 } // InstrumentGEP
 
 /**
@@ -2495,6 +2533,16 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   Constant *Initializer = GV->getInitializer();
   Type *type = GV->getValueType();
 
+  if (type->isStructTy()) {
+    auto *ST = dyn_cast<StructType>(type);
+    if (ST->hasName() && ST->getName().starts_with("struct.std::pair")) {
+      errs() << "[FieldArmor] Skipping global variable: " << GV->getName()
+             << "\n";
+      return;
+    }
+    // if literal, it cant be a pair
+  }
+
   assert(type->isAggregateType() &&
          "[FieldArmor] Expected only aggregate types to be instrumented");
   bool isUnion = false;
@@ -2578,8 +2626,8 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
 
     assert(!struct_name.empty() &&
            "Struct name must be valid to instrument global variable.");
-    errs() << "[FieldArmor] Instrumenting global of struct type: "
-           << struct_name << "\n";
+    // errs() << "[FieldArmor] Instrumenting global of struct type: "
+    //        << struct_name << "\n";
 
     // TODO: introduce support for arrays in runtime tagging
     auto *TagVector =
@@ -2807,7 +2855,7 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
     /** Non-literal union: treat it as a scalar field. */
     tags = new uint8_t[size]; // TODO: get rid of this, maybe causing OOM
     memset(tags, (unsigned char)0x00, size);
-    NumProtectedUnions++; // TODO: remove or refactor
+    NumEmbeddedUnions++; // TODO: remove or refactor
   } // if isUnion
   else {
     /** This gets called on: a) non-literal struct, b) literal struct*/
@@ -2989,43 +3037,44 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
   return tags;
 } // computeTags
 
-
 /**
- * GEPs on globals are constant expr, so they need special handling.
+ * GEPs on globals are constant expr, right? Maybe not ...
  */
-void HWAddressSanitizer::InstrumentConstGEP(ConstantExpr *GEPI,
-                                            Type *fatherType) {
+void HWAddressSanitizer::InstrumentConstGEP(ConstantExpr *GEPI) {
+  errs() << "[FieldArmor] Instrumenting CONST GEP: ";
+  GEPI->print(errs());
+  errs() << "\n";
+
   auto nOperands = GEPI->getNumOperands();
   assert(nOperands <= 3); // I expect 3 at most
-  if(nOperands == 2) {
+  if (nOperands == 2) {
     errs() << "[FieldArmor] CONST GEP with 2 operands found: ";
     GEPI->print(errs());
     errs() << "\n";
     return;
-    // TODO
   }
 
-  Instruction *insertBefore = nullptr;
-  auto users = GEPI->users();
-  
-  if (!users.empty()) {
+  // Instruction *insertBefore = nullptr;
+  // auto users = GEPI->users();
 
-    auto *one_user = *users.begin();
-    if (Instruction *one_user_inst = dyn_cast<Instruction>(one_user)) {
-      insertBefore = one_user_inst->getPrevNode();
-    }
-    if (!insertBefore) {
-      return;
-    }
-  }
-  auto *constIdx = dyn_cast<ConstantInt>(GEPI->getOperand(2));
-  if (!constIdx) {
-    return;
-  }
-  uint64_t gepIdx = constIdx->getZExtValue();
-  auto sonType = fatherType->getContainedType(gepIdx);
+  // if (!users.empty()) {
 
-  IRBuilder<> IRB(M.getContext());
-  IRB.SetInsertPoint(insertBefore);
+  //   auto *one_user = *users.begin();
+  //   if (Instruction *one_user_inst = dyn_cast<Instruction>(one_user)) {
+  //     insertBefore = one_user_inst->getPrevNode();
+  //   }
+  //   if (!insertBefore) {
+  //     return;
+  //   }
+  // }
+  // auto *constIdx = dyn_cast<ConstantInt>(GEPI->getOperand(2));
+  // if (!constIdx) {
+  //   return;
+  // }
+  // uint64_t gepIdx = constIdx->getZExtValue();
+  // auto sonType = fatherType->getContainedType(gepIdx);
+
+  // IRBuilder<> IRB(M.getContext());
+  // IRB.SetInsertPoint(insertBefore);
 
 } // instrumentConstGEP
