@@ -276,12 +276,13 @@ uptr fieldarmor_tag_memory(void *ptr, uptr tags, uptr size) {
   if(!tags){
     // untag memory, i.e. tag it with 0s
     VPrintf(2, "[FieldArmor] untagging memory %p of size %zu\n", ptr, size);
-    return TagMemory_mod((uptr)ptr, size, 0); // TODO
+    // TODO 
+    return TagMemory_mod((uptr)ptr, size, 0, 1); 
     // return (uptr) UntagPtr(ptr);
   }
   ptr = UntagPtr(ptr);
-
-  return TagMemory_mod((uptr)ptr, size, tags);
+  // TODO
+  return TagMemory_mod((uptr)ptr, size, tags, 1);
 }
 
 }  // namespace __hwasan
@@ -304,19 +305,11 @@ void __sanitizer::BufferedStackTrace::UnwindImpl(uptr pc, uptr bp,
 
 
 static bool InitializeSingleGlobal(const hwasan_global& global) {
-  VPrintf(1, "[FieldArmor] GLOBAL INIT %p size %zu \n",
-          (void*)global.addr(), global.size());
-  // NOTE: global.addr() returns the sum of the base + gv_relptr. It is the actual address of the NEW global created at instrumentation time.
-  TagMemory_mod(global.addr(), global.size(), global.tag_vector());// broken alignment here TODO test estensively
-  
+  TagMemory_mod(global.addr(), global.size(), global.tag_vector(), global.get_array_size());
   return true;
 }
 
 static void InitLoadedGlobals() {
-  // FieldArmor: globals should be tagged here, because this is called at init
-  // time
-  // STEP 1: how do I navigate information whose size is different from the
-  // original one?
   dl_iterate_phdr(  // iterate on all the shared objects loaded at this point
       [](dl_phdr_info* info, size_t /* size */,
          void* /* data */) -> int {  // callback for each loaded shared object

@@ -54,7 +54,7 @@
 SANITIZER_INTERFACE_ATTRIBUTE
 THREADLOCAL uptr __hwasan_tls;
 #  endif
-u_int64_t RPTag = 0x40Ul; 
+u_int64_t RPTag = 0x40Ul;
 namespace __hwasan {
 
 // With the zero shadow base we can not actually map pages starting from 0.
@@ -72,8 +72,8 @@ uptr kLowMemEnd;
 uptr kHighMemStart;
 uptr kHighMemEnd;
 
-static void PrintRange(uptr start, uptr end, const char *name) {
-  Printf("|| [%p, %p] || %.*s ||\n", (void *)start, (void *)end, 10, name);
+static void PrintRange(uptr start, uptr end, const char* name) {
+  Printf("|| [%p, %p] || %.*s ||\n", (void*)start, (void*)end, 10, name);
 }
 
 static void PrintAddressSpaceLayout() {
@@ -114,7 +114,7 @@ static void InitializeShadowBaseAddress(uptr shadow_size_bytes) {
     if (!MemoryRangeIsAvailable(beg, end)) {
       Report(
           "FATAL: HWAddressSanitizer: Shadow range %p-%p is not available.\n",
-          (void *)beg, (void *)end);
+          (void*)beg, (void*)end);
       DumpProcessMap();
       CHECK(MemoryRangeIsAvailable(beg, end));
     }
@@ -123,10 +123,10 @@ static void InitializeShadowBaseAddress(uptr shadow_size_bytes) {
   }
 }
 
-static void MaybeDieIfNoTaggingAbi(const char *message) {
+static void MaybeDieIfNoTaggingAbi(const char* message) {
   if (!flags()->fail_without_syscall_abi)
     return;
-Printf("FATAL: %s\n", message);
+  Printf("FATAL: %s\n", message);
   Die();
 }
 
@@ -157,7 +157,7 @@ static bool CanUseTaggingAbi() {
 #  else
   // Check for ARM TBI support.
   return !internal_iserror(internal_prctl(PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0));
-#  endif // __x86_64__
+#  endif  // __x86_64__
 }
 
 static bool EnableTaggingAbi() {
@@ -193,7 +193,7 @@ static bool EnableTaggingAbi() {
       PR_TAGGED_ADDR_ENABLE)
     return false;
   return true;
-#  endif // __x86_64__
+#  endif  // __x86_64__
 }
 
 void InitializeOsSupport() {
@@ -231,14 +231,16 @@ bool InitShadow() {
   // Define the entire memory range.
   kHighMemEnd = GetHighMemEnd();
   // Determine shadow memory base offset.
-  InitializeShadowBaseAddress(MemToShadowSize(kHighMemEnd)>>1); // @ale: shrink shadow memory size
-  VPrintf(1, "HWASan hardcoded shadow base address: %p\n", (void *)__hwasan_shadow_memory_dynamic_address);
+  InitializeShadowBaseAddress(MemToShadowSize(kHighMemEnd) >>
+                              1);  // @ale: shrink shadow memory size
+  VPrintf(1, "HWASan hardcoded shadow base address: %p\n",
+          (void*)__hwasan_shadow_memory_dynamic_address);
   uptr sizeOfInterval = 0x3fffffffffff + 1;
   kLowMemStart = 0;
-  kLowMemEnd =  sizeOfInterval - 1; 
+  kLowMemEnd = sizeOfInterval - 1;
   kLowShadowStart = sizeOfInterval;
   kLowShadowEnd = kLowShadowStart + sizeOfInterval - 1;
-  kHighShadowStart = 0xb00000000000; // @ale: create a gap
+  kHighShadowStart = 0xb00000000000;  // @ale: create a gap
   kHighShadowEnd = kHighShadowStart + sizeOfInterval - 1;
   kHighMemStart = 0xf00000010000;
 
@@ -252,8 +254,10 @@ bool InitShadow() {
   CHECK_GT(kLowShadowStart, kLowMemEnd);
 
   // Reserve shadow memory.
-  ReserveShadowMemoryRange(kLowShadowStart, kLowShadowEnd, "low shadow");     // @ale: this should be shadow heap
-  ReserveShadowMemoryRange(kHighShadowStart, kHighShadowEnd, "high shadow");  // @ale: this should be shadow stack
+  ReserveShadowMemoryRange(kLowShadowStart, kLowShadowEnd,
+                           "low shadow");  // @ale: this should be shadow heap
+  ReserveShadowMemoryRange(kHighShadowStart, kHighShadowEnd,
+                           "high shadow");  // @ale: this should be shadow stack
 
   // Protect all the gaps. TODO: establish sanity checks
   // ProtectGap(0, Min(kLowMemStart, kLowShadowStart));
@@ -306,13 +310,13 @@ static bool tsd_key_inited = false;
 void HwasanTSDThreadInit() {
   if (tsd_key_inited)
     CHECK_EQ(0, pthread_setspecific(tsd_key,
-                                    (void *)GetPthreadDestructorIterations()));
+                                    (void*)GetPthreadDestructorIterations()));
 }
 
-void HwasanTSDDtor(void *tsd) {
+void HwasanTSDDtor(void* tsd) {
   uptr iterations = (uptr)tsd;
   if (iterations > 1) {
-    CHECK_EQ(0, pthread_setspecific(tsd_key, (void *)(iterations - 1)));
+    CHECK_EQ(0, pthread_setspecific(tsd_key, (void*)(iterations - 1)));
     return;
   }
   __hwasan_thread_exit();
@@ -329,19 +333,19 @@ void HwasanTSDThreadInit() {}
 #  endif
 
 #  if SANITIZER_ANDROID
-uptr *GetCurrentThreadLongPtr() { return (uptr *)get_android_tls_ptr(); }
+uptr* GetCurrentThreadLongPtr() { return (uptr*)get_android_tls_ptr(); }
 #  else
-uptr *GetCurrentThreadLongPtr() { return &__hwasan_tls; }
+uptr* GetCurrentThreadLongPtr() { return &__hwasan_tls; }
 #  endif
 
 #  if SANITIZER_ANDROID
 void AndroidTestTlsSlot() {
   uptr kMagicValue = 0x010203040A0B0C0D;
-  uptr *tls_ptr = GetCurrentThreadLongPtr();
+  uptr* tls_ptr = GetCurrentThreadLongPtr();
   uptr old_value = *tls_ptr;
   *tls_ptr = kMagicValue;
   dlerror();
-  if (*(uptr *)get_android_tls_ptr() != kMagicValue) {
+  if (*(uptr*)get_android_tls_ptr() != kMagicValue) {
     Printf(
         "ERROR: Incompatible version of Android: TLS_SLOT_SANITIZER(6) is used "
         "for dlerror().\n");
@@ -353,7 +357,7 @@ void AndroidTestTlsSlot() {
 void AndroidTestTlsSlot() {}
 #  endif
 
-static AccessInfo GetAccessInfo(siginfo_t *info, ucontext_t *uc) {
+static AccessInfo GetAccessInfo(siginfo_t* info, ucontext_t* uc) {
   // Access type is passed in a platform dependent way (see below) and encoded
   // as 0xXY, where X&1 is 1 for store, 0 for load, and X&2 is 1 if the error is
   // recoverable. Valid values of Y are 0 to 4, which are interpreted as
@@ -364,7 +368,7 @@ static AccessInfo GetAccessInfo(siginfo_t *info, ucontext_t *uc) {
   // access size is stored in X1 register. Access address is always in X0
   // register.
   uptr pc = (uptr)info->si_addr;
-  const unsigned code = ((*(u32 *)pc) >> 5) & 0xffff;
+  const unsigned code = ((*(u32*)pc) >> 5) & 0xffff;
   if ((code & 0xff00) != 0x900)
     return AccessInfo{};  // Not ours.
 
@@ -381,7 +385,7 @@ static AccessInfo GetAccessInfo(siginfo_t *info, ucontext_t *uc) {
   // NOP DWORD ptr [EAX + 0x40 + 0xXY]. For Y == 0xF, access size is stored in
   // RSI register. Access address is always in RDI register.
   uptr pc = (uptr)uc->uc_mcontext.gregs[REG_RIP];
-  uint8_t *nop = (uint8_t *)pc;
+  uint8_t* nop = (uint8_t*)pc;
   if (*nop != 0x0f || *(nop + 1) != 0x1f || *(nop + 2) != 0x40 ||
       *(nop + 3) < 0x40)
     return AccessInfo{};  // Not ours.
@@ -401,10 +405,10 @@ static AccessInfo GetAccessInfo(siginfo_t *info, ucontext_t *uc) {
   // ADDI x0, x0, [0x40 + 0xXY]. For Y == 0xF, access size is stored in
   // X11 register. Access address is always in X10 register.
   uptr pc = (uptr)uc->uc_mcontext.__gregs[REG_PC];
-  uint8_t byte1 = *((u8 *)(pc + 0));
-  uint8_t byte2 = *((u8 *)(pc + 1));
-  uint8_t byte3 = *((u8 *)(pc + 2));
-  uint8_t byte4 = *((u8 *)(pc + 3));
+  uint8_t byte1 = *((u8*)(pc + 0));
+  uint8_t byte2 = *((u8*)(pc + 1));
+  uint8_t byte3 = *((u8*)(pc + 2));
+  uint8_t byte4 = *((u8*)(pc + 3));
   uint32_t ebreak = (byte1 | (byte2 << 8) | (byte3 << 16) | (byte4 << 24));
   bool isFaultShort = false;
   bool isEbreak = (ebreak == 0x100073);
@@ -418,10 +422,10 @@ static AccessInfo GetAccessInfo(siginfo_t *info, ucontext_t *uc) {
     return AccessInfo{};
   // advance pc to point after ebreak and reconstruct addi instruction
   pc += isFaultShort ? 2 : 4;
-  byte1 = *((u8 *)(pc + 0));
-  byte2 = *((u8 *)(pc + 1));
-  byte3 = *((u8 *)(pc + 2));
-  byte4 = *((u8 *)(pc + 3));
+  byte1 = *((u8*)(pc + 0));
+  byte2 = *((u8*)(pc + 1));
+  byte3 = *((u8*)(pc + 2));
+  byte4 = *((u8*)(pc + 3));
   // reconstruct instruction
   uint32_t instr = (byte1 | (byte2 << 8) | (byte3 << 16) | (byte4 << 24));
   // check if this is really 32 bit instruction
@@ -444,7 +448,7 @@ static AccessInfo GetAccessInfo(siginfo_t *info, ucontext_t *uc) {
   return AccessInfo{addr, size, is_store, !is_store, recover};
 }
 
-static bool HwasanOnSIGTRAP(int signo, siginfo_t *info, ucontext_t *uc) {
+static bool HwasanOnSIGTRAP(int signo, siginfo_t* info, ucontext_t* uc) {
   AccessInfo ai = GetAccessInfo(info, uc);
   if (!ai.is_store && !ai.is_load)
     return false;
@@ -457,7 +461,7 @@ static bool HwasanOnSIGTRAP(int signo, siginfo_t *info, ucontext_t *uc) {
 #  elif defined(__x86_64__)
 #  elif SANITIZER_RISCV64
   // pc points to EBREAK which is 2 bytes long
-  uint8_t *exception_source = (uint8_t *)(uc->uc_mcontext.__gregs[REG_PC]);
+  uint8_t* exception_source = (uint8_t*)(uc->uc_mcontext.__gregs[REG_PC]);
   uint8_t byte1 = (uint8_t)(*(exception_source + 0));
   uint8_t byte2 = (uint8_t)(*(exception_source + 1));
   uint8_t byte3 = (uint8_t)(*(exception_source + 2));
@@ -474,36 +478,47 @@ static bool HwasanOnSIGTRAP(int signo, siginfo_t *info, ucontext_t *uc) {
   return true;
 }
 
-static void OnStackUnwind(const SignalContext &sig, const void *,
-                          BufferedStackTrace *stack) {
+static void OnStackUnwind(const SignalContext& sig, const void*,
+                          BufferedStackTrace* stack) {
   stack->Unwind(StackTrace::GetNextInstructionPc(sig.pc), sig.bp, sig.context,
                 common_flags()->fast_unwind_on_fatal);
 }
 
-void HwasanOnDeadlySignal(int signo, void *info, void *context) {
+void HwasanOnDeadlySignal(int signo, void* info, void* context) {
   // Probably a tag mismatch.
   if (signo == SIGTRAP)
-    if (HwasanOnSIGTRAP(signo, (siginfo_t *)info, (ucontext_t *)context))
+    if (HwasanOnSIGTRAP(signo, (siginfo_t*)info, (ucontext_t*)context))
       return;
 
   HandleDeadlySignal(info, context, GetTid(), &OnStackUnwind, nullptr);
 }
 
-void Thread::InitStackAndTls(const InitState *) {
+void Thread::InitStackAndTls(const InitState*) {
   GetThreadStackAndTls(IsMainThread(), &stack_bottom_, &stack_top_, &tls_begin_,
                        &tls_end_);
 }
+uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector, uptr array_size) {
+  uptr perElementSize = size / array_size;
+  // NOTE: the above must be an integer division! Is this always the case?
 
-uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector) {
-  // TODO complete
-  u_int8_t * ptr = (u_int8_t *)tag_vector;
-  VPrintf(2, "[FieldArmor] TagMemory_mod : NEW VAR -> P: %p size: %p tag_vector: %p\n", (void *)p, (void *)size, (void *)tag_vector);
-  uptr tagged = AddTagToPointer(p, RPTag);
+  u_int8_t* ptr = (u_int8_t*)tag_vector;
+  VPrintf(2,
+          "[FieldArmor] TagMemory_mod : NEW VAR -> P: %p size: %p tag_vector: "
+          "%p, array_size: %p, perElementSize: %p\n",
+          (void*)p, (void*)size, (void*)tag_vector, (void*)array_size,
+          (void*)perElementSize);
+  uptr tagged = AddTagToPointer(p, RPTag);  // TODO: handle array case!
 
-  for(uptr i=0; i<size; i++){
-    u_int8_t tag = ptr ? ptr[i] : 0; // TODO this sucks
-    VPrintf(2, "\t\t[FieldArmor] TagMemory_mod: A: %p shadow[A]  -> T: 0x%02x\n", (void *)(p + i), tag);
-    *(char *)(MemToShadow(p + i)) = tag;
+  for (int x = 0; x < array_size; x++) {
+    for (uptr i = 0; i < perElementSize; i++) {
+      u_int8_t tag = ptr ? ptr[i] : 0;
+      VPrintf(2,
+              "\t\t[FieldArmor] TagMemory_mod: A: %p shadow[A]  -> T: 0x%02x\n",
+              (void*)(p + i), tag);
+      *(char*)(MemToShadow(p + (i + x * perElementSize))) = tag;
+    }
+    if (array_size == 1)
+      break;
   }
   return ptr ? tagged : p;
 }
@@ -520,17 +535,18 @@ uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
   uptr threshold = common_flags()->clear_shadow_mmap_threshold;
   if (SANITIZER_LINUX &&
       UNLIKELY(page_end >= page_start + threshold && tag == 0)) {
-    internal_memset((void *)shadow_start, tag, page_start - shadow_start);
-    internal_memset((void *)page_end, tag,
+    internal_memset((void*)shadow_start, tag, page_start - shadow_start);
+    internal_memset((void*)page_end, tag,
                     shadow_start + shadow_size - page_end);
     // For an anonymous private mapping MADV_DONTNEED will return a zero page on
     // Linux.
     ReleaseMemoryPagesToOSAndZeroFill(page_start, page_end);
   } else {
-    internal_memset((void *)shadow_start, tag, shadow_size);
+    internal_memset((void*)shadow_start, tag, shadow_size);
   }
   uptr tagged = AddTagToPointer(p, tag);
-  VPrintf(2, "\t\t[HWASAN] TagMemoryAligned: return %p\n------------\n", (void *)tagged);
+  VPrintf(2, "\t\t[HWASAN] TagMemoryAligned: return %p\n------------\n",
+          (void*)tagged);
   return tagged;
 }
 
@@ -584,7 +600,7 @@ extern "C" void __hwasan_thread_enter() {
 }
 
 extern "C" void __hwasan_thread_exit() {
-  Thread *t = GetCurrentThread();
+  Thread* t = GetCurrentThread();
   // Make sure that signal handler can not see a stale current thread pointer.
   atomic_signal_fence(memory_order_seq_cst);
   if (t) {
