@@ -54,7 +54,7 @@
 SANITIZER_INTERFACE_ATTRIBUTE
 THREADLOCAL uptr __hwasan_tls;
 #  endif
-u_int64_t RPTag = 0x40Ul;
+
 namespace __hwasan {
 
 // With the zero shadow base we can not actually map pages starting from 0.

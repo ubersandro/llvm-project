@@ -229,7 +229,7 @@ static void* HwasanAllocate(StackTrace* stack, uptr orig_size, uptr alignment,
   if (InTaggableRegion(reinterpret_cast<uptr>(user_ptr)) &&
       atomic_load_relaxed(&hwasan_allocator_tagging_enabled) &&
       flags()->tag_in_malloc && malloc_bisect(stack, orig_size)) {
-    tag_t tag = 0x0;  // t ? t->GenerateRandomTag() : kFallbackAllocTag;
+    tag_t tag = 0x0Lu;  // t ? t->GenerateRandomTag() : kFallbackAllocTag; RPTag
     // NOTE: ptr tagging will happen in the instrumentation.
     uptr tag_size = orig_size ? orig_size : 1;
     uptr full_granule_size = RoundDownTo(tag_size, kShadowAlignment);
@@ -239,7 +239,7 @@ static void* HwasanAllocate(StackTrace* stack, uptr orig_size, uptr alignment,
       // TagMemoryAligned((uptr)short_granule, kShadowAlignment,
       //                  tag_size % kShadowAlignment);
       TagMemoryAligned((uptr)short_granule, kShadowAlignment, 0);
-      short_granule[kShadowAlignment - 1] = tag;
+      short_granule[kShadowAlignment - 1] = 0;
     }
   } else {
     // Tagging can not be completely skipped. If it's disabled, we need to tag
@@ -255,8 +255,8 @@ static void* HwasanAllocate(StackTrace* stack, uptr orig_size, uptr alignment,
 #endif
   meta->SetAllocated(StackDepotPut(*stack), orig_size);
   RunMallocHooks(user_ptr, orig_size);
-  // VPrintf(0 , "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n",
-  // orig_size, alignment, user_ptr);
+  VPrintf(2 , "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n",
+  orig_size, alignment, user_ptr);
   return user_ptr;
 }
 
@@ -283,8 +283,10 @@ static bool CheckInvalidFree(StackTrace* stack, void* untagged_ptr,
 }
 
 static void HwasanDeallocate(StackTrace* stack, void* tagged_ptr) {
+  // VPrintf(0, "[HWASAN] HwasanDeallocate: ptr=%p\n", tagged_ptr);
   CHECK(tagged_ptr);
   void* untagged_ptr = UntagPtr(tagged_ptr);
+  VPrintf(2, "[HWASAN] HwasanDeallocate: ptr=%p\n", untagged_ptr);
 
   if (RunFreeHooks(tagged_ptr))
     return;
@@ -299,6 +301,8 @@ static void HwasanDeallocate(StackTrace* stack, void* tagged_ptr) {
   Metadata* meta =
       reinterpret_cast<Metadata*>(allocator.GetMetaData(aligned_ptr));
   if (!meta) {
+    VPrintf(2, "[HWASAN] HwasanDeallocate: no metadata for ptr=%p/%p\n",
+            tagged_ptr, untagged_ptr);
     ReportInvalidFree(stack, reinterpret_cast<uptr>(tagged_ptr));
     return;
   }
