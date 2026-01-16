@@ -96,7 +96,8 @@ enum class OffsetKind {
 };
 }
 /**
- * SW compatibility is a concern. When using un-instrumented code (e.g libs), tagged pointers might wreak havoc.
+ * SW compatibility is a concern. When using un-instrumented code (e.g libs),
+ * tagged pointers might wreak havoc.
  */
 static cl::opt<std::string>
     ClMemoryAccessCallbackPrefix("hwasan-memory-access-callback-prefix",
@@ -327,10 +328,12 @@ private:
 
   // FieldArmor addenda
   // u_int64_t TagBits = 7; // for later use
-  u_int64_t RPTag = 0x0LU;          
+  u_int64_t RPTag = 0x0LU;
   // it seems that setting RPTag to 0x80/0x40 breaks things in the C++ stdlib
-  // TODO: look more into this -> there still things that do not make much sense. For instance, GEPs and arithmetic clash
-  // TODO: dump all the malloc happening, see if the size is influenced by GEPs being tagged (and it will be for sure)
+  // TODO: look more into this -> there still things that do not make much
+  // sense. For instance, GEPs and arithmetic clash
+  // TODO: dump all the malloc happening, see if the size is influenced by GEPs
+  // being tagged (and it will be for sure)
   u_int64_t TagMask = 0b01111111Lu; // mask to apply to get T+L+R
   u_int64_t R_Mask = 0b01000000Lu;
   u_int64_t L_Mask = 0b00110000Lu;
@@ -937,31 +940,33 @@ void HWAddressSanitizer::getInterestingMemoryOperands(
     return;
 
   if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
-    if (!ClInstrumentReads || ignoreAccess(ORE, I, LI->getPointerOperand()))
-      return;
+    // NOTE: this is masking undefined behavior from the runtime.
+    // CFR: bug in 526.blender_r. 
+    // if (!ClInstrumentReads || ignoreAccess(ORE, I, LI->getPointerOperand()))
+    //   return;
     Interesting.emplace_back(I, LI->getPointerOperandIndex(), false,
                              LI->getType(), LI->getAlign());
   } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
-    if (!ClInstrumentWrites || ignoreAccess(ORE, I, SI->getPointerOperand()))
-      return;
+    // if (!ClInstrumentWrites || ignoreAccess(ORE, I, SI->getPointerOperand()))
+    //   return;
     Interesting.emplace_back(I, SI->getPointerOperandIndex(), true,
                              SI->getValueOperand()->getType(), SI->getAlign());
   } else if (AtomicRMWInst *RMW = dyn_cast<AtomicRMWInst>(I)) {
-    if (!ClInstrumentAtomics || ignoreAccess(ORE, I, RMW->getPointerOperand()))
-      return;
+    // if (!ClInstrumentAtomics || ignoreAccess(ORE, I, RMW->getPointerOperand()))
+    //   return;
     Interesting.emplace_back(I, RMW->getPointerOperandIndex(), true,
                              RMW->getValOperand()->getType(), std::nullopt);
   } else if (AtomicCmpXchgInst *XCHG = dyn_cast<AtomicCmpXchgInst>(I)) {
-    if (!ClInstrumentAtomics || ignoreAccess(ORE, I, XCHG->getPointerOperand()))
-      return;
+    // if (!ClInstrumentAtomics || ignoreAccess(ORE, I, XCHG->getPointerOperand()))
+    //   return;
     Interesting.emplace_back(I, XCHG->getPointerOperandIndex(), true,
                              XCHG->getCompareOperand()->getType(),
                              std::nullopt);
   } else if (auto *CI = dyn_cast<CallInst>(I)) {
     for (unsigned ArgNo = 0; ArgNo < CI->arg_size(); ArgNo++) {
-      if (!ClInstrumentByval || !CI->isByValArgument(ArgNo) ||
-          ignoreAccess(ORE, I, CI->getArgOperand(ArgNo)))
-        continue;
+      // if (!ClInstrumentByval || !CI->isByValArgument(ArgNo) ||
+      //     ignoreAccess(ORE, I, CI->getArgOperand(ArgNo)))
+      //   continue;
       Type *Ty = CI->getParamByValType(ArgNo);
       Interesting.emplace_back(I, ArgNo, false, Ty, Align(1));
     }
@@ -1223,11 +1228,15 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
   // We can therefore elide the tag check.
   llvm::KnownBits Known(DL.getPointerTypeSizeInBits(Addr->getType()));
   llvm::computeKnownBits(Addr, Known, DL);
-  if (Known.isZero())
+  if (Known.isZero()) {
+    errs() << "[FieldArmor] Skipping instrumentation of null pointer access\n";
+    errs() << "\t\t\tInstruction: " << *(O.getInsn()) << "\n";
     return false;
+  }
 
   if (O.MaybeMask)
     return false; // FIXME
+  // WHAT IS THIS?
 
   IRBuilder<> IRB(O.getInsn());
   if (!O.TypeStoreSize.isScalable() && isPowerOf2_64(O.TypeStoreSize) &&
@@ -1235,9 +1244,8 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
       (!O.Alignment || *O.Alignment >= Mapping.getObjectAlignment() ||
        *O.Alignment >= O.TypeStoreSize / 8)) {
     size_t AccessSizeIndex = TypeSizeToSizeIndex(O.TypeStoreSize);
-    // enforcing call instrumentation for now. This branch installs sized CBs.
-    SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
 
+    SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
     IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
                    Args);
 
@@ -1919,7 +1927,8 @@ HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   // if gepping into array of structs, tag with RP
   // EXAMPLE getelementptr inbounds nuw %"struct.cDynamicExpression::Value", ptr
   // %stk.0, i64 %idxprom106
-  // EXAMPLE: %86 = getelementptr inbounds %struct.arc, ptr %add.ptr.fieldarmor.struct, <2 x i64> %vec.ind, !dbg !251
+  // EXAMPLE: %86 = getelementptr inbounds %struct.arc, ptr
+  // %add.ptr.fieldarmor.struct, <2 x i64> %vec.ind, !dbg !251
   /**  */
   auto GEPResultType = GEPI->getResultElementType();
   // auto resultIsArrayOfStructs =
@@ -1927,17 +1936,18 @@ HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   //      GEPResultType->getArrayElementType()->isStructTy());
   // auto resultIsVectorOfStructs =
   //     (GEPResultType->isVectorTy() &&
-  //      GEPResultType->getVectorElementType()->isStructTy()); 
+  //      GEPResultType->getVectorElementType()->isStructTy());
   // TODO: look into this. How's vector implemented?
-  if (GEPI->getType()->isStructTy() &&  !GEPI->getType()->isVectorTy()) {
+  if (GEPI->getType()->isStructTy() && !GEPI->getType()->isVectorTy()) {
     errs() << "[HWASAN] Instrumenting 2-operands GEP into struct: ";
     GEPI->print(errs());
     errs() << "\n";
     GEPI->getType()->print(errs());
     errs() << "\n";
     IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
-    Value *resultLong = IRB.CreatePointerCast(GEPI, IntptrTy); // this breaks for some GEPs
-    
+    Value *resultLong =
+        IRB.CreatePointerCast(GEPI, IntptrTy); // this breaks for some GEPs
+
     Value *untaggedResLong = untagPointer(IRB, resultLong);
     Value *taggedPointer =
         tagPointer(IRB, GEPI->getType(), untaggedResLong,
@@ -2210,8 +2220,8 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
   assert(taggedPointer != nullptr && "taggedPointer cannot be null here");
   taggedPointer->setName(endResultName);
-  // set tagged pointer as volatile 
-  taggedPointer->setVolatile(true);
+  // set tagged pointer as volatile
+  // taggedPointer->setVolatile(true);
   GEPI->replaceUsesWithIf(taggedPointer, [resultLong](const Use &U) {
     auto *User = U.getUser();
     // TODO: look into these replacement
@@ -2768,9 +2778,9 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
   if (TagVec) {
     return;
   }
-  
+
   /** NOTE: opaque types are not sized. */
-  if(!t->isSized()) {
+  if (!t->isSized()) {
     errs() << "[FieldArmor] StructType " << *t << " is not sized!\n";
     return;
   }
