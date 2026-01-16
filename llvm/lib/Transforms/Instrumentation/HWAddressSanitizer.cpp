@@ -95,7 +95,9 @@ enum class OffsetKind {
   kTls,
 };
 }
-
+/**
+ * SW compatibility is a concern. When using un-instrumented code (e.g libs), tagged pointers might wreak havoc.
+ */
 static cl::opt<std::string>
     ClMemoryAccessCallbackPrefix("hwasan-memory-access-callback-prefix",
                                  cl::desc("Prefix for memory access callbacks"),
@@ -2208,7 +2210,8 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
   assert(taggedPointer != nullptr && "taggedPointer cannot be null here");
   taggedPointer->setName(endResultName);
-  
+  // set tagged pointer as volatile 
+  taggedPointer->setVolatile(true);
   GEPI->replaceUsesWithIf(taggedPointer, [resultLong](const Use &U) {
     auto *User = U.getUser();
     // TODO: look into these replacement
@@ -2757,11 +2760,18 @@ Value *HWAddressSanitizer::getRPTag(IRBuilder<> &IRB) {
 
 /** This method is called on whatever struct that was identified in the
  * frontend. This includes unions and literal structs. */
+// __attribute__((noinline))
 void HWAddressSanitizer::createTagVector(StructType *t) {
 
   std::string TagVecName = t->getStructName().str() + ".fieldarmor.tagvec";
   auto *TagVec = M.getGlobalVariable(TagVecName, true);
   if (TagVec) {
+    return;
+  }
+  
+  /** NOTE: opaque types are not sized. */
+  if(!t->isSized()) {
+    errs() << "[FieldArmor] StructType " << *t << " is not sized!\n";
     return;
   }
   auto size = M.getDataLayout().getTypeAllocSize(t);

@@ -157,11 +157,11 @@ static void InitializeFlags() {
   if (common_flags()->help)
     parser.PrintFlagDescriptions();
   // Flag validation:
-  if (!CAN_SANITIZE_LEAKS && common_flags()->detect_leaks) {
-    Report("%s: detect_leaks is not supported on this platform.\n",
-           SanitizerToolName);
-    Die();
-  }
+  // if (!CAN_SANITIZE_LEAKS && common_flags()->detect_leaks) {
+  //   Report("%s: detect_leaks is not supported on this platform.\n",
+  //          SanitizerToolName);
+  //   Die();
+  // }
 }
 
 static void CheckUnwind() {
@@ -271,6 +271,7 @@ Thread* GetCurrentThread() {
 }
 
 // TODO: consider refactoring
+SANITIZER_INTERFACE_ATTRIBUTE
 uptr fieldarmor_tag_memory(void *ptr, uptr tags, uptr size) {
   // TODO: make sure pointer is untagged
   if(!tags){
