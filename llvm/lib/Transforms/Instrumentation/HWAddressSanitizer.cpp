@@ -964,9 +964,9 @@ void HWAddressSanitizer::getInterestingMemoryOperands(
                              std::nullopt);
   } else if (auto *CI = dyn_cast<CallInst>(I)) {
     for (unsigned ArgNo = 0; ArgNo < CI->arg_size(); ArgNo++) {
-      // if (!ClInstrumentByval || !CI->isByValArgument(ArgNo) ||
-      //     ignoreAccess(ORE, I, CI->getArgOperand(ArgNo)))
-      //   continue;
+      if (!ClInstrumentByval || !CI->isByValArgument(ArgNo))
+      //||ignoreAccess(ORE, I, CI->getArgOperand(ArgNo))))
+        continue;
       Type *Ty = CI->getParamByValType(ArgNo);
       Interesting.emplace_back(I, ArgNo, false, Ty, Align(1));
     }
@@ -1229,8 +1229,8 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
   llvm::KnownBits Known(DL.getPointerTypeSizeInBits(Addr->getType()));
   llvm::computeKnownBits(Addr, Known, DL);
   if (Known.isZero()) {
-    errs() << "[FieldArmor] Skipping instrumentation of null pointer access\n";
-    errs() << "\t\t\tInstruction: " << *(O.getInsn()) << "\n";
+    // errs() << "[FieldArmor] Skipping instrumentation of null pointer access\n";
+    // errs() << "\t\t\tInstruction: " << *(O.getInsn()) << "\n";
     return false;
   }
 
