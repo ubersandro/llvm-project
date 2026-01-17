@@ -941,7 +941,7 @@ void HWAddressSanitizer::getInterestingMemoryOperands(
 
   if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
     // NOTE: this is masking undefined behavior from the runtime.
-    // CFR: bug in 526.blender_r. 
+    // CFR: bug in 526.blender_r.
     // if (!ClInstrumentReads || ignoreAccess(ORE, I, LI->getPointerOperand()))
     //   return;
     Interesting.emplace_back(I, LI->getPointerOperandIndex(), false,
@@ -952,12 +952,14 @@ void HWAddressSanitizer::getInterestingMemoryOperands(
     Interesting.emplace_back(I, SI->getPointerOperandIndex(), true,
                              SI->getValueOperand()->getType(), SI->getAlign());
   } else if (AtomicRMWInst *RMW = dyn_cast<AtomicRMWInst>(I)) {
-    // if (!ClInstrumentAtomics || ignoreAccess(ORE, I, RMW->getPointerOperand()))
+    // if (!ClInstrumentAtomics || ignoreAccess(ORE, I,
+    // RMW->getPointerOperand()))
     //   return;
     Interesting.emplace_back(I, RMW->getPointerOperandIndex(), true,
                              RMW->getValOperand()->getType(), std::nullopt);
   } else if (AtomicCmpXchgInst *XCHG = dyn_cast<AtomicCmpXchgInst>(I)) {
-    // if (!ClInstrumentAtomics || ignoreAccess(ORE, I, XCHG->getPointerOperand()))
+    // if (!ClInstrumentAtomics || ignoreAccess(ORE, I,
+    // XCHG->getPointerOperand()))
     //   return;
     Interesting.emplace_back(I, XCHG->getPointerOperandIndex(), true,
                              XCHG->getCompareOperand()->getType(),
@@ -965,7 +967,7 @@ void HWAddressSanitizer::getInterestingMemoryOperands(
   } else if (auto *CI = dyn_cast<CallInst>(I)) {
     for (unsigned ArgNo = 0; ArgNo < CI->arg_size(); ArgNo++) {
       if (!ClInstrumentByval || !CI->isByValArgument(ArgNo))
-      //||ignoreAccess(ORE, I, CI->getArgOperand(ArgNo))))
+        //||ignoreAccess(ORE, I, CI->getArgOperand(ArgNo))))
         continue;
       Type *Ty = CI->getParamByValType(ArgNo);
       Interesting.emplace_back(I, ArgNo, false, Ty, Align(1));
@@ -1229,8 +1231,8 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
   llvm::KnownBits Known(DL.getPointerTypeSizeInBits(Addr->getType()));
   llvm::computeKnownBits(Addr, Known, DL);
   if (Known.isZero()) {
-    // errs() << "[FieldArmor] Skipping instrumentation of null pointer access\n";
-    // errs() << "\t\t\tInstruction: " << *(O.getInsn()) << "\n";
+    // errs() << "[FieldArmor] Skipping instrumentation of null pointer
+    // access\n"; errs() << "\t\t\tInstruction: " << *(O.getInsn()) << "\n";
     return false;
   }
 
@@ -2185,8 +2187,23 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       // } // if son is union
 
       // else { /* son is not a union. Might still be a literal struct/union. */
-      StructType *SonTy = dyn_cast<StructType>(sonType);
 
+      StructType *SonTy = dyn_cast<StructType>(sonType);
+      if (SonTy->isOpaque()) {
+        // Opaque structs are not tagged, they might be passed to the uninstr lib
+        taggedPointer = untaggedResLongPtr;
+        NumUntaggedGEPResults++;
+        endResultName =
+            (GEPI->hasName() ? GEPI->getName().str()
+                             : "gep." + itostr(NumInstrumentedGEPs)) +
+            ".untagged";
+      } else {
+        sonTag = ConstantInt::get(IntptrTy, RPTag);
+        // sonTag->setName("sonTag_struct");
+        endResultName = gepName + ".fieldarmor.struct";
+        taggedPointer =
+            tagPointer(IRB, GEPI->getType(), untaggedResLong, sonTag);
+      }
       // if (SonTy->isLiteral()) {
       //   // if son is a literal struct, untag the pointer
       //   taggedPointer = untaggedResLongPtr;
@@ -2208,10 +2225,7 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       //   endResultName = gepName + ".untagged";
       // } else {
       // DONT BLACKLIST
-      sonTag = ConstantInt::get(IntptrTy, RPTag);
-      // sonTag->setName("sonTag_struct");
-      endResultName = gepName + ".fieldarmor.struct";
-      taggedPointer = tagPointer(IRB, GEPI->getType(), untaggedResLong, sonTag);
+
       // }
       // }
       // } // son is a struct!
