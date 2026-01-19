@@ -1479,7 +1479,8 @@ bool shouldSkipAlloca(Type *t) {
   }
   return false;
 }
-__attribute__((noinline)) bool HWAddressSanitizer::instrumentStack(
+// __attribute__((noinline)) 
+bool HWAddressSanitizer::instrumentStack(
     memtag::StackInfo &SInfo, const DominatorTree &DT,
     const PostDominatorTree &PDT, const LoopInfo &LI, const DataLayout &DL) {
   unsigned int I = 0;
@@ -1886,7 +1887,8 @@ void dumpGEPDebug(GetElementPtrInst *GEPI) {
   errs() << "\n _______________________________\n";
 }
 
-__attribute__((noinline)) void
+// __attribute__((noinline)) 
+void
 HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   // TODO
   // NOTE: I assume all 2-operands GEPs are array indexing.
@@ -1969,7 +1971,8 @@ HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   }
 }
 
-__attribute__((noinline)) void
+// __attribute__((noinline)) 
+void
 HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   // Q: can I tell GEPs on globals/stack apart from heap?
   // NOTE: std::vector and std::string are broken with this instrumentation
@@ -1987,40 +1990,6 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   auto sonType = GEPI->getResultElementType();
   auto gepName = GEPI->hasName() ? GEPI->getName().str()
                                  : "gep." + itostr(NumInstrumentedGEPs);
-  // if (shouldBlocklistGEP(GEPI)) {
-  //   std::string Name = GEPI->hasName() ? GEPI->getName().str()
-  //                                      : "gep." +
-  //                                      itostr(NumInstrumentedGEPs);
-  //   GEPI->setName(Name + ".untagged");
-  //   NumIgnoredGEPs++;
-  //   return;
-  // }
-
-  // GEPs on unions are not instrumented!
-  // if (GEPI->getOperand(0)->hasName() &&
-  //     GEPI->getOperand(0)->getName().str().find(".union") !=
-  //         std::string::npos) {
-  //   // propagate the name to the result of the gep
-  //   std::string Name = GEPI->hasName() ? GEPI->getName().str()
-  //                                      : "gep." +
-  //                                      itostr(NumInstrumentedGEPs);
-  //   GEPI->setName(Name + ".union"); // propagate
-  //   // NumInstrumentedGEPs++;
-  //   NumIgnoredGEPs++;
-  //   return;
-  // }
-
-  // if the pointer is untagged, propagate the untagged status. TODO: remove
-  // as soon as variables coverage gets better.
-  // if (GEPI->getOperand(0)->hasName() &&
-  //     GEPI->getOperand(0)->getName().str().find("invariant.untagged") !=
-  //         std::string::npos) {
-  //   // propagate the name to the result of the gep
-  //   GEPI->setName(gepName + "invariant.untagged");
-  //   // NumInstrumentedGEPs++;
-  //   NumIgnoredGEPs++;
-  //   return;
-  // }
 
   IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
   Value *resultLong = IRB.CreatePointerCast(GEPI, IntptrTy);
@@ -2028,62 +1997,12 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   Value *untaggedResLongPtr =
       IRB.CreateIntToPtr(untaggedResLong, GEPI->getType());
 
-  // auto fatherTypeIsUnion =
-  //     (fatherType->isStructTy() &&
-  //      !dyn_cast<StructType>(fatherType)->isLiteral() &&
-  //      (dyn_cast<StructType>(fatherType)->getName().str().find("union.") !=
-  //       std::string::npos));
-
-  // if (fatherTypeIsUnion) {
-  //   // if GEPping into a union, untag the pointer
-  //   // NOTE: this is only true when accessing a non-literal struct whose name
-  //   // contains "union." (union)
-  //   auto taggedPointer = untaggedResLongPtr;
-
-  //   std::string Name = GEPI->hasName() ? GEPI->getName().str()
-  //                                      : "gep." +
-  //                                      itostr(NumInstrumentedGEPs);
-  //   taggedPointer->setName(Name + ".union");
-
-  //   GEPI->replaceUsesWithIf(taggedPointer, [resultLong](const Use &U) {
-  //     auto *User = U.getUser();
-  //     return User != resultLong && !isa<LifetimeIntrinsic>(User);
-  //   });
-  //   // NumInstrumentedGEPs++;
-  //   NumIgnoredGEPs++;
-  //   return;
-  // } // if father is union
-
-  // if (fatherType->isStructTy() &&
-  //     dyn_cast<StructType>(fatherType)->isLiteral()) {
-  //   // in this case, the struct might either be a union or an actual struct.
-  //   // Since we cannot use the name to distinguish them, we conservatively
-  //   // untag
-  //   auto taggedPointer = untaggedResLongPtr;
-
-  //   std::string Name = GEPI->hasName() ? GEPI->getName().str()
-  //                                      : "gep." +
-  //                                      itostr(NumInstrumentedGEPs);
-  //   taggedPointer->setName(Name + ".untagged");
-
-  //   GEPI->replaceUsesWithIf(taggedPointer, [resultLong](const Use &U) {
-  //     auto *User = U.getUser();
-  //     return User != resultLong && !isa<LifetimeIntrinsic>(User);
-  //   });
-  //   // NumInstrumentedGEPs++;
-  //   NumIgnoredGEPs++;
-  //   return;
-  // } // if struct and literal
-
   Value *fullFatherTag = IRB.CreateLShr(
       IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x7FLu << 56Lu)),
       PointerTagShift);
 
   Value *fatherT = IRB.CreateAnd(fullFatherTag, T_Mask_value);
-  // fatherT->setName("father_T");
-  // Value *fatherL = IRB.CreateAnd(fullFatherTag, L_Mask_value); // DEBUG
-  // fatherL->setName("father_L");
-  std::string endResultName = ""; // for IR DEBUG
+  std::string endResultName = "";
   Value *taggedPointer = nullptr;
 
   if (GEPI->hasName() &&
@@ -2105,28 +2024,6 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
     else { /** GEP into array of structs */
       StructType *sonTypeCast = dyn_cast<StructType>(sonType);
-
-      // if (sonTypeCast->isLiteral()) { /* untag if literal */
-      //   taggedPointer = untaggedResLongPtr;
-      //   NumUntaggedGEPResults++;
-      //   endResultName =
-      //       (GEPI->hasName() ? GEPI->getName().str()
-      //                        : "gep." + itostr(NumInstrumentedGEPs)) +
-      //       ".untagged";
-
-      // } // GEP on array of literal structs/unions
-
-      // auto sonIsUnion =
-      //     (sonTypeCast->getName().str().find("union.") != std::string::npos);
-      // if (sonIsUnion) { /* GEP into array of unions -> untag*/
-      //   taggedPointer = untaggedResLongPtr;
-      //   NumUntaggedGEPResults++;
-      //   endResultName =
-      //       (GEPI->hasName() ? GEPI->getName().str()
-      //                        : "gep." + itostr(NumInstrumentedGEPs)) +
-      //       ".union";
-      // } // GEP into array of unions
-
       // GEP into non-literal struct array
       taggedPointer =
           tagPointer(IRB, GEPI->getType(), untaggedResLong,
@@ -2150,10 +2047,9 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
       Value *sonT = IRB.CreateAnd(IRB.CreateAdd(fatherT, sonIdx),
                                   ConstantInt::get(IntptrTy, T_Mask));
-      // Value *sonT = ConstantInt::get(IntptrTy, 0); // DEBUG
       // NOTE: tags might be 0 after this operation. TODO: prevent it from
       // happening
-      // sonTag = IRB.CreateOr(sonT, fatherL);
+
       sonTag = sonT;
       // sonTag->setName("sonTag");
       taggedPointer = tagPointer(IRB, GEPI->getType(), untaggedResLong, sonTag);
@@ -2161,36 +2057,10 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     } // GEP struct -> scalar
 
     else { /** GEP struct -> struct */
-           // son is a struct: might be a (literal) union!
-           // bool sonIsUnion = !dyn_cast<StructType>(sonType)->isLiteral() &&
-      //                   (dyn_cast<StructType>(sonType)->getName().str().find(
-      //                        "union.") != std::string::npos);
-      // // TODO: check if the following is necessary.
-      // auto FatherTypeCast = dyn_cast<StructType>(fatherType);
-      // auto sonTypeRetrieved = FatherTypeCast->getElementType(
-      //     cast<ConstantInt>(GEPI->getOperand(2))->getZExtValue());
-      // sonIsUnion |= (sonTypeRetrieved->isStructTy() &&
-      //                !dyn_cast<StructType>(sonTypeRetrieved)->isLiteral() &&
-      //                (dyn_cast<StructType>(sonTypeRetrieved)
-      //                     ->getName()
-      //                     .str()
-      //                     .find("union.") != std::string::npos));
-
-      // if (sonIsUnion) { /* son is a union -> untag */
-      //   taggedPointer = untaggedResLongPtr;
-      //   NumUntaggedGEPResults++;
-      //   endResultName =
-      //       (GEPI->hasName() ? GEPI->getName().str()
-      //                        : "gep." + itostr(NumInstrumentedGEPs)) +
-      //       ".union";
-
-      // } // if son is union
-
-      // else { /* son is not a union. Might still be a literal struct/union. */
-
       StructType *SonTy = dyn_cast<StructType>(sonType);
       if (SonTy->isOpaque()) {
-        // Opaque structs are not tagged, they might be passed to the uninstr lib
+        // Opaque structs are not tagged, they might be passed to the uninstr
+        // lib
         taggedPointer = untaggedResLongPtr;
         NumUntaggedGEPResults++;
         endResultName =
@@ -2199,52 +2069,41 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
             ".untagged";
       } else {
         sonTag = ConstantInt::get(IntptrTy, RPTag);
-        // sonTag->setName("sonTag_struct");
         endResultName = gepName + ".fieldarmor.struct";
         taggedPointer =
             tagPointer(IRB, GEPI->getType(), untaggedResLong, sonTag);
       }
-      // if (SonTy->isLiteral()) {
-      //   // if son is a literal struct, untag the pointer
-      //   taggedPointer = untaggedResLongPtr;
-      //   NumUntaggedGEPResults++;
-      //   endResultName =
-      //       (GEPI->hasName() ? GEPI->getName().str()
-      //                        : "gep." + itostr(NumInstrumentedGEPs)) +
-      //       ".untagged";
-      // } // son is literal struct
-      // else {
-      // StructType *SonTy = dyn_cast<StructType>(sonType);
-      // Son is struct not literal, not union.
-      // if (SonTy->getName().str().find("class.std::") == 0 ||
-      //     SonTy->getName().str().find("struct.std::") == 0) {
-      //   // NOTE: untagging std types because my instrumentation causes
-      //   // some issues with HWAsan runtime. TODO: come back to this later.
-      //   taggedPointer = untaggedResLongPtr;
-      //   NumUntaggedGEPResults++;
-      //   endResultName = gepName + ".untagged";
-      // } else {
-      // DONT BLACKLIST
-
-      // }
-      // }
-      // } // son is a struct!
     } // GEP struct -> struct
   } // FATHER IS STRUCT
 
   assert(taggedPointer != nullptr && "taggedPointer cannot be null here");
   taggedPointer->setName(endResultName);
-  // set tagged pointer as volatile
-  // taggedPointer->setVolatile(true);
-  GEPI->replaceUsesWithIf(taggedPointer, [resultLong](const Use &U) {
+  GEPI->replaceUsesWithIf(taggedPointer, [resultLong, GEPI](const Use &U) {
     auto *User = U.getUser();
     // TODO: look into these replacement
     bool safe = User != resultLong && !isa<LifetimeIntrinsic>(User);
-    // if (safe) {
-    //   errs() << " Replacing USE: ";
-    //   errs() << *U << "\n";
-    //   errs() << " user: " << *User << "\n";
-    // }
+    // Q: are GEPs used in stores? I.e., is the tagged pointer stored?
+
+    // Don't store tagged pointers that might be used by uninstrumented code
+    // Q: can this fail with maps????
+    // Q: how much detection power do we lose?
+    if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
+      
+      // errs() << "[FieldArmor] GEP used in store: ";
+      // SI->print(errs());
+      // errs() << "\n";
+      // errs() << "\tpointer operand: " << *SI->getPointerOperand();
+      // errs() << "\n";
+      // errs() << "\tvalue operand: " << *SI->getValueOperand();
+      // errs() << "\n";
+      
+      // NOTE: if this works, it has to be done everywhere else
+      if(SI->getValueOperand() == GEPI) {
+        errs() << "\t\t GEP is being stored! Not safe to replace!\n";
+        SI->print(errs());
+        safe = false;
+      }
+    }
     return safe;
   });
   NumInstrumentedGEPs++;
