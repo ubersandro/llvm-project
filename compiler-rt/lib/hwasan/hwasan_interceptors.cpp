@@ -40,7 +40,7 @@ struct HWAsanInterceptorContext {
     do {                                                                      \
       VPrintf(1, "[HWASAN] %s RANGE %p size=%llu\n",                          \
               access == AccessType::Load ? "READ" : "WRITE", offset, size);   \
-      __hwasan::CheckAddressSized<ErrorAction::Recover, access>((uptr)offset, \
+      __hwasan::CheckAddressSized<ErrorAction::Abort, access>((uptr)offset, \
                                                                 size);        \
     } while (0);
 
