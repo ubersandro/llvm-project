@@ -220,8 +220,9 @@ static void* HwasanAllocate(StackTrace* stack, uptr orig_size, uptr alignment,
   if (size != orig_size) {
     u8* tail = reinterpret_cast<u8*>(allocated) + orig_size;
     uptr tail_length = size - orig_size;
-    // internal_memcpy(tail, tail_magic, tail_length - 1); // just copy 0s in the padding region
-    // Short granule is excluded from magic tail, so we explicitly untag.
+    // internal_memcpy(tail, tail_magic, tail_length - 1); // just copy 0s in
+    // the padding region Short granule is excluded from magic tail, so we
+    // explicitly untag.
     tail[tail_length - 1] = 0;
   }
 
@@ -249,14 +250,14 @@ static void* HwasanAllocate(StackTrace* stack, uptr orig_size, uptr alignment,
 
   Metadata* meta =
       reinterpret_cast<Metadata*>(allocator.GetMetaData(allocated));
-#if CAN_SANITIZE_LEAKS
-  meta->SetLsanTag(__lsan::DisabledInThisThread() ? __lsan::kIgnored
-                                                  : __lsan::kDirectlyLeaked);
-#endif
+// #if CAN_SANITIZE_LEAKS
+//   meta->SetLsanTag(__lsan::DisabledInThisThread() ? __lsan::kIgnored
+//                                                   : __lsan::kDirectlyLeaked);
+// #endif
   meta->SetAllocated(StackDepotPut(*stack), orig_size);
   RunMallocHooks(user_ptr, orig_size);
-  VPrintf(2 , "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n",
-  orig_size, alignment, user_ptr);
+  VPrintf(1, "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n",
+          orig_size, alignment, user_ptr);
   return user_ptr;
 }
 
@@ -286,7 +287,7 @@ static void HwasanDeallocate(StackTrace* stack, void* tagged_ptr) {
   // VPrintf(0, "[HWASAN] HwasanDeallocate: ptr=%p\n", tagged_ptr);
   CHECK(tagged_ptr);
   void* untagged_ptr = UntagPtr(tagged_ptr);
-  VPrintf(2, "[HWASAN] HwasanDeallocate: ptr=%p\n", untagged_ptr);
+  VPrintf(1, "[HWASAN] HwasanDeallocate: ptr=%p\n", untagged_ptr);
 
   if (RunFreeHooks(tagged_ptr))
     return;
@@ -301,7 +302,7 @@ static void HwasanDeallocate(StackTrace* stack, void* tagged_ptr) {
   Metadata* meta =
       reinterpret_cast<Metadata*>(allocator.GetMetaData(aligned_ptr));
   if (!meta) {
-    VPrintf(2, "[HWASAN] HwasanDeallocate: no metadata for ptr=%p/%p\n",
+    VPrintf(1, "[HWASAN] HwasanDeallocate: no metadata for ptr=%p/%p\n",
             tagged_ptr, untagged_ptr);
     ReportInvalidFree(stack, reinterpret_cast<uptr>(tagged_ptr));
     return;
@@ -379,6 +380,8 @@ static void HwasanDeallocate(StackTrace* stack, void* tagged_ptr) {
 
 static void* HwasanReallocate(StackTrace* stack, void* tagged_ptr_old,
                               uptr new_size, uptr alignment) {
+  VPrintf(1, "[HWASAN] HwasanReallocate: ptr=%p new_size=%zx\n", tagged_ptr_old,
+          new_size);
   void* untagged_ptr_old = UntagPtr(tagged_ptr_old);
   if (CheckInvalidFree(stack, untagged_ptr_old, tagged_ptr_old))
     return nullptr;

@@ -38,7 +38,7 @@ struct HWAsanInterceptorContext {
 
 #  define ACCESS_MEMORY_RANGE(offset, size, access)                           \
     do {                                                                      \
-      VPrintf(1, "[HWASAN] %s RANGE %p size=%llu\n",                          \
+      VPrintf(2, "[HWASAN] %s RANGE %p size=%llu\n",                          \
               access == AccessType::Load ? "READ" : "WRITE", offset, size);   \
       __hwasan::CheckAddressSized<ErrorAction::Abort, access>((uptr)offset, \
                                                                 size);        \

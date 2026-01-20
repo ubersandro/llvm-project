@@ -545,8 +545,8 @@ uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
     internal_memset((void*)shadow_start, tag, shadow_size);
   }
   uptr tagged = AddTagToPointer(p, tag);
-  VPrintf(2, "\t\t[HWASAN] TagMemoryAligned: return %p\n------------\n",
-          (void*)tagged);
+  VPrintf(1, "\t\t[HWASAN] TagMemoryAligned: return %p, untagged %p\n------------\n",
+          (void*)tagged, (void*)p);
   return tagged;
 }
 

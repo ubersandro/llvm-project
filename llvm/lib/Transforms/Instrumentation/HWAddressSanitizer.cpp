@@ -346,7 +346,6 @@ private:
   void InstrumentGEP(GetElementPtrInst *GEPI);
   void handleGEP2operands(GetElementPtrInst *GEPI);
   void InstrumentCMP(CmpInst *CI);
-  void InstrumentCall(CallInst *CI);
   void InstrumentPtrToInt(PtrToIntInst *PI);
   void InstrumentArithmetic(BinaryOperator *BO);
   void InstrumentConstGEP(ConstantExpr *GEPI);
@@ -1479,10 +1478,12 @@ bool shouldSkipAlloca(Type *t) {
   }
   return false;
 }
-// __attribute__((noinline)) 
-bool HWAddressSanitizer::instrumentStack(
-    memtag::StackInfo &SInfo, const DominatorTree &DT,
-    const PostDominatorTree &PDT, const LoopInfo &LI, const DataLayout &DL) {
+// __attribute__((noinline))
+bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
+                                         const DominatorTree &DT,
+                                         const PostDominatorTree &PDT,
+                                         const LoopInfo &LI,
+                                         const DataLayout &DL) {
   unsigned int I = 0;
 
   for (auto &KV : SInfo.AllocasToInstrument) {
@@ -1641,15 +1642,19 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   if (F.hasFnAttribute(Attribute::Naked))
     return;
 
-  if (!F.hasFnAttribute(Attribute::SanitizeHWAddress))
+  if (!F.hasFnAttribute(Attribute::SanitizeHWAddress)) {
+    // errs( ) << "[HWASan] Skipping function without sanitize-hwaddress
+    // attribute: "
+    //        << F.getName() << "\n";
     return;
+  }
 
   if (F.empty())
     return;
   // if (potentiallyBlacklistFunction(F))
   //   return;
   NumTotalFuncs++;
-
+  // errs() << "[FSan] Instrumenting function: " << F.getName() << "\n";
   OptimizationRemarkEmitter &ORE =
       FAM.getResult<OptimizationRemarkEmitterAnalysis>(F);
 
@@ -1887,60 +1892,8 @@ void dumpGEPDebug(GetElementPtrInst *GEPI) {
   errs() << "\n _______________________________\n";
 }
 
-// __attribute__((noinline)) 
-void
-HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
-  // TODO
-  // NOTE: I assume all 2-operands GEPs are array indexing.
-  // NOTE: GEPs in vtables are 2 op GEPs
-  // auto GEPType = GEPI->getSourceElementType();
-  // if (StructType *ST = dyn_cast<StructType>(GEPType)) {
-  //   bool isLiteral = ST->isLiteral();
-  //   if (!isLiteral && ST->getName().str().find("union.") !=
-  //   std::string::npos) {
-  //     IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
-  //     Value *resultLong = IRB.CreatePointerCast(GEPI, IntptrTy);
-
-  //     Value *untaggedResLong = untagPointer(IRB, resultLong);
-
-  //     Value *untaggedResLongPtr =
-  //         IRB.CreatePointerCast(untaggedResLong, IntptrTy);
-
-  //     auto taggedPointer =
-  //         tagPointer(IRB, GEPI->getType(), untaggedResLongPtr,
-  //                    ConstantInt::get(IntptrTy, 0x00Lu)); // NULL TAG
-
-  //     std::string Name = GEPI->hasName() ? GEPI->getName().str()
-  //                                        : "gep." +
-  //                                        itostr(NumInstrumentedGEPs);
-  //     taggedPointer->setName(Name + ".arrayidx.union");
-  //     Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, PtrTy);
-
-  //     GEPI->replaceUsesWithIf(
-  //         taggedPointer, [GEPICastToPtr, resultLong](const Use &U) {
-  //           auto *User = U.getUser();
-  //           return User != resultLong && User != GEPICastToPtr &&
-  //                  !isa<LifetimeIntrinsic>(User);
-  //         });
-  //     NumInstrumentedGEPs++;
-
-  //     return;
-  //   }
-  // }
-  // NOTE: literal structs (union+structs) are not handled here.
-  // if gepping into array of structs, tag with RP
-  // EXAMPLE getelementptr inbounds nuw %"struct.cDynamicExpression::Value", ptr
-  // %stk.0, i64 %idxprom106
-  // EXAMPLE: %86 = getelementptr inbounds %struct.arc, ptr
-  // %add.ptr.fieldarmor.struct, <2 x i64> %vec.ind, !dbg !251
-  /**  */
+void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   auto GEPResultType = GEPI->getResultElementType();
-  // auto resultIsArrayOfStructs =
-  //     (GEPResultType->isArrayTy() &&
-  //      GEPResultType->getArrayElementType()->isStructTy());
-  // auto resultIsVectorOfStructs =
-  //     (GEPResultType->isVectorTy() &&
-  //      GEPResultType->getVectorElementType()->isStructTy());
   // TODO: look into this. How's vector implemented?
   if (GEPI->getType()->isStructTy() && !GEPI->getType()->isVectorTy()) {
     errs() << "[HWASAN] Instrumenting 2-operands GEP into struct: ";
@@ -1956,12 +1909,9 @@ HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
     Value *taggedPointer =
         tagPointer(IRB, GEPI->getType(), untaggedResLong,
                    ConstantInt::get(IntptrTy, RPTag)); // set RP bit
-    // Value *taggedPointer = IRB.CreateIntToPtr(untaggedResLong,
-    // GEPI->getType());
     std::string Name = GEPI->hasName() ? GEPI->getName().str()
                                        : "gep." + itostr(NumInstrumentedGEPs);
     taggedPointer->setName(Name + ".fieldarmor.struct");
-    // Value *GEPICastToPtr = IRB.CreatePointerCast(GEPI, GEPI->getType());
     GEPI->replaceUsesWithIf(taggedPointer, [resultLong](const Use &U) {
       auto *User = U.getUser();
       return User != resultLong && !isa<LifetimeIntrinsic>(User);
@@ -1971,13 +1921,8 @@ HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   }
 }
 
-// __attribute__((noinline)) 
-void
-HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
+void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   // Q: can I tell GEPs on globals/stack apart from heap?
-  // NOTE: std::vector and std::string are broken with this instrumentation
-  // dumpGEPDebug(GEPI);
-  // NOTE: difference between fields in the same object must be defined
   auto nOperands = GEPI->getNumOperands();
   // NOTE: this check never fails if un-squashing the GEPs in the frontend.
   assert(nOperands <= 3);
@@ -2032,10 +1977,13 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
     } // GEP into array of non-literal structs
   } // GEP from array type
-
+  else if (fatherType->isVectorTy()) {
+    if (!sonType->isStructTy()) {
+      return;
+    }
+  }
   // FATHER IS STRUCT for sure now
   else if (fatherType->isStructTy()) {
-
     Value *sonTag = nullptr;
     auto sonIsScalar = !sonType->isStructTy();
     if (sonIsScalar) {
@@ -2076,31 +2024,33 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     } // GEP struct -> struct
   } // FATHER IS STRUCT
 
-  assert(taggedPointer != nullptr && "taggedPointer cannot be null here");
+  // assert(taggedPointer != nullptr && "taggedPointer cannot be null here");
+  if (taggedPointer == nullptr) {
+    // This should not happens
+    errs() << "[HWASAN] Error: taggedPointer is null in GEP instrumentation!\n";
+    GEPI->print(errs());
+    GEPI->getSourceElementType()->print(errs());
+    errs() << "\n";
+    GEPI->getOperand(0)->print(errs());
+    errs() << "\n";
+    GEPI->getResultElementType()->print(errs());
+    errs() << "\n";
+    GEPI->getType()->print(errs());
+    errs() << "\n";
+    GEPI->getOperand(2)->print(errs());
+
+    errs() << "\n";
+    assert(taggedPointer != nullptr && "taggedPointer cannot be null here");
+  }
   taggedPointer->setName(endResultName);
   GEPI->replaceUsesWithIf(taggedPointer, [resultLong, GEPI](const Use &U) {
     auto *User = U.getUser();
-    // TODO: look into these replacement
     bool safe = User != resultLong && !isa<LifetimeIntrinsic>(User);
-    // Q: are GEPs used in stores? I.e., is the tagged pointer stored?
-
-    // Don't store tagged pointers that might be used by uninstrumented code
-    // Q: can this fail with maps????
-    // Q: how much detection power do we lose?
+    // NOTE: don't store tagged pointers that might be used by uninstrumented code
+    // Q: can this fail with maps where something is stored with ptr key and retrieved with tagged/untagged ptr?
+    // Q: how much detection power do we lose, if any?
     if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
-      
-      // errs() << "[FieldArmor] GEP used in store: ";
-      // SI->print(errs());
-      // errs() << "\n";
-      // errs() << "\tpointer operand: " << *SI->getPointerOperand();
-      // errs() << "\n";
-      // errs() << "\tvalue operand: " << *SI->getValueOperand();
-      // errs() << "\n";
-      
-      // NOTE: if this works, it has to be done everywhere else
-      if(SI->getValueOperand() == GEPI) {
-        errs() << "\t\t GEP is being stored! Not safe to replace!\n";
-        SI->print(errs());
+      if (SI->getValueOperand() == GEPI) {
         safe = false;
       }
     }
@@ -2110,34 +2060,6 @@ HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   // NOTE: instrumented might also mean untagged
 } // InstrumentGEP
 
-/**
- * Existing sanitizers work seamlessly with calls. I would need this because
- * the same pointer can have two different tags depending on how it is
- * retrieved. This is a last resort!!!
- * TODO: do functional check!
- * TODO: check that this happens BEFORE inliner!
- * NOTE: if this is a **, you are screwed
- * NOTE: this should handle std::more and alike too, in case they are not
- * handled by InstrumentCMP(?). If they are templates, and user redefines them
- * for each type, they sould be in the module. NOTE: this causes SEGV on
- * std::map implementation.
- */
-void HWAddressSanitizer::InstrumentCall(CallInst *CI) {
-  // for each argument, if arg is a pointer, remove tag and replace argument
-  auto numArgs = CI->arg_size();
-  IRBuilder<> IRB(CI);
-  for (unsigned i = 0; i < numArgs; i++) {
-    auto arg = CI->getArgOperand(i);
-    auto argType = arg->getType();
-    if (argType->isPointerTy()) {
-      auto untaggedArgLong =
-          untagPointer(IRB, IRB.CreatePtrToInt(arg, IntptrTy));
-      Value *untaggedArg = IRB.CreateIntToPtr(untaggedArgLong, argType);
-      untaggedArg->setName("call_arg" + itostr(i) + "_untagged");
-      CI->replaceUsesOfWith(arg, untaggedArg);
-    }
-  }
-} // InstrumentCall
 
 void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
   // EXAMPLE
@@ -2436,8 +2358,17 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     auto *TagVector =
         M.getGlobalVariable(struct_name + ".fieldarmor.tagvec", true);
     // this is the TagVector for the base struct!
-    assert(TagVector &&
-           "Tag vector global must exist and be properly initialized.");
+    // assert(TagVector &&
+    //        "Tag vector global must exist and be properly initialized.");
+    if (TagVector == nullptr) {
+      // NOTE: this fails for arrays of pairs
+      errs() << "[FieldArmor] Error: Tag vector global not found for struct: "
+             << struct_name << "\n";
+      errs() << *GV << "\n";
+      errs() << *type << "\n";
+      assert(TagVector &&
+             "Tag vector global must exist and be properly initialized.");
+    }
     auto *TVRelPtr = ConstantExpr::getTrunc(
         ConstantExpr::getSub(ConstantExpr::getPtrToInt(TagVector, Int64Ty),
                              ConstantExpr::getPtrToInt(Descriptor, Int64Ty)),
@@ -2696,12 +2627,13 @@ void HWAddressSanitizer::createTagVectors() {
 
   for (auto t : identifiedStructTypes) {
     StructType *ty = dyn_cast<StructType>(t);
-    if (ty && !ty->isLiteral() &&
-        ty->getName().str().find("std::pair") != std::string::npos) {
-      // skip pairs
-      // TODO: refactor!
-      continue;
-    }
+    // if (ty && !ty->isLiteral() &&
+    //     ty->getName().str().find("std::pair") != std::string::npos) {
+    //   // skip pairs
+    //   // TODO: refactor!
+    //   continue;
+    // }
+    // OpenCV is breaking without this
     createTagVector(t);
   }
 }
