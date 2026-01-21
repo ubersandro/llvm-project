@@ -214,34 +214,36 @@ STATISTIC(NumTotalFuncs, "Number of total funcs");
 STATISTIC(NumInstrumentedFuncs, "Number of instrumented funcs");
 STATISTIC(NumNoProfileSummaryFuncs, "Number of funcs without PS");
 
-STATISTIC(NumTotalGEPs, "Number of total GEP instructions");
+// STATISTIC(NumTotalGEPs, "Number of total GEP instructions");
 STATISTIC(
     NumUntaggedGEPResults,
     "Number of untagged GEP results"); // proxy for how many checks we skip
 STATISTIC(NumInstrumentedGEPs, "Number of instrumented GEP instructions");
-STATISTIC(NumIgnoredGEPs, "Number of ignored GEP instructions");
+// STATISTIC(NumIgnoredGEPs, "Number of ignored GEP instructions");
 
 STATISTIC(NumInstrumentedGlobals, "Number of instrumented global variables");
 STATISTIC(NumDefinedTagVectors, "Number of defined tag vectors (same as the "
                                 "number of totally identified struct types.)");
 STATISTIC(NumInstrumentedCMPs, "Number of instrumented CMP instructions");
-STATISTIC(NumEmbeddedUnions, "Number of unions embedded in other structs");
-STATISTIC(NumLiteralStructs, "Number of literal structs encountered");
-STATISTIC(NumLiteralStructsEmbedded,
-          "Number of literal structs embedded in other structs");
+// STATISTIC(NumEmbeddedUnions, "Number of unions embedded in other structs");
+// STATISTIC(NumLiteralStructs, "Number of literal structs encountered");
+// STATISTIC(NumLiteralStructsEmbedded,
+//           "Number of literal structs embedded in other structs");
 
-STATISTIC(NumInstrumentedArithmeticOps,
-          "Number of instrumented arithmetic instructions");
-STATISTIC(
-    NumChecksOnUntaggedPtrs,
-    "Number of checks skipped on untagged pointers"); // TODO: find a way of
-                                                      // implementing this. It's
-                                                      // impossible to get it
-                                                      // from the LOAD/STORE
-                                                      // instruction itself
+// STATISTIC(NumInstrumentedArithmeticOps,
+//           "Number of instrumented arithmetic instructions");
+// STATISTIC(
+//     NumChecksOnUntaggedPtrs,
+//     "Number of checks skipped on untagged pointers"); // TODO: find a way of
+//                                                       // implementing this.
+//                                                       It's
+//                                                       // impossible to get it
+//                                                       // from the LOAD/STORE
+//                                                       // instruction itself
 STATISTIC(NumInstrumentedMemAccesses, "Number of instrumented memory accesses");
 // Mode for selecting how to insert frame record info into the stack ring
 // buffer.
+
 enum RecordStackHistoryMode {
   // Do not record frame record info.
   none,
@@ -334,7 +336,7 @@ private:
   // sense. For instance, GEPs and arithmetic clash
   // TODO: dump all the malloc happening, see if the size is influenced by GEPs
   // being tagged (and it will be for sure)
-  u_int64_t TagMask = 0b01111111Lu; // mask to apply to get T+L+R
+  // u_int64_t TagMask = 0b01111111Lu; // mask to apply to get T+L+R
   u_int64_t R_Mask = 0b01000000Lu;
   u_int64_t L_Mask = 0b00110000Lu;
   u_int64_t T_Mask = 0b00001111Lu;
@@ -344,6 +346,7 @@ private:
   Value *R_Mask_value = nullptr;
 
   void InstrumentGEP(GetElementPtrInst *GEPI);
+  void PreprocessGEP(GetElementPtrInst *GEPI);
   void handleGEP2operands(GetElementPtrInst *GEPI);
   void InstrumentCMP(CmpInst *CI);
   void InstrumentPtrToInt(PtrToIntInst *PI);
@@ -1310,31 +1313,65 @@ void HWAddressSanitizer::untagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
 
 } // untagAlloca
 
+// TODO: correctly handle aggregates of vectors
 void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
                                    const DataLayout &DL) {
   if (StructType *ST = dyn_cast<StructType>(AI->getAllocatedType())) {
-    if (ST->isLiteral() || ST->isOpaque()) {
-      // TODO: tag literals properly
-      return;
-    } else {
-      ApplyRLT(IRB, AI, AI->getAllocatedType(), DL);
-      return;
-    }
-  }
-  if (ArrayType *AT = dyn_cast<ArrayType>(AI->getAllocatedType())) {
+    ApplyRLT(IRB, AI, ST, DL);
+  } // StructType
+
+  else if (VectorType *VT = dyn_cast<VectorType>(AI->getAllocatedType())) {
+    errs() << "[FieldArmor] WARNING: Alloca of VectorType for RLT not yet "
+              "supported: "
+           << *(AI->getAllocatedType()) << "\n";
+  } // VectorType
+
+  else if (ArrayType *AT = dyn_cast<ArrayType>(AI->getAllocatedType())) {
     auto elementType = AT->getElementType();
-    // APPROACH 1: for each element, apply RLT. Apply it on a new GEP.
-    for (u_int64_t el = 0; el < AT->getNumElements(); el++) {
-      auto *ElementPtr =
-          IRB.CreateGEP(elementType, AI, {ConstantInt::get(Int64Ty, el)});
-      GetElementPtrInst *GepInstruction = cast<GetElementPtrInst>(ElementPtr);
-      ApplyRLT(IRB, GepInstruction, elementType, DL);
-      /* TODO: this can be largely improved by applying RLT on the whole array
-       * with some smarter solution */
-    } // for each element, tag
-    return;
+
+    if (elementType->isStructTy()) {
+      for (u_int64_t el = 0; el < AT->getNumElements(); el++) {
+        auto *ElementPtr =
+            IRB.CreateGEP(elementType, AI, {ConstantInt::get(Int64Ty, el)});
+        GetElementPtrInst *GepInstruction = cast<GetElementPtrInst>(ElementPtr);
+        ApplyRLT(IRB, GepInstruction, elementType, DL);
+      } // for
+    } // CASE: ARRAY OF STRUCTS
+
+    else if (elementType->isArrayTy()) {
+      // NOTE: SPEC2017 does not use arrays of arrays, apparently
+      errs() << "[FieldArmor] Alloca of array of arrays "
+             << *(AI->getAllocatedType()) << "\n";
+      for (u_int64_t el = 0; el < AT->getNumElements(); el++) {
+        auto *ElementPtr =
+            IRB.CreateGEP(elementType, AI, {ConstantInt::get(Int64Ty, el)});
+        // this points to an array
+        GetElementPtrInst *i_th_array = cast<GetElementPtrInst>(ElementPtr);
+        ArrayType *innerArrayType = cast<ArrayType>(elementType);
+        auto int_n = innerArrayType->getNumElements();
+        for (int el_int = 0; el_int < int_n; el_int++) {
+          auto *innerElementPtr =
+              IRB.CreateGEP(innerArrayType->getElementType(), i_th_array,
+                            {ConstantInt::get(Int64Ty, el_int)});
+          GetElementPtrInst *GepInstruction =
+              cast<GetElementPtrInst>(innerElementPtr);
+          ApplyRLT(IRB, GepInstruction, innerArrayType->getElementType(), DL);
+        } // for inner elements
+      } // for each element, tag
+    } // CASE: ARRAY OF ARRAYS
+  } // ArrayType
+  else {
+    // SPEC2017 never hits this case
+    errs() << "[FieldArmor] WARNING: Alloca of unsupported type for RLT: "
+           << *(AI->getAllocatedType()) << "\n";
+    errs() << "Is vector? " << AI->getAllocatedType()->isVectorTy() << "\n";
+    errs() << "Is struct? " << AI->getAllocatedType()->isStructTy() << "\n";
+    errs() << "Is array? " << AI->getAllocatedType()->isArrayTy() << "\n";
+    errs() << "Is pointer? " << AI->getAllocatedType()->isPointerTy() << "\n";
+    errs() << AI->getAllocatedType() << "\n";
   }
-  assert(false && "This should be unreachable.");
+
+  return;
 } // tagAlloca
 
 unsigned HWAddressSanitizer::retagMask(unsigned AllocaNo) {
@@ -1494,44 +1531,66 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
 
     if (AllocaInst *AIcast = dyn_cast<AllocaInst>(AI)) {
       Type *allocatedType = AIcast->getAllocatedType();
-      // TODO: skipping allocas will go soon
-      if (shouldSkipAlloca(allocatedType))
-        continue;
 
       if (allocatedType->isArrayTy()) {
         auto elementType = allocatedType->getArrayElementType();
-        if (!elementType->isStructTy()) {
-          continue; // NOTE: this rules out matrices of structs too.
-        } // if array not of structs
-        else {
-          /** array of structs */
-          bool shouldSkipArrayAlloca =
-              shouldSkipAlloca(elementType); // skip the structs we dont want
-          if (shouldSkipArrayAlloca)
+        if (elementType->isStructTy()) {
+          StructType *ST_internal = dyn_cast<StructType>(elementType);
+          if (ST_internal->isLiteral())
             continue;
-          Tag = ConstantInt::get(Int64Ty, 0UL); // ptr tag for later
-        }
-      } // if array, check element type
+          else if (ST_internal->getName().str().find("union.") == 0) {
+            continue;
+          }
+        } // case: 1d array of structs
 
-      // for arrays of structs, use tag 0.
-      // NOTE: this is perfectly fine. The tagging scheme will be applied to
-      // subelementes.
+        else if (elementType->isArrayTy()) {
+          // multi-dimensional array
+          auto innerElementType = elementType->getArrayElementType();
+          if (innerElementType->isStructTy()) {
+            StructType *ST_internal_l2 = dyn_cast<StructType>(innerElementType);
+            if (ST_internal_l2->isLiteral())
+              continue;
+            else if (ST_internal_l2->getName().str().find("union.") == 0) {
+              continue;
+            }
+          } // case: 2d array of structs
 
-      if (!allocatedType->isStructTy())
+          else {
+            continue;
+          } // case: 2d array of scalars or other types I don't care about atm
+
+        } // case 2d array
+
+        else {
+          continue;
+        } // case : array of scalars/NA
+      } // case : alloca of ARRAY
+
+      if (!allocatedType->isStructTy()) {
         continue;
-    }
-    // TODO: filter out allocas.
+      } else {
+        StructType *ST = dyn_cast<StructType>(allocatedType);
+        if (ST->isLiteral())
+          continue;
+        else if (ST->getName().str().find("union.") == 0) {
+          continue;
+        }
+      } // rules out allocas of not safe structs
+    } // cast AI
+    else
+      assert(false && "Allocas must be AllocaInsts");
 
+    // AT THIS POINT, IT'S EITHER A STRUCT, A 1d ARRAY OF STRUCTS, OR A 2d ARRAY
+    // OF STRUCTS
     IRBuilder<> IRB(AI->getNextNonDebugInstruction());
     if (!Tag)
       Tag = getRPTag(IRB);
-    // NOTE: pointers to arrays of structs should not be tagged with RP tag!
     Value *AILong = IRB.CreatePointerCast(AI, IntptrTy);
     Value *AINoTagLong = untagPointer(IRB, AILong);
     Value *Replacement = tagPointer(IRB, AI->getType(), AINoTagLong, Tag);
     std::string Name =
         AI->hasName() ? AI->getName().str() : "alloca." + itostr(N);
-    Replacement->setName(Name + ".hwasan");
+    Replacement->setName(Name + ".fieldarmor");
     size_t Size = memtag::getAllocaSizeInBytes(*AI);
     Value *AICast = IRB.CreatePointerCast(AI, PtrTy);
 
@@ -1562,9 +1621,7 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
       II->eraseFromParent();
     for (auto &II : Info.LifetimeEnd)
       II->eraseFromParent();
-    memtag::alignAndPadAlloca(
-        Info, Mapping.getObjectAlignment()); // TODO: what does this do? Dive
-                                             // into it later.
+    memtag::alignAndPadAlloca(Info, Mapping.getObjectAlignment());
 
     memtag::annotateDebugRecords(Info, retagMask(N));
 
@@ -1762,6 +1819,11 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   //                  Mapping.withFrameRecord() &&
   //                  !SInfo.AllocasToInstrument.empty());
 
+  // HEAP
+  // for (auto &GEPI : GEPsToInstrument) {
+  //   PreprocessGEP(GEPI);
+  // }
+
   if (!SInfo.AllocasToInstrument.empty()) {
     const DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
     const PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
@@ -1844,25 +1906,6 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
    * transformations. TODO: implement and test.*/
 
   ShadowBase = nullptr;
-  /** HEAP INSTRUMENTATION */
-  // GEP: array of structs -> struct (dont do anything)
-  // FIRST GEP on DYN ALLOC CHUNK -> insert tagging call
-  // Q: how do LLVM passes traverse chains on GEPs?
-  // Q: should I implement this at LTO? Does it give me some advantage when
-  // dealing with globals?
-
-  /**
-   * 1. if a GEP is on a pointer resulting from an alloca, remove that GEP and
-   all the other GEP users recursively from the set of all GEPs inside the
-   function.
-
-   * 2. if a GEP results from a pointer derived from a global that is not a
-   pointer, those GEPs can be deleted. Q: is it possible to understand when a
-   global is not dynamically allocated?
-
-   * 3. for the remaining GEPs, find a set of distinguished operands, insert
-   tagging calls at the beginning of the function.
-   */
 }
 
 void dumpGEPDebug(GetElementPtrInst *GEPI) {
@@ -1870,6 +1913,9 @@ void dumpGEPDebug(GetElementPtrInst *GEPI) {
   errs() << " GEP INSTRUCTION: ";
   GEPI->print(errs());
   errs() << "\n";
+  errs() << "\t SRC: ";
+  errs() << *(GEPI->getOperand(0)) << "\n";
+  errs() << *getUnderlyingObject(GEPI->getOperand(0)) << "\n";
   errs() << "\t SRC TYPE: ";
   GEPI->getSourceElementType()->print(errs());
   errs() << "\n";
@@ -1893,7 +1939,7 @@ void dumpGEPDebug(GetElementPtrInst *GEPI) {
 }
 
 void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
-  auto GEPResultType = GEPI->getResultElementType();
+  // auto GEPResultType = GEPI->getResultElementType();
   // TODO: look into this. How's vector implemented?
   if (GEPI->getType()->isStructTy() && !GEPI->getType()->isVectorTy()) {
     errs() << "[HWASAN] Instrumenting 2-operands GEP into struct: ";
@@ -1921,9 +1967,208 @@ void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   }
 }
 
+// void HWAddressSanitizer::PreprocessStore(StoreInst *SI) {
+//   // you some ptr into another ptr when you dynamically allocate memory
+//   // TODO
+//   Value *PtrOperand = SI->getPointerOperand();
+//   if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(PtrOperand)) {
+
+//   }
+// }
+
+void HWAddressSanitizer::PreprocessGEP(GetElementPtrInst *GEPI) {
+  // whenever the pointer to an aggregate is retrieved for the first time, I
+  // want to check if it's tagged or not. If not, I tag it. Just tag structs on
+  // first use!!!
+  auto operand0 = GEPI->getOperand(0);
+  auto GepSourceType = GEPI->getSourceElementType();
+  if (!GepSourceType->isStructTy()) {
+    return;
+  }
+
+  if (AllocaInst *AI = dyn_cast<AllocaInst>(operand0)) {
+    // put the STACK prefix to it
+    GEPI->setName("stackGEP." + GEPI->getName().str());
+    return;
+  }
+
+  else if (GlobalVariable *GV = dyn_cast<GlobalVariable>(operand0)) {
+    GEPI->setName("globalGEP." + GEPI->getName().str());
+    return;
+  }
+
+  if (GetElementPtrInst *GEPporcodio = dyn_cast<GetElementPtrInst>(operand0)) {
+    // chain of GEPs
+    if (GEPporcodio->hasName() &&
+        GEPporcodio->getName().str().find("globalGEP") != std::string::npos) {
+      GEPI->setName("globalGEP." + GEPI->getName().str());
+      return;
+    } else if (GEPporcodio->hasName() && GEPporcodio->getName().str().find(
+                                             "stackGEP") != std::string::npos) {
+      GEPI->setName("stackGEP." + GEPI->getName().str());
+      return;
+    }
+  }
+  // at this point, operand0 is neither ALLOCA nor GLOBAL nor GEP
+
+  else {
+    /* Always care about the very first GEP of a chain */
+    GetElementPtrInst *GEPop0 = dyn_cast<GetElementPtrInst>(operand0);
+    if (!GEPop0) {
+
+      // errs() << "[FSan] GEP on NON-GEP, NON-ALLOC, NON-GLOBAL\n";
+      Value *src = getUnderlyingObject(operand0, 20);
+      auto isFunctionArgument = isa<Argument>(src);
+
+      if (isFunctionArgument) {
+        // POLICY: ignore for now -> MIGHT BE A POINTER TO SOME GLOBAL OR STACK,
+        // MAYBE THERE IS SOME ANALYSIS TO KNOW THIS FOR SURE?
+        // TODO
+        // errs() << "[FSan] underlying object is FUNCTION ARGUMENT\n";
+        // GEPI->print(errs());
+      }
+
+      else if (GlobalVariable *GV = dyn_cast<GlobalVariable>(src)) {
+        // errs() << "[FSan] underlying object is GLOBAL\n";
+        // GEPI->print(errs());
+      }
+
+      else {
+        // can be a LOAD, CALL, PHI, SELECT
+        if (SelectInst *SEL = dyn_cast<SelectInst>(src)) {
+
+        } else if (LoadInst *LI = dyn_cast<LoadInst>(src)) {
+
+          auto srcType = dyn_cast<StructType>(GepSourceType);
+          if (srcType->isLiteral()) {
+            errs() << "[FieldArmor] Skipping literal struct - type "
+                      "instrumentation\n";
+            srcType->print(errs());
+            errs() << "\n";
+            return;
+          }
+          if (srcType->getName().str().find("union.") == 0) {
+            errs() << "[FieldArmor] Skipping union struct - type "
+                      "instrumentation\n";
+            srcType->print(errs());
+            errs() << "\n";
+            return;
+          }
+
+          IRBuilder<> IRB(GEPI);
+          Value *loadedPtrLong = IRB.CreatePointerCast(LI, IntptrTy);
+          Value *untaggedPtrLong = untagPointer(IRB, loadedPtrLong);
+          // Q: is everything untagged on the heap?
+          // Q: what if the loaded pointer belongs to the stack or global?
+          Value *shadowLoadedPtr =
+              memToShadow(untaggedPtrLong, IRB); // this is a pointer
+
+          Value *loadedShadowStart = IRB.CreateLoad(Int64Ty, shadowLoadedPtr);
+
+          Value *cmpout = IRB.CreateCmp(ICmpInst::ICMP_EQ, loadedShadowStart,
+                                        ConstantInt::get(Int64Ty, 0));
+          cmpout->setName("fsan.tagged_check.load");
+          // // Create blocks for then and else
+          Function *ParentFunc = GEPI->getFunction();
+          BasicBlock *OrigBB = GEPI->getParent();
+          BasicBlock *ThenBB = BasicBlock::Create(
+              OrigBB->getContext(), "tagged_check_then", ParentFunc);
+          BasicBlock *ContBB = OrigBB->splitBasicBlock(IRB.GetInsertPoint(),
+                                                       "tagged_check_cont");
+
+          // Remove the unconditional branch inserted by splitBasicBlock
+          OrigBB->getTerminator()->eraseFromParent();
+
+          // Insert conditional branch
+          IRB.SetInsertPoint(OrigBB);
+          IRB.CreateCondBr(cmpout, ThenBB, ContBB);
+
+          // In ThenBB, print a message and jump to ContBB
+          IRBuilder<> IRBThen(ThenBB);
+          FunctionType *PrintfTy = FunctionType::get(
+              Type::getInt32Ty(ThenBB->getContext()),
+              {PointerType::getUnqual(Type::getInt8Ty(ThenBB->getContext()))},
+              true);
+          // FunctionCallee PrintfFunc =
+          //     GEPI->getModule()->getOrInsertFunction("printf", PrintfTy);
+          // Value *FormatStr = IRBThen.CreateGlobalStringPtr(
+          //     "[FSan] GEP on UNTAGGED pointer detected, pointer %p, shadow
+          //     %p!\n");
+          // IRBThen.CreateCall(PrintfFunc, {FormatStr, loadedPtrLong,
+          // shadowLoadedPtr}); call fieldarmor_tag
+
+          assert(srcType && "Source type must be struct here");
+
+          auto tagVector = M.getGlobalVariable(
+              srcType->getStructName().str() + ".fieldarmor.tagvec", true);
+          assert(tagVector && "Tag vector must exist here");
+
+          FunctionCallee fieldarmor_tag_memory =
+              M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm",
+                                    PtrTy, PtrTy, PtrTy, Int64Ty, Int64Ty);
+          auto typeSize = M.getDataLayout().getTypeAllocSize(GepSourceType);
+
+          IRBThen.CreateCall(fieldarmor_tag_memory,
+                             {IRB.CreatePointerCast(LI, PtrTy),
+                              IRB.CreatePointerCast(tagVector, PtrTy),
+                              ConstantInt::get(Int64Ty, typeSize),
+                              ConstantInt::get(Int64Ty, 1)});
+
+          IRBThen.CreateBr(ContBB);
+          // if zero, print a message
+
+        } else if (CallInst *CI = dyn_cast<CallInst>(src)) {
+          // errs() << "\tCALL INSTRUCTION: ";
+          // CI->print(errs());
+          // errs() << "\n";
+        } else if (InvokeInst *II = dyn_cast<InvokeInst>(src)) {
+          // errs() << "\tINVOKE INSTRUCTION: ";
+          // II->print(errs());
+          // errs() << "\n";
+        } else if (PHINode *PN = dyn_cast<PHINode>(src)) {
+          // Q: for every option, what is the underlying object?
+          // errs() << "\tPHI NODE: ";
+          // PN->print(errs());
+          // errs() << "\n";
+        } else if (IntToPtrInst *ITPI = dyn_cast<IntToPtrInst>(src)) {
+          // errs() << "\tINT TO PTR INSTRUCTION: ";
+          // ITPI->print(errs());
+          // errs() << "\n";
+          // auto underlyingObjectPtrToIntOperand =
+          //     getUnderlyingObject(ITPI->getOperand(0));
+          // errs() << "\t\t underlying object of ptrtoint operand: ";
+          // underlyingObjectPtrToIntOperand->print(errs());
+          // errs() << "\n";
+        } else {
+          // could be "ptr null"
+          errs() << "\t\t[FSan] underlying object is UNKNOWN\n";
+          GEPI->print(errs());
+          errs() << "\n";
+          src->print(errs());
+          errs() << "\n";
+        }
+      }
+    } else {
+      assert(false);
+      // just don't care about it for now, whatever it is
+      // errs() << "[FSan] GEP on GEP\n";
+      // dumpGEPDebug(GEPI);
+    }
+  }
+}
+
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   // Q: can I tell GEPs on globals/stack apart from heap?
+  // Q: what if some global pointer is stored in a stack variable and then
+  // GEPed? Do I see a store?
   auto nOperands = GEPI->getNumOperands();
+  // if(GEPI->hasName() && GEPI->getName().str().find("untagged") !=
+  // std::string::npos){
+  //   errs() << "[FSan] Skipping GEP on untagged pointer: ";
+  //   GEPI->print(errs());
+  //   errs() << "\n";
+  //   return;
+  // }
   // NOTE: this check never fails if un-squashing the GEPs in the frontend.
   assert(nOperands <= 3);
   if (nOperands != 3) {
@@ -1991,7 +2236,6 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
                         ConstantInt::get(IntptrTy, 0x1Lu)),
           ConstantInt::get(IntptrTy, T_Mask)); // modulo 16
-      // DEBUG temporarily disable this
 
       Value *sonT = IRB.CreateAnd(IRB.CreateAdd(fatherT, sonIdx),
                                   ConstantInt::get(IntptrTy, T_Mask));
@@ -2046,9 +2290,10 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   GEPI->replaceUsesWithIf(taggedPointer, [resultLong, GEPI](const Use &U) {
     auto *User = U.getUser();
     bool safe = User != resultLong && !isa<LifetimeIntrinsic>(User);
-    // NOTE: don't store tagged pointers that might be used by uninstrumented code
-    // Q: can this fail with maps where something is stored with ptr key and retrieved with tagged/untagged ptr?
-    // Q: how much detection power do we lose, if any?
+    // NOTE: don't store tagged pointers that might be used by uninstrumented
+    // code Q: can this fail with maps where something is stored with ptr key
+    // and retrieved with tagged/untagged ptr? Q: how much detection power do we
+    // lose, if any?
     if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
       if (SI->getValueOperand() == GEPI) {
         safe = false;
@@ -2059,7 +2304,6 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   NumInstrumentedGEPs++;
   // NOTE: instrumented might also mean untagged
 } // InstrumentGEP
-
 
 void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
   // EXAMPLE
@@ -2195,7 +2439,7 @@ void HWAddressSanitizer::InstrumentArithmetic(BinaryOperator *CI) {
       untaggedop2->setName("arith_op2_untagged");
       CI->replaceUsesOfWith(op2, untaggedop2);
     }
-    NumInstrumentedArithmeticOps++;
+    // NumInstrumentedArithmeticOps++;
     CI->setName("arith_op_untagged");
     //   FunctionCallee printf = M.getOrInsertFunction(
     //     "printf",
@@ -2252,30 +2496,37 @@ void HWAddressSanitizer::InstrumentPtrToInt(PtrToIntInst *PI) {
   // Q: do I still need to replace the uses?
 }
 
-/** Instrument the following aggregates: arrays of structs, structs. */
+/** Only expect structs, arrays of structs, matrices of structs */
 void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
-
   Constant *Initializer = GV->getInitializer();
   Type *type = GV->getValueType();
-
-  if (type->isStructTy()) {
-    auto *ST = dyn_cast<StructType>(type);
-    if (ST->hasName() && ST->getName().starts_with("struct.std::pair")) {
-      // errs() << "[FieldArmor] Skipping global variable: " << GV->getName()
-      //        << "\n";
-      return;
-    }
-    // if literal, it cant be a pair
-  }
-
   assert(type->isAggregateType() &&
          "[FieldArmor] Expected only aggregate types to be instrumented");
+
+  bool isStruct = type->isStructTy();
+  bool isArrayOfStructs =
+      type->isArrayTy() &&
+      dyn_cast<ArrayType>(type)->getArrayElementType()->isStructTy();
+
+  bool isMatrixOfStructs =
+      type->isArrayTy() &&
+      dyn_cast<ArrayType>(type)->getElementType()->isArrayTy() &&
+      dyn_cast<ArrayType>(dyn_cast<ArrayType>(type)->getElementType())
+          ->getElementType()
+          ->isStructTy();
+
+  if (!(isStruct || isArrayOfStructs || isMatrixOfStructs)) {
+    errs() << "[FieldArmor - WARNING] Skipping global variable: "
+           << GV->getName() << "\n";
+    errs() << *type << "\n";
+    return;
+  }
+
   bool isUnion = false;
   std::string struct_name = "";
+
   if (type->isStructTy()) {
     StructType *ST = dyn_cast<StructType>(type);
-    // TODO: handle literal structs later.
-    // now skipping cause they could be unions
     if (ST->isLiteral()) {
       return;
     }
@@ -2283,23 +2534,27 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     struct_name = ST->getName().str();
   }
 
-  if (type->isArrayTy()) {
+  if (isArrayOfStructs) {
     Type *elementType = type->getArrayElementType();
-    assert(elementType->isStructTy() &&
-           "[FieldArmor] Expected only arrays of structs to be instrumented");
-
     StructType *STA = dyn_cast<StructType>(elementType);
-    if (STA->isLiteral()) {
+    if (STA->isLiteral())
       return;
-    }
     isUnion = STA->getName().str().find("union.") != std::string::npos;
     struct_name = STA->getName().str();
   }
 
-  if (isUnion) {
-    // TODO: handle unions later
-    return;
+  if (isMatrixOfStructs) {
+    Type *elementType = dyn_cast<ArrayType>(type)->getElementType();
+    Type *structType = dyn_cast<ArrayType>(elementType)->getElementType();
+    StructType *STM = dyn_cast<StructType>(structType);
+    if (STM->isLiteral())
+      return;
+    isUnion = STM->getName().str().find("union.") != std::string::npos;
+    struct_name = STM->getName().str();
   }
+
+  if (isUnion)
+    return;
 
   uint64_t SizeInBytes =
       M.getDataLayout().getTypeAllocSize(Initializer->getType());
@@ -2329,10 +2584,9 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   // NOTE: dont set tag vector here, do it once and for all in constructor and
   // only reference it here
 
-  auto *DescriptorTy =
-      StructType::get(Int32Ty, Int32Ty, Int32Ty,
-                      Int32Ty); // addr, info, tagvec ptr, padding ->
-                                // preserve original alignment (8)
+  auto *DescriptorTy = StructType::get(
+      Int32Ty, Int32Ty, Int32Ty,
+      Int32Ty); // addr, info, tagvec ptr, n_elem if array or matrix
   const uint64_t MaxDescriptorSize = 0xfffff0;
   for (uint64_t DescriptorPos = 0; DescriptorPos < SizeInBytes;
        DescriptorPos += MaxDescriptorSize) {
@@ -2351,15 +2605,10 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
 
     assert(!struct_name.empty() &&
            "Struct name must be valid to instrument global variable.");
-    // errs() << "[FieldArmor] Instrumenting global of struct type: "
-    //        << struct_name << "\n";
-
-    // TODO: introduce support for arrays in runtime tagging
+    
     auto *TagVector =
         M.getGlobalVariable(struct_name + ".fieldarmor.tagvec", true);
-    // this is the TagVector for the base struct!
-    // assert(TagVector &&
-    //        "Tag vector global must exist and be properly initialized.");
+    
     if (TagVector == nullptr) {
       // NOTE: this fails for arrays of pairs
       errs() << "[FieldArmor] Error: Tag vector global not found for struct: "
@@ -2376,15 +2625,26 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     // auto *arraySize = ConstantInt::get(
     //     Int32Ty, 0x1); // fix to this value for now!!! TODO :REMOVE
     Constant *arraySize = nullptr;
-    if (!type->isArrayTy()) {
+    if (isStruct) {
       // single struct
       arraySize = ConstantInt::get(
           Int32Ty, 0x1); // fix to this value for now!!! TODO :REMOVE
       ;
     } else {
       // array of structs
-      auto arrayType = dyn_cast<ArrayType>(type);
-      arraySize = ConstantInt::get(Int32Ty, arrayType->getNumElements());
+      if(isMatrixOfStructs){
+        auto outerArrayType = dyn_cast<ArrayType>(type);
+        auto innerArrayType = dyn_cast<ArrayType>(outerArrayType->getElementType());
+        assert(outerArrayType && "Outer array type must be valid for matrix of structs.");
+        assert(innerArrayType && "Inner array type must be valid for matrix of structs.");
+
+        arraySize = ConstantInt::get(
+            Int32Ty, outerArrayType->getNumElements() * innerArrayType->getNumElements());
+      }
+      else {
+        auto arrayType = dyn_cast<ArrayType>(type);
+        arraySize = ConstantInt::get(Int32Ty, arrayType->getNumElements());
+      }
     }
     assert(arraySize && "Array size constant must be valid.");
     uint32_t Size = std::min(SizeInBytes - DescriptorPos, MaxDescriptorSize);
@@ -2420,11 +2680,11 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   // instruction
   GV->eraseFromParent();
   NumInstrumentedGlobals++;
-}
+} // instrumentGlobal
 
 void HWAddressSanitizer::instrumentGlobals() {
   std::vector<GlobalVariable *> Globals;
-  // TODO: add statistic to check on how many globals are not protected
+
   for (GlobalVariable &GV : M.globals()) {
 
     if (GV.hasSanitizerMetadata() && GV.getSanitizerMetadata().NoHWAddress)
@@ -2449,10 +2709,33 @@ void HWAddressSanitizer::instrumentGlobals() {
     // WHAT HAPPEN IF A GLOBAL HAS NO INITIALIZER?
 
     if (GV.getValueType()->isArrayTy()) {
-      // TODO handle matrix of structs
-      if (!GV.getValueType()->getArrayElementType()->isStructTy()) {
+      if (!GV.getValueType()->getArrayElementType()->isStructTy() &&
+          !GV.getValueType()->getArrayElementType()->isArrayTy()) {
+        // array of structs
         continue;
-      }
+      } else if (GV.getValueType()->getArrayElementType()->isArrayTy()) {
+        ArrayType *elemArrayType =
+            dyn_cast<ArrayType>(GV.getValueType()->getArrayElementType());
+        if (!elemArrayType->getElementType()->isStructTy()) {
+          // skipping 3d array
+          errs() << "[HWASAN] Skipping global variable (3D array): "
+                 << GV.getName() << "\n";
+          continue;
+        } // arrays of arrays of something other than structs
+        else if (elemArrayType->getElementType()->isStructTy()) {
+          bool isLiteral = dyn_cast<StructType>(elemArrayType->getElementType())
+                               ->isLiteral();
+          bool isUnion =
+              isLiteral ? true
+                        : dyn_cast<StructType>(elemArrayType->getElementType())
+                                  ->getName()
+                                  .str()
+                                  .find("union.") == 0;
+          if (isUnion || isLiteral) {
+            continue;
+          }
+        } // if array of arrays of structs
+      } // if array of arrays
     } // if it's an array
 
     else if (!GV.getValueType()->isStructTy()) {
@@ -2465,7 +2748,7 @@ void HWAddressSanitizer::instrumentGlobals() {
   for (GlobalVariable *GV : Globals) {
     instrumentGlobal(GV);
   } // for global var
-}
+} // instrumentGlobals
 
 // TODO: why do we even need this in first place?
 void HWAddressSanitizer::instrumentPersonalityFunctions() {
@@ -2570,38 +2853,27 @@ Value *HWAddressSanitizer::getRPTag(IRBuilder<> &IRB) {
   return ConstantInt::get(Int64Ty, RPTag);
 }
 
-// TODO: remove
-
 /** This method is called on whatever struct that was identified in the
  * frontend. This includes unions and literal structs. */
-// __attribute__((noinline))
 void HWAddressSanitizer::createTagVector(StructType *t) {
-
+  // dont create if it already exists
   std::string TagVecName = t->getStructName().str() + ".fieldarmor.tagvec";
   auto *TagVec = M.getGlobalVariable(TagVecName, true);
   if (TagVec) {
     return;
   }
-
-  /** NOTE: opaque types are not sized. */
-  if (!t->isSized()) {
-    errs() << "[FieldArmor] StructType " << *t << " is not sized!\n";
-    return;
-  }
   auto size = M.getDataLayout().getTypeAllocSize(t);
 
   u_int8_t *tags = nullptr;
-  // bool isLiteral = t->isLiteral(); // TODO: handle later
-  bool isUnion = t->getName().str().find("union.") != std::string::npos;
+  bool isLiteral = t->isLiteral();
+  bool isUnion =
+      !isLiteral && t->getName().str().find("union.") != std::string::npos;
 
-  if (isUnion) {
+  if (isLiteral || isUnion) {
     /** Non-literal union: treat it as a scalar field. */
-    tags = new uint8_t[size]; // TODO: get rid of this, maybe causing OOM
+    tags = new uint8_t[size];
     memset(tags, (unsigned char)0x00, size);
-    NumEmbeddedUnions++; // TODO: remove or refactor
-  } // if isUnion
-  else {
-    /** This gets called on: a) non-literal struct, b) literal struct*/
+  } else {
     tags = computeTags(t);
   }
 
@@ -2622,25 +2894,29 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
 }
 
 void HWAddressSanitizer::createTagVectors() {
-  /** you only do this for each struct... */
   auto identifiedStructTypes = M.getIdentifiedStructTypes();
 
   for (auto t : identifiedStructTypes) {
     StructType *ty = dyn_cast<StructType>(t);
-    // if (ty && !ty->isLiteral() &&
-    //     ty->getName().str().find("std::pair") != std::string::npos) {
-    //   // skip pairs
-    //   // TODO: refactor!
-    //   continue;
-    // }
-    // OpenCV is breaking without this
+
+    /** NOTE: opaque types are not sized. */
+    if (!ty->isSized()) {
+      // Q: what is the solution to this?
+      errs() << "[FieldArmor] StructType " << *t << " is not sized!\n";
+      return;
+    }
+
     createTagVector(t);
   }
 }
 
+/** This method computes tags for aggregates of unions up to level 2
+ * (matrices). Vectors are out of scope for now. */
 u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
-
-  // TODO: introduce ad hoc tag for padding
+  // TODO: introduce ad hoc tag for padding (maybe 0xff?)
+  // TODO: try tagging unions
+  // TODO: remove the 0 tag from everywhere else
+  // TODO: measure coverage of literal structs
   DataLayout DL = M.getDataLayout();
   u_int8_t *tags = new u_int8_t[DL.getTypeAllocSize(Ty)];
   memset(tags, 0, DL.getTypeAllocSize(Ty));
@@ -2655,6 +2931,8 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
   uint16_t sonIdx = 1; // NOTE: 2^^16 max number of fields because tag on 4 bits
   if (levelZeroFieldsOffsets.size() >= (1 << 16) - 1) {
     /** Too many fields :( */
+    errs() << "[FieldArmor] Struct " << *Ty
+           << " has too many fields to be tagged properly.\n";
     return nullptr;
   }
 
@@ -2668,7 +2946,6 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
 
     auto el_pair = AggQueue.front();
     AggQueue.pop_front();
-
     Type *sonType = std::get<0>(el_pair);
     fatherT = std::get<1>(el_pair);
     fatherL = std::get<2>(el_pair);
@@ -2676,11 +2953,11 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
     size_t sonOffset = std::get<4>(el_pair);
 
     auto ST_son = dyn_cast<StructType>(sonType);
-    auto isLiteralStruct = ST_son && ST_son->isLiteral();
-    auto isUnion = ST_son && !isLiteralStruct &&
-                   (ST_son->getName().find("union.") != std::string::npos);
+    auto isLitStr = ST_son && ST_son->isLiteral();
+    auto isUnion =
+        ST_son && !isLitStr && (ST_son->getName().find("union.") == 0);
 
-    if (ST_son && !isLiteralStruct && !isUnion) {
+    if (ST_son && !isLitStr && !isUnion) {
       u_int8_t newBaseTag = 0; // FLAT scheme introduced here
       uint8_t count = 0;
       auto sonSubfieldsCount = sonType->getNumContainedTypes();
@@ -2697,29 +2974,36 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
                             sonSubfieldsCount - count, currSonSubfieldOffset));
         count++;
       } // for subtype
+    } // if son struct
 
-    } else if (sonType->isArrayTy()) {
-      // NOTE: 502.gcc_r has 2 dimensional struct arrays inside!
+    else if (sonType->isArrayTy()) {
       Type *elementType = sonType->getArrayElementType();
-
       if (elementType->isStructTy()) {
+        // case : ARRAY of STRUCTS embedded in a struct
+        if (StructType *structType = dyn_cast<StructType>(elementType)) {
+          if (structType->isLiteral()) {
+            // dont tag literal structs arrays for now
+            continue;
+          } else if (structType->getName().str().find("union.") == 0) {
+            // dont tag union arrays for now
+            continue;
+          }
+        } // skip literal and unions
+
         auto structType = cast<StructType>(elementType);
         auto structName = structType->getStructName().str();
+        auto tagVectorGlobal =
+            M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
 
-        auto tagVectorGlobal = M.getGlobalVariable(
-            structName + ".fieldarmor.tagvec",
-            true); // CAVEAT -> these are for internal use...
-
-        if (!tagVectorGlobal) {
+        if (!tagVectorGlobal)
           createTagVector(structType);
-        }
+
         tagVectorGlobal =
             M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
-        if (!tagVectorGlobal) {
+
+        if (!tagVectorGlobal)
           continue;
-        }
-        // Apply tag vector
-        // TODO: optimize
+
         Constant *tagVectorInit =
             cast<Constant>(tagVectorGlobal->getInitializer());
 
@@ -2729,55 +3013,122 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
 
         for (u_int64_t k = 0; k < numElements; k++) {
           uint64_t elemOffset = sonOffset + k * elementSize;
-
           for (u_int64_t i = 0; i < elementSize; i++) {
             tags[elemOffset + i] = static_cast<uint8_t>(
                 cast<ConstantInt>(tagVectorInit->getAggregateElement(i))
                     ->getZExtValue());
           }
         } // for each struct, copy its tag vector at the right position
-      } // if array of structs
+      } // case: array of structs embedded in a struct
 
       else if (elementType->isArrayTy()) {
         auto innerArrayType = dyn_cast<ArrayType>(elementType);
         Type *innerElementType = innerArrayType->getArrayElementType();
         if (innerElementType->isStructTy()) {
+          // case : matrix of structs
           auto structType = cast<StructType>(innerElementType);
-          auto structName = structType->getStructName().str();
-          // errs() << "[FieldArmor] matrix of structs detected. Struct type: "
-          //        << structName << ", type: " << *structType
-          //        << ", container struct: " << *sonType << "\n";
-          // TODO: handle matrix of structs -> this is a real problem!
-        }
-      } // array of arrays
+          if (structType->isLiteral()) {
+            // dont tag literal struct matrices for now
+            continue;
+          } else if (structType->getName().str().find("union.") == 0) {
+            // dont tag union matrices for now
+            continue;
+          }
 
-      else { /** array of scalars or, 3d-arrays */
+          auto structName = structType->getStructName().str();
+          auto tagVectorGlobal =
+              M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
+
+          if (!tagVectorGlobal) {
+            createTagVector(structType);
+          }
+          tagVectorGlobal =
+              M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
+
+          if (!tagVectorGlobal) {
+            continue; // you could assert it here
+          }
+          auto sizeOuterArray = DL.getTypeAllocSize(sonType);
+          auto sizeInnerArray = DL.getTypeAllocSize(elementType);
+          uint64_t numOuterElements = sizeOuterArray / sizeInnerArray;
+          uint64_t structSize = DL.getTypeAllocSize(innerElementType);
+          uint64_t numInnerElements = sizeInnerArray / structSize;
+          Constant *tagVectorInit =
+              cast<Constant>(tagVectorGlobal->getInitializer());
+
+          for (u_int64_t k = 0; k < numOuterElements; k++) {
+            // each element is an array of structs
+            uint64_t currOuterArrayOffset = sonOffset + k * sizeInnerArray;
+
+            for (u_int64_t h = 0; h < numInnerElements; h++) {
+              uint64_t currInnerArrayOffset =
+                  currOuterArrayOffset + h * structSize;
+              for (u_int64_t i = 0; i < structSize; i++) {
+                tags[currInnerArrayOffset + i] = static_cast<uint8_t>(
+                    cast<ConstantInt>(tagVectorInit->getAggregateElement(i))
+                        ->getZExtValue());
+              } // for each byte of the tag vector of the struct
+            } // for each struct
+          } // for each array of structs
+        } // case : matrix of structs
+
+        else {
+          // array of arrays of scalars, or array of arrays of arrays of
+          // something else -> all same tag
+          // NOTE: this could be 3d matrices of structs as well!
+          uint8_t sonT = (fatherT + sonIdx) % 16;
+          uint8_t sonTag = sonT | (fatherL << 4);
+          uint64_t sonSize = DL.getTypeAllocSize(sonType);
+          for (uint64_t i = 0; i < sonSize; i++) {
+            tags[sonOffset + i] = sonTag;
+          }
+        } // case: matrix of scalars/arrays
+      } // case: inner element of array is an array
+      else {
+        // array of scalars -> all same tag
         uint8_t sonT = (fatherT + sonIdx) % 16;
         uint8_t sonTag = sonT | (fatherL << 4);
-
         uint64_t sonSize = DL.getTypeAllocSize(sonType);
         for (uint64_t i = 0; i < sonSize; i++) {
           tags[sonOffset + i] = sonTag;
         }
-      }
-
-    } // if son array
+      } // array of scalars
+    } // case: son is array
 
     else {
-      // scalar fields, literal structs, unions == ALL SCALAR
-      uint8_t sonT = (fatherT + sonIdx) % 16;
-      uint8_t sonTag = sonT | (fatherL << 4);
-      if (isUnion)
-        sonTag = 0x00; // constant tag for unions
-      // TODO: try to make non-null, see what happens
-      // NOTE: there is some violation flagged for 500
-      int sonSize = DL.getTypeAllocSize(sonType);
-      for (int i = 0; i < sonSize; i++) {
-        tags[sonOffset + i] = sonTag;
-      }
+      // case : scalar fields, literal structs, unions == ALL SCALAR
 
-    } // else scalar fields
+      if (sonType->isStructTy()) {
+        StructType *ty = dyn_cast<StructType>(sonType);
+        errs() << "[FieldArmor - WARNING] Treating as scalar EMBEDDED struct "
+                  "type: "
+               << *ty << "\n";
+        errs() << "container " << *Ty << "\n";
+        errs() << "is opaque " << (ty->isOpaque() ? "true" : "false") << "\n";
+        errs() << "is literal " << (ty->isLiteral() ? "true" : "false") << "\n";
+        if (!ty->isLiteral())
+          errs() << "is union "
+                 << ((ty->getName().str().find("union.") == 0) ? "true"
+                                                               : "false")
+                 << "\n";
+        if (!ty->isLiteral())
+          errs() << "struct name " << ty->getName().str() << "\n";
+        memset(&tags[sonOffset], 0x00,
+               DL.getTypeAllocSize(sonType)); // treat as NULL scalar field
+
+      } else {
+        uint8_t sonT = (fatherT + sonIdx) % 16;
+        uint8_t sonTag = sonT | (fatherL << 4);
+        if (isUnion)
+          sonTag = 0x00;
+        int sonSize = DL.getTypeAllocSize(sonType);
+        for (int i = 0; i < sonSize; i++) {
+          tags[sonOffset + i] = sonTag;
+        }
+      }
+    } // case : scalar fields, literal structs, unions
   } // while agg queue not empty
+
   return tags;
 } // computeTags
 

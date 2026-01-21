@@ -38,7 +38,7 @@ struct hwasan_global {
   s32 gv_relptr;
   u32 info;
   u32 tag_vector_relptr; // THIS IS WHERE THE TAG LIVES
-  u32 array_size;
+  u32 array_size; // treat matrices as arrays, this is the number of elements in the inner array (row) * number of inner arrays/rows
 };
 
 // Walk through the specific DSO (as specified by the base, phdr, and phnum),
