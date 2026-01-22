@@ -509,7 +509,7 @@ uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector, uptr array_size) {
           (void*)perElementSize);
   uptr tagged = AddTagToPointer(p, RPTag);  // TODO: handle array case!
 
-  for (int x = 0; x < array_size; x++) {
+  for (u_int64_t x = 0; x < array_size; x++) {
     for (uptr i = 0; i < perElementSize; i++) {
       u_int8_t tag = ptr ? ptr[i] : 0;
       VPrintf(2,
@@ -519,6 +519,8 @@ uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector, uptr array_size) {
     }
     if (array_size == 1)
       break;
+    VPrintf(2, "\t\t[FieldArmor] TagMemory_mod: NEXT ELEMENT in array, x: %d\n",
+            x + 1);
   }
   return ptr ? tagged : p;
 }
@@ -545,7 +547,7 @@ uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
     internal_memset((void*)shadow_start, tag, shadow_size);
   }
   uptr tagged = AddTagToPointer(p, tag);
-  VPrintf(1, "\t\t[HWASAN] TagMemoryAligned: return %p, untagged %p\n------------\n",
+  VPrintf(1, "[FieldArmor] TagMemoryAligned: return %p, untagged %p ",
           (void*)tagged, (void*)p);
   return tagged;
 }

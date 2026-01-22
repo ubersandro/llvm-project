@@ -1820,9 +1820,9 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   //                  !SInfo.AllocasToInstrument.empty());
 
   // HEAP
-  // for (auto &GEPI : GEPsToInstrument) {
-  //   PreprocessGEP(GEPI);
-  // }
+  for (auto &GEPI : GEPsToInstrument) {
+    PreprocessGEP(GEPI);
+  }
 
   if (!SInfo.AllocasToInstrument.empty()) {
     const DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
@@ -2021,24 +2021,56 @@ void HWAddressSanitizer::PreprocessGEP(GetElementPtrInst *GEPI) {
       auto isFunctionArgument = isa<Argument>(src);
 
       if (isFunctionArgument) {
-        // POLICY: ignore for now -> MIGHT BE A POINTER TO SOME GLOBAL OR STACK,
-        // MAYBE THERE IS SOME ANALYSIS TO KNOW THIS FOR SURE?
-        // TODO
-        // errs() << "[FSan] underlying object is FUNCTION ARGUMENT\n";
-        // GEPI->print(errs());
-      }
+        return;
+        // // unconditionally tag the memory
+        // auto srcType = dyn_cast<StructType>(GepSourceType);
+        // IRBuilder<> IRB(GEPI); // BEFORE the GEP
+        // if (srcType->isLiteral()) {
+        //   errs() << "[FieldArmor] Skipping literal struct - TR\n";
+        //   srcType->print(errs());
+        //   errs() << "\n";
+        //   return;
+        // }
+        // if (srcType->getName().str().find("union.") == 0) {
+        //   errs() << "[FieldArmor] Skipping union struct - TR\n";
+        //   srcType->print(errs());
+        //   errs() << "\n";
+        //   return;
+        // }
 
-      else if (GlobalVariable *GV = dyn_cast<GlobalVariable>(src)) {
-        // errs() << "[FSan] underlying object is GLOBAL\n";
-        // GEPI->print(errs());
-      }
+        // assert(srcType && "Source type must be struct here");
+
+        // auto tagVector = M.getGlobalVariable(
+        //     srcType->getStructName().str() + ".fieldarmor.tagvec", true);
+        // assert(tagVector && "Tag vector must exist here");
+
+        // FunctionCallee fieldarmor_tag_memory =
+        //     M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm",
+        //                           PtrTy, PtrTy, PtrTy, Int64Ty, Int64Ty);
+        // auto typeSize = M.getDataLayout().getTypeAllocSize(GepSourceType);
+
+        // // is operand0 the right pointer to tag?
+        // IRB.CreateCall(fieldarmor_tag_memory,
+        //                {IRB.CreatePointerCast(operand0, PtrTy),
+        //                 IRB.CreatePointerCast(tagVector, PtrTy),
+        //                 ConstantInt::get(Int64Ty, typeSize),
+        //                 ConstantInt::get(Int64Ty, 1)});
+
+      } // function argument case
+
+      // else if (GlobalVariable *GV = dyn_cast<GlobalVariable>(src)) {
+      //   // Q: can this case happen?
+      //   assert(false && "GEP on global variable should have been "
+      //                  "caught earlier!");
+      // NOTE: this case has been deleted because does not seem to make sense
+      // }
 
       else {
         // can be a LOAD, CALL, PHI, SELECT
         if (SelectInst *SEL = dyn_cast<SelectInst>(src)) {
 
         } else if (LoadInst *LI = dyn_cast<LoadInst>(src)) {
-
+          // NOTE: ideally, only what gets accessed should be tagged
           auto srcType = dyn_cast<StructType>(GepSourceType);
           if (srcType->isLiteral()) {
             errs() << "[FieldArmor] Skipping literal struct - type "
@@ -2059,15 +2091,16 @@ void HWAddressSanitizer::PreprocessGEP(GetElementPtrInst *GEPI) {
           Value *loadedPtrLong = IRB.CreatePointerCast(LI, IntptrTy);
           Value *untaggedPtrLong = untagPointer(IRB, loadedPtrLong);
           // Q: is everything untagged on the heap?
-          // Q: what if the loaded pointer belongs to the stack or global?
+          // Q: what if the loaded pointer belongs to the stack or global? Can
+          // this still happen?
           Value *shadowLoadedPtr =
               memToShadow(untaggedPtrLong, IRB); // this is a pointer
 
           Value *loadedShadowStart = IRB.CreateLoad(Int64Ty, shadowLoadedPtr);
 
-          Value *cmpout = IRB.CreateCmp(ICmpInst::ICMP_EQ, loadedShadowStart,
-                                        ConstantInt::get(Int64Ty, 0));
-          cmpout->setName("fsan.tagged_check.load");
+          // Value *cmpout = IRB.CreateCmp(ICmpInst::ICMP_EQ, loadedShadowStart,
+          //                               ConstantInt::get(Int64Ty, 0));
+          // cmpout->setName("fsan.tagged_check.load"); // DEBUG
           // // Create blocks for then and else
           Function *ParentFunc = GEPI->getFunction();
           BasicBlock *OrigBB = GEPI->getParent();
@@ -2081,14 +2114,14 @@ void HWAddressSanitizer::PreprocessGEP(GetElementPtrInst *GEPI) {
 
           // Insert conditional branch
           IRB.SetInsertPoint(OrigBB);
-          IRB.CreateCondBr(cmpout, ThenBB, ContBB);
-
+          // IRB.CreateCondBr(cmpout, ThenBB, ContBB); // DEBUG
+          IRB.CreateBr(ThenBB); // JUMP UNCOND
           // In ThenBB, print a message and jump to ContBB
           IRBuilder<> IRBThen(ThenBB);
-          FunctionType *PrintfTy = FunctionType::get(
-              Type::getInt32Ty(ThenBB->getContext()),
-              {PointerType::getUnqual(Type::getInt8Ty(ThenBB->getContext()))},
-              true);
+          // FunctionType *PrintfTy = FunctionType::get(
+          //     Type::getInt32Ty(ThenBB->getContext()),
+          //     {PointerType::getUnqual(Type::getInt8Ty(ThenBB->getContext()))},
+          //     true);
           // FunctionCallee PrintfFunc =
           //     GEPI->getModule()->getOrInsertFunction("printf", PrintfTy);
           // Value *FormatStr = IRBThen.CreateGlobalStringPtr(
@@ -2149,10 +2182,8 @@ void HWAddressSanitizer::PreprocessGEP(GetElementPtrInst *GEPI) {
         }
       }
     } else {
+      // operand0 is a GEP, this should not happen
       assert(false);
-      // just don't care about it for now, whatever it is
-      // errs() << "[FSan] GEP on GEP\n";
-      // dumpGEPDebug(GEPI);
     }
   }
 }
@@ -2605,10 +2636,10 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
 
     assert(!struct_name.empty() &&
            "Struct name must be valid to instrument global variable.");
-    
+
     auto *TagVector =
         M.getGlobalVariable(struct_name + ".fieldarmor.tagvec", true);
-    
+
     if (TagVector == nullptr) {
       // NOTE: this fails for arrays of pairs
       errs() << "[FieldArmor] Error: Tag vector global not found for struct: "
@@ -2632,16 +2663,19 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       ;
     } else {
       // array of structs
-      if(isMatrixOfStructs){
+      if (isMatrixOfStructs) {
         auto outerArrayType = dyn_cast<ArrayType>(type);
-        auto innerArrayType = dyn_cast<ArrayType>(outerArrayType->getElementType());
-        assert(outerArrayType && "Outer array type must be valid for matrix of structs.");
-        assert(innerArrayType && "Inner array type must be valid for matrix of structs.");
+        auto innerArrayType =
+            dyn_cast<ArrayType>(outerArrayType->getElementType());
+        assert(outerArrayType &&
+               "Outer array type must be valid for matrix of structs.");
+        assert(innerArrayType &&
+               "Inner array type must be valid for matrix of structs.");
 
-        arraySize = ConstantInt::get(
-            Int32Ty, outerArrayType->getNumElements() * innerArrayType->getNumElements());
-      }
-      else {
+        arraySize =
+            ConstantInt::get(Int32Ty, outerArrayType->getNumElements() *
+                                          innerArrayType->getNumElements());
+      } else {
         auto arrayType = dyn_cast<ArrayType>(type);
         arraySize = ConstantInt::get(Int32Ty, arrayType->getNumElements());
       }

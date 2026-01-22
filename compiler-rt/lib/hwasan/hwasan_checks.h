@@ -281,9 +281,10 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
 
     for (uptr i = 0; i < sz; i++) {
       mem_tag = *(tag_t*)MemToShadow((uptr)untagged_ptr + i);
+      // NOTE: memtag can become 0 at some point if a) going out of bounds on the current object b) flexible array member. We tolerate a), but have to be lenient on b)
 
       // TODO: un-ignore levels!!!!
-      if ((getT(mem_tag)) != getT(ptr_tag)) {
+      if ((getT(mem_tag)) != getT(ptr_tag) && mem_tag != 0) {
         VPrintf(1, "[FieldArmor] TAG MISMATCH A=%p SZ=%u\n",
                 (void*)(untagged_ptr + i), sz);
         VPrintf(1, "\t[FieldArmor] memory T: %u, pointer T: %u\n",
