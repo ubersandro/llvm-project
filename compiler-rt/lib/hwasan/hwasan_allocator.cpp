@@ -276,6 +276,7 @@ static bool CheckInvalidFree(StackTrace* stack, void* untagged_ptr,
   // This function can return true if halt_on_error is false.
   // if (!MemIsApp(reinterpret_cast<uptr>(untagged_ptr)) ||
   //     !PointerAndMemoryTagsMatch(tagged_ptr)) {
+  // TODO: this was removed for now, maybe re-introduce later.
   if (!MemIsApp(reinterpret_cast<uptr>(untagged_ptr))) {
     ReportInvalidFree(stack, reinterpret_cast<uptr>(tagged_ptr));
     return true;

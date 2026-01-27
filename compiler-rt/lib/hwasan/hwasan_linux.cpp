@@ -273,6 +273,19 @@ bool InitShadow() {
 
   return true;
 }
+#ifndef FINISH
+#define FINISH
+void __attribute__((destructor)) __hwasan_finish(){
+  // enable on need
+  // Printf(
+  //     "FSAN: %llu checks, %llu on untagged ptrs, %llu on uninitialized shadow. Overflows %llu\n",
+  //     atomic_load(&total_checks, memory_order_relaxed),
+  //     atomic_load(&checks_on_untagged_ptr, memory_order_relaxed),
+  //     atomic_load(&checks_on_uninited_shadow, memory_order_relaxed), 
+  //     atomic_load(&overflows, memory_order_relaxed));
+}
+#endif
+
 
 void InitThreads() {
   CHECK(__hwasan_shadow_memory_dynamic_address);

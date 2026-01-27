@@ -169,8 +169,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   unsigned char* untagged_ptr = (unsigned char*)(p & ~kAddressTagMask);
   tag_t ptr_tag = GetTagFromPointer(p);
   if (ptr_tag == 0) {
-    // VPrintf(1, "[FieldArmor] CAS A=%p SZ=%u: UNTAGGED PTR <SKIP>\n",
-    //         (void*)p, sz);
+    // atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
     return;
   }
   tag_t R = getR(ptr_tag);
@@ -182,106 +181,28 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   //         R, L, T);
   tag_t mem_tag = *(tag_t*)MemToShadow((uptr)untagged_ptr);
   if (mem_tag == 0) {
-    // VPrintf(1, "\033[1;33m[FieldArmor] MEM %p UNTAGGED, <SKIP>\033[0m\n",
-    //         (void*)untagged_ptr);
+    // atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
     return;
   }
+  // atomic_fetch_add(&total_checks, 1ULL, memory_order_relaxed);
+  // if(atomic_load(&total_checks, memory_order_relaxed) == 0){
+  //   // prevent overflow
+  //   atomic_store(&overflows, 1ULL, memory_order_relaxed);
+  // }
 
   if (R) {
     // VPrintf(1, "\t\t[FieldArmor] RP CHECK A=%p SZ=%u\n", (void*)p, sz);
     if ((L == 0) && (T == 0))
       return; /* pointer to outer root struct can do whatever -> CASE1*/
-
-    // unsigned int idx = 1;  // initial index is always 1 in RLT
-    // unsigned int i = 0;
-    // unsigned int tries = 0;
-    // unsigned const int THRESHOLD = 16;  // we assume a struct has no more
-    // than
-    //                                     // 16 fields for now // TODO Review
-
-    // /** The following can happen here:
-    //  * 1. linear write of the whole struct (like a memset)
-    //  * 2. random access to a field (of whatever size)
-    //  * 3. security hole: overflows are possible at levels lower than L
-    //  * In case 1, checks are sequential and easy to implement.
-    //  * In case 2, increments to the expected tag are needed to figure out
-    //  * whether this pointer can write to the targeted location or not.
-    //  */
-    // tag_t exp = T + idx;  // expected tag of the first field
-    // int inc = 0;
-
-    // tag_t* curr_memtag;
-    // tag_t prevT;  // current element memory tag
-    // while (i < sz) {
-    //   curr_memtag = (tag_t*)MemToShadow((uptr)untagged_ptr) + i;
-
-    //   if ((getT(*curr_memtag)) == exp) {
-    //     VPrintf(2, "\t\t[FieldArmor] TAG MATCH A=%p SZ=%u, EXP_T=%u\n",
-    //             (void*)(p + i), 1, exp);
-    //     i++;
-    //     prevT = getT(*curr_memtag);
-    //     if (inc == 1) {
-    //       inc = 0;
-
-    //       VPrintf(
-    //           2, "\t\t[FieldArmor] Clearing INC flag, expecting field idx
-    //           %u\n", idx);
-    //     }
-    //     continue;
-    //   } else {
-    //     // if IDX is 1 we are looking for the first field. If INC is one,
-    //     this
-    //     // is for sure a random access.
-    //     if (idx == 1 && inc == 1)
-    //       VPrintf(1,
-    //               "\033[1;31m[FieldArmor] random access detected. This case "
-    //               "should be handled in instrumentation untagging "
-    //               "pointer?.\033[0m");
-    //     else {
-    //       if (inc == 1) {
-    //         tries++;
-    //         if (tries > THRESHOLD || (prevT + 1) % 16 !=
-    //         (getT(*curr_memtag))) {
-    //           /** OVERFLOW DETECTED only if level mismatch**/
-    //           if (getL(*curr_memtag) <=
-    //               L) {  // NOTE: This is an ugly approximation
-    //             VPrintf(0,
-    //                     "OVERFLOW, exp=%x, idx=%u curr_memtag=%u cur L=%u,
-    //                     tag " "L=%u\n", exp, idx, *curr_memtag,
-    //                     getL(*curr_memtag), L);
-    //             SigTrap<EA, AT>(p, sz);
-    //             if (EA == ErrorAction::Abort)
-    //               __builtin_unreachable();
-    //           } else {  // L , curL
-    //             VPrintf(2,
-    //                     "\t\t[FieldArmor] cur L %u is MORE than L %u, "
-    //                     "continuing\n",
-    //                     getL(*curr_memtag), L);
-    //             // THIS CASE MUST BE FIXED -> IDEAL FIX: apply masking
-    //             // fix1: instrument memset, split into many memset
-    //             // problem: custom memset
-    //           }
-    //         }
-    //       }
-
-    //       idx = (idx + 1) % 16;  // TODO: also enforce this in
-    //       instrumentation inc = 1; exp = (T + idx) % 16; VPrintf(2,
-    //               "\t\t[FieldArmor] Advancing to next field, idx=%u "
-    //               "curr_memtag=%u, "
-    //               "former exp=%u, tries=%d\n",
-    //               idx, *curr_memtag, exp, tries);
-
-    //     }  // idx != 1 || inc = 0
-
-    //   }  // tag mismatch
-    // }
-
+    // TODO
   } else {  // R == 0
     // VPrintf(1, "\t[FieldArmor] NO RP CHK A=%p SZ=%u\n", (void*)p, sz);
 
     for (uptr i = 0; i < sz; i++) {
       mem_tag = *(tag_t*)MemToShadow((uptr)untagged_ptr + i);
-      // NOTE: memtag can become 0 at some point if a) going out of bounds on the current object b) flexible array member. We tolerate a), but have to be lenient on b)
+      // NOTE: memtag can become 0 at some point if a) going out of bounds on
+      // the current object b) flexible array member. We tolerate a), but have
+      // to be lenient on b)
 
       // TODO: un-ignore levels!!!!
       if ((getT(mem_tag)) != getT(ptr_tag) && mem_tag != 0) {

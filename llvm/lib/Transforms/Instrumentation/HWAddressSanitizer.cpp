@@ -347,6 +347,10 @@ private:
 
   void InstrumentGEP(GetElementPtrInst *GEPI);
   void PreprocessGEP(GetElementPtrInst *GEPI);
+  void TagAllocChunksBeforeUse(CallInst *CI,
+                               const std::string &DemangledName); // FieldArmor
+  Value *GetArraySize(CallInst *CI, StructType *t,
+                      IRBuilder<> &IRB); // FieldArmor
   void handleGEP2operands(GetElementPtrInst *GEPI);
   void InstrumentCMP(CmpInst *CI);
   void InstrumentPtrToInt(PtrToIntInst *PI);
@@ -1323,7 +1327,7 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
   else if (VectorType *VT = dyn_cast<VectorType>(AI->getAllocatedType())) {
     errs() << "[FieldArmor] WARNING: Alloca of VectorType for RLT not yet "
               "supported: "
-           << *(AI->getAllocatedType()) << "\n";
+           << *(VT) << "\n";
   } // VectorType
 
   else if (ArrayType *AT = dyn_cast<ArrayType>(AI->getAllocatedType())) {
@@ -1349,7 +1353,7 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
         GetElementPtrInst *i_th_array = cast<GetElementPtrInst>(ElementPtr);
         ArrayType *innerArrayType = cast<ArrayType>(elementType);
         auto int_n = innerArrayType->getNumElements();
-        for (int el_int = 0; el_int < int_n; el_int++) {
+        for (uint64_t el_int = 0; el_int < int_n; el_int++) {
           auto *innerElementPtr =
               IRB.CreateGEP(innerArrayType->getElementType(), i_th_array,
                             {ConstantInt::get(Int64Ty, el_int)});
@@ -1731,7 +1735,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   SmallVector<BinaryOperator *, 40> ArithInstructions;
   SmallVector<PtrToIntInst *, 40> PointerToIntInstructions;
   SmallVector<ConstantExpr *, 40> ConstGEPsToInstrument;
-  SmallVector<CallInst *, 40> CallsToInstrument;
+  SmallVector<std::pair<CallInst *, std::string>, 40> CallsToAllocator;
   // FieldArmor
 
   const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
@@ -1766,30 +1770,24 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     // TODO: compiler can decide to statically fold some arithmetics to wrong
     // result -> InstCombiner does this, replacing the wrong value
 
-    // if (PtrToIntInst *PTII = dyn_cast<PtrToIntInst>(&Inst)) {
-    //   PointerToIntInstructions.push_back(PTII);
-    // }
-
-    // if (BinaryOperator *BO = dyn_cast<BinaryOperator>(&Inst)) {
-    //   ArithInstructions.push_back(BO);
-    // }
-    // if (CallInst *CI = dyn_cast<CallInst>(&Inst)) {
-    //   Function *Callee = CI->getCalledFunction();
-    //   if (!Callee)
-    //     continue;
-    //   auto demangledName = demangle(Callee->getName().str());
-    //   if (demangledName.find("std::") == 0) { // starts with std::
-    //     CallsToInstrument.push_back(CI);
-    //   }
-    // }
+    if (CallInst *CI = dyn_cast<CallInst>(&Inst)) {
+      Function *Callee = CI->getCalledFunction();
+      if (!Callee)
+        continue;
+      std::string demangledName = demangle(Callee->getName().str());
+      if (demangledName == "malloc" || demangledName == "realloc" ||
+          demangledName == "calloc" || demangledName == "reallocarray" ||
+          demangledName == "memalign" || demangledName == "aligned_alloc" ||
+          demangledName == "posix_memalign" || demangledName == "valloc" ||
+          demangledName == "pvalloc") {
+        CallsToAllocator.push_back(std::make_pair(CI, demangledName));
+      }
+    }
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(&Inst)) {
       if (CE->getOpcode() == Instruction::GetElementPtr) {
         ConstGEPsToInstrument.push_back(CE);
       }
     }
-    // TODO: introduce logic for figuring out the first GEP in a chain on a
-    // potentially dynamically allocated chunk. Then, introduce ad hoc routine
-    // to insert calls to tagging function. Finally, instrument GEPs as usual.
   }
 
   memtag::StackInfo &SInfo = SIB.get();
@@ -1820,8 +1818,12 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   //                  !SInfo.AllocasToInstrument.empty());
 
   // HEAP
-  for (auto &GEPI : GEPsToInstrument) {
-    PreprocessGEP(GEPI);
+  // NOTE: this approach introduces FPs in CMA benchmarks
+  // for (auto &GEPI : GEPsToInstrument) {
+  //   PreprocessGEP(GEPI);
+  // }
+  for (auto &PAIR : CallsToAllocator) {
+    TagAllocChunksBeforeUse(PAIR.first, PAIR.second);
   }
 
   if (!SInfo.AllocasToInstrument.empty()) {
@@ -1888,7 +1890,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   //   InstrumentPtrToInt(PI);
   // }
 
-  // for (auto &CI : CallsToInstrument) {
+  // for (auto &CI : CallsToAllocator) {
   //   InstrumentCall(CI);
   // }
   // NOTE: this might not be necessary.
@@ -1938,6 +1940,186 @@ void dumpGEPDebug(GetElementPtrInst *GEPI) {
   errs() << "\n _______________________________\n";
 }
 
+Value *HWAddressSanitizer::GetArraySize(CallInst *CI, StructType *t,
+                                        IRBuilder<> &IRB) {
+  std::string demangledName =
+      CI->getCalledFunction()
+          ? demangle(CI->getCalledFunction()->getName().str())
+          : "";
+  if (demangledName == "") {
+    errs()
+        << "[FieldArmor] WARNING: could not demangle function name for call: "
+        << *CI << "\n";
+    return 0;
+  }
+
+  errs() << "[FieldArmor] SIZE RECON for: " << demangledName << "\n";
+  uint64_t typeSize = M.getDataLayout().getTypeAllocSize(t);
+
+  if (typeSize == 0) {
+    errs() << "[FieldArmor] WARNING: could not get type size for struct: ";
+    t->print(errs());
+    errs() << "SIZED?" << t->isSized() << "\n";
+    return nullptr;
+  }
+
+  Value *TypeSizeValue =
+      ConstantInt::get(Int64Ty, typeSize); // size of the struct type
+
+  if (demangledName == "malloc" || demangledName == "valloc" ||
+      demangledName == "pvalloc") {
+    Value *MallocSizeValue = IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
+    return IRB.CreateUDiv(MallocSizeValue, TypeSizeValue);
+  } else if (demangledName == "calloc") {
+    return IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
+  } else if (demangledName == "realloc") {
+    Value *ReallocSizeValue = IRB.CreateZExt(CI->getArgOperand(1), Int64Ty);
+    return IRB.CreateUDiv(ReallocSizeValue, TypeSizeValue);
+  } else if (demangledName == "reallocarray") {
+    return IRB.CreateZExt(CI->getArgOperand(1), Int64Ty);
+  }
+  // TODO: handle the rest of allocators
+  errs() << "[FieldArmor] WARNING: allocator not handled for size "
+            "reconstruction: "
+         << demangledName << "\n";
+  return nullptr;
+}
+
+/** Analyze uses at allocation site, if a type can be reliably reconstructed,
+ * then tag memory. This almost never works.*/
+void HWAddressSanitizer::TagAllocChunksBeforeUse(
+    CallInst *CI, const std::string &DemangledName) {
+  errs() << "[FieldArmor] ALLOC CALL: " << DemangledName << ", RET: " << *(CI)
+         << "\n";
+
+  std::set<Type *> SeenTypes;
+  auto nUses = CI->getNumUses();
+  if (nUses == 0)
+    return;
+
+  for (auto *U : CI->users()) {
+    if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
+      if (GEP->getOperand(0) != CI)
+        continue;
+      SeenTypes.insert(GEP->getSourceElementType());
+      errs() << "\t GEP User: ";
+      GEP->print(errs());
+      errs() << "\n";
+    } // GEPs
+
+    else if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
+      // this case cannot be handled here.
+      if (SI->getValueOperand() != CI)
+        continue;
+      auto whereToStore = SI->getPointerOperand();
+      auto underlyingObject = getUnderlyingObject(whereToStore);
+
+      errs() << "\t STORE User: ";
+      SI->print(errs());
+      errs() << "\n";
+      errs() << "\t Underlying object of store ptr: ";
+      underlyingObject->print(errs());
+      errs() << "\n";
+
+      if (GlobalVariable *GV = dyn_cast<GlobalVariable>(underlyingObject)) {
+        errs() << "\t\t STORE IN GLOBAL: " << *GV
+               << ". Can't handle here because of type "
+                  "opaqueness.\n";
+        continue;
+      }
+
+      if (GetElementPtrInst *GEP_where_stored =
+              dyn_cast<GetElementPtrInst>(whereToStore)) {
+        errs() << "\t\t STORE IN STRUCT FIELD: cant handle here because we "
+                  "don't know the type of the field. ";
+        GEP_where_stored->print(errs());
+        errs() << "\n";
+        // NOTE: types are opaque! Field type is gonna be "ptr".
+        continue;
+      }
+    } // STOREs
+  } // for each user
+
+  if (SeenTypes.empty())
+    return;
+
+  if (SeenTypes.size() > 1) {
+    std::vector<Type *> TypesToRemove;
+    for (auto *type : SeenTypes) {
+      errs() << "\t Seen Type: ";
+      type->print(errs());
+      errs() << "\n";
+      if (!type->isStructTy())
+        TypesToRemove.push_back(type);
+    }
+    for (auto *type : TypesToRemove) {
+      SeenTypes.erase(type);
+    }
+
+    if (SeenTypes.empty())
+      return;
+
+    if (SeenTypes.size() > 1) {
+      errs() << "[FieldArmor] UNSAFE: Malloc'd pointer used with multiple "
+                "types. Skipping instrumentation.\n";
+      for (auto *type : SeenTypes) {
+        errs() << "\t Type: ";
+        type->print(errs());
+        errs() << "\n";
+      }
+      return;
+    }
+  } // more than 1 type
+
+  if (SeenTypes.empty())
+    return;
+  Type *type = *SeenTypes.begin();
+  if (!type->isStructTy())
+    return;
+
+  errs() << "[FieldArmor] Malloc'd pointer used with type: ";
+  type->print(errs());
+  errs() << "\n";
+
+  IRBuilder<> IRB(CI->getNextNonDebugInstruction());
+  // NOTE: this is safe even if before ICMP null
+  auto srcType = dyn_cast<StructType>(type);
+
+  if (srcType->isLiteral() || srcType->getName().str().find("union.") == 0)
+    return;
+
+  auto tagVector = M.getGlobalVariable(
+      srcType->getStructName().str() + ".fieldarmor.tagvec", true);
+  assert(tagVector && "Tag vector for malloc'd struct type does not exist!");
+
+  FunctionCallee fieldarmor_tag_memory =
+      M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy,
+                            PtrTy, PtrTy, Int64Ty, Int64Ty);
+
+  Value *ArraySizeValue = GetArraySize(CI, srcType, IRB);
+  if (!ArraySizeValue) {
+    errs() << "[FieldArmor] WARNING Allocation size reconstruction did not "
+              "work!\n";
+    CI->print(errs());
+    errs() << " ARG 0: ";
+    CI->getArgOperand(0)->print(errs());
+    errs() << "\n";
+    return;
+  }
+
+  uint64_t typeSize = M.getDataLayout().getTypeAllocSize(srcType);
+  errs() << "[FieldArmor] Tagging malloc'd memory of type "
+         << srcType->getStructName() << " Array size: " << *ArraySizeValue
+         << "\n";
+
+  IRB.CreateCall(fieldarmor_tag_memory,
+                 {IRB.CreatePointerCast(CI, PtrTy),
+                  IRB.CreatePointerCast(tagVector, PtrTy),
+                  ConstantInt::get(Int64Ty, typeSize), ArraySizeValue});
+
+  SeenTypes.clear();
+} // TagAllocChunksBeforeUse
+
 void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   // auto GEPResultType = GEPI->getResultElementType();
   // TODO: look into this. How's vector implemented?
@@ -1967,19 +2149,22 @@ void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   }
 }
 
-// void HWAddressSanitizer::PreprocessStore(StoreInst *SI) {
-//   // you some ptr into another ptr when you dynamically allocate memory
-//   // TODO
-//   Value *PtrOperand = SI->getPointerOperand();
-//   if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(PtrOperand)) {
-
-//   }
-// }
-
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wall"
+#pragma GCC diagnostic ignored "-Wextra"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wconversion"
+#pragma GCC diagnostic ignored "-Wshadow"
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
 void HWAddressSanitizer::PreprocessGEP(GetElementPtrInst *GEPI) {
   // whenever the pointer to an aggregate is retrieved for the first time, I
-  // want to check if it's tagged or not. If not, I tag it. Just tag structs on
-  // first use!!!
+  // want to check if it's tagged or not. If not, I tag it. Just tag structs
+  // on first use!!!
   auto operand0 = GEPI->getOperand(0);
   auto GepSourceType = GEPI->getSourceElementType();
   if (!GepSourceType->isStructTy()) {
@@ -2071,6 +2256,7 @@ void HWAddressSanitizer::PreprocessGEP(GetElementPtrInst *GEPI) {
 
         } else if (LoadInst *LI = dyn_cast<LoadInst>(src)) {
           // NOTE: ideally, only what gets accessed should be tagged
+          return; // DEBUG dont do anything for now!
           auto srcType = dyn_cast<StructType>(GepSourceType);
           if (srcType->isLiteral()) {
             errs() << "[FieldArmor] Skipping literal struct - type "
@@ -2098,7 +2284,8 @@ void HWAddressSanitizer::PreprocessGEP(GetElementPtrInst *GEPI) {
 
           Value *loadedShadowStart = IRB.CreateLoad(Int64Ty, shadowLoadedPtr);
 
-          // Value *cmpout = IRB.CreateCmp(ICmpInst::ICMP_EQ, loadedShadowStart,
+          // Value *cmpout = IRB.CreateCmp(ICmpInst::ICMP_EQ,
+          // loadedShadowStart,
           //                               ConstantInt::get(Int64Ty, 0));
           // cmpout->setName("fsan.tagged_check.load"); // DEBUG
           // // Create blocks for then and else
@@ -2244,7 +2431,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     } // GEP array -> <scalar, array>
 
     else { /** GEP into array of structs */
-      StructType *sonTypeCast = dyn_cast<StructType>(sonType);
+      // StructType *sonTypeCast = dyn_cast<StructType>(sonType);
       // GEP into non-literal struct array
       taggedPointer =
           tagPointer(IRB, GEPI->getType(), untaggedResLong,
@@ -2323,8 +2510,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     bool safe = User != resultLong && !isa<LifetimeIntrinsic>(User);
     // NOTE: don't store tagged pointers that might be used by uninstrumented
     // code Q: can this fail with maps where something is stored with ptr key
-    // and retrieved with tagged/untagged ptr? Q: how much detection power do we
-    // lose, if any?
+    // and retrieved with tagged/untagged ptr? Q: how much detection power do
+    // we lose, if any?
     if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
       if (SI->getValueOperand() == GEPI) {
         safe = false;
@@ -2352,7 +2539,7 @@ void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
   auto op1 = CI->getOperand(0);
   auto cmpType = op1->getType();
   auto op2 = CI->getOperand(1);
-  auto cmpType2 = op2->getType();
+  // auto cmpType2 = op2->getType();
   // auto oneIsNull =
   //     isa<ConstantPointerNull>(op1) || isa<ConstantPointerNull>(op2);
   // if (oneIsNull)
@@ -2371,8 +2558,8 @@ void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
     untaggedPtr1->setName("cmp_op1_untagged");
     untaggedPtr2->setName("cmp_op2_untagged");
 
-    // Mark as volatile to prevent optimization folding --> this is not verified
-    // if (Instruction *I1 = dyn_cast<Instruction>(untaggedPtr1))
+    // Mark as volatile to prevent optimization folding --> this is not
+    // verified if (Instruction *I1 = dyn_cast<Instruction>(untaggedPtr1))
     //   I1->setMetadata(LLVMContext::MD_mem_parallel_loop_access,
     //           MDNode::get(I1->getContext(), {}));
     // if (Instruction *I2 = dyn_cast<Instruction>(untaggedPtr2))
@@ -3135,8 +3322,8 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
       if (sonType->isStructTy()) {
         StructType *ty = dyn_cast<StructType>(sonType);
         errs() << "[FieldArmor - WARNING] Treating as scalar EMBEDDED struct "
-                  "type: "
-               << *ty << "\n";
+                  "field: ";
+        errs() << *ty << "\n";
         errs() << "container " << *Ty << "\n";
         errs() << "is opaque " << (ty->isOpaque() ? "true" : "false") << "\n";
         errs() << "is literal " << (ty->isLiteral() ? "true" : "false") << "\n";

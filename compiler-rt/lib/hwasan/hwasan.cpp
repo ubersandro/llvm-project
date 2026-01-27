@@ -49,6 +49,10 @@ int hwasan_instrumentation_inited = 0;
 bool hwasan_init_is_running;
 
 int hwasan_report_count = 0;
+__sanitizer::atomic_uint64_t checks_on_uninited_shadow;
+__sanitizer::atomic_uint64_t checks_on_untagged_ptr;
+__sanitizer::atomic_uint64_t total_checks;
+__sanitizer::atomic_uint64_t overflows;
 
 uptr kLowShadowStart;
 uptr kLowShadowEnd;
@@ -68,10 +72,14 @@ static void RegisterHwasanFlags(FlagParser* parser, Flags* f) {
 #undef HWASAN_FLAG
 }
 
-
-#undef HWASAN_CONTAINS_UBSAN 
+#undef HWASAN_CONTAINS_UBSAN
 
 static void InitializeFlags() {
+  atomic_store(&checks_on_uninited_shadow, 0, memory_order_relaxed);
+  atomic_store(&checks_on_untagged_ptr, 0, memory_order_relaxed);
+  atomic_store(&total_checks, 0, memory_order_relaxed);
+  atomic_store(&overflows, 0, memory_order_relaxed);
+  
   SetCommonFlagsDefaults();
   {
     CommonFlags cf;
@@ -89,9 +97,9 @@ static void InitializeFlags() {
     cf.handle_sigtrap = kHandleSignalExclusive;
     // For now only tested on Linux and Fuchsia. Other plantforms can be turned
     // on as they become ready.
-    constexpr bool can_detect_leaks =
-        (SANITIZER_LINUX && !SANITIZER_ANDROID) || SANITIZER_FUCHSIA;
-    cf.detect_leaks = cf.detect_leaks && can_detect_leaks;
+    // constexpr bool can_detect_leaks =
+    //     (SANITIZER_LINUX && !SANITIZER_ANDROID) || SANITIZER_FUCHSIA;
+    cf.detect_leaks = false; // cf.detect_leaks && can_detect_leaks;
 
 #if SANITIZER_ANDROID
     // Let platform handle other signals. It is better at reporting them then we
@@ -214,6 +222,14 @@ void UpdateMemoryUsage() {}
 #endif
 
 void HwasanAtExit() {
+  // Printf("FSAN: %llu TOTAL checks\n",
+  //        (unsigned long long)atomic_load(&total_checks, memory_order_relaxed));
+  // Printf("FSAN: %llu checks on uninitialized shadow\n",
+  //        (unsigned long long)atomic_load(&checks_on_uninited_shadow,
+  //                                        memory_order_relaxed));
+  // Printf("FSAN: %llu checks on untagged pointers\n",
+  //        (unsigned long long)atomic_load(&checks_on_untagged_ptr,
+  //                                        memory_order_relaxed));  
   if (common_flags()->print_module_map)
     DumpProcessMap();
   if (flags()->print_stats && (flags()->atexit || hwasan_report_count > 0))
@@ -272,13 +288,17 @@ Thread* GetCurrentThread() {
 
 // TODO: consider refactoring
 SANITIZER_INTERFACE_ATTRIBUTE
-uptr fieldarmor_tag_memory(void *ptr, uptr tags, uptr size) {
+uptr fieldarmor_tag_memory(void* ptr, uptr tags, uptr size) {
+  if (!ptr)
+    return (uptr)ptr;
+  if (size == 0)
+    return (uptr)ptr;
   // TODO: make sure pointer is untagged
-  if(!tags){
+  if (!tags) {
     // untag memory, i.e. tag it with 0s
     VPrintf(2, "[FieldArmor] untagging memory %p of size %zu\n", ptr, size);
-    // TODO 
-    return TagMemory_mod((uptr)ptr, size, 0, 1); 
+    // TODO
+    return TagMemory_mod((uptr)ptr, size, 0, 1);
     // return (uptr) UntagPtr(ptr);
   }
   ptr = UntagPtr(ptr);
@@ -304,9 +324,9 @@ void __sanitizer::BufferedStackTrace::UnwindImpl(uptr pc, uptr bp,
          request_fast);
 }
 
-
 static bool InitializeSingleGlobal(const hwasan_global& global) {
-  TagMemory_mod(global.addr(), global.size(), global.tag_vector(), global.get_array_size());
+  TagMemory_mod(global.addr(), global.size(), global.tag_vector(),
+                global.get_array_size());
   return true;
 }
 
@@ -314,7 +334,9 @@ static void InitLoadedGlobals() {
   dl_iterate_phdr(  // iterate on all the shared objects loaded at this point
       [](dl_phdr_info* info, size_t /* size */,
          void* /* data */) -> int {  // callback for each loaded shared object
-        for (const hwasan_global& global : HwasanGlobalsFor( // TODO: fix navigation -> somethnig is adding an offset
+        for (const hwasan_global& global :
+             HwasanGlobalsFor(  // TODO: fix navigation -> somethnig is adding
+                                // an offset
                  info->dlpi_addr, info->dlpi_phdr, info->dlpi_phnum))
           InitializeSingleGlobal(global);
         return 0;
@@ -678,7 +700,8 @@ void __hwasan_store16_match_all_noabort(uptr p, u8 match_all_tag) {
     CheckAddress<ErrorAction::Recover, AccessType::Store, 4>(p);
 }
 
-// NOTE: this exists because I'm inlining tagging logic. This can go in the future.
+// NOTE: this exists because I'm inlining tagging logic. This can go in the
+// future.
 void __hwasan_tag_memory(uptr p, u8 tag, uptr sz, uptr type_descriptor) {
   VPrintf(2,
           "[FieldArmor] Tagging memory %p of size %zu with tag %02x (type "

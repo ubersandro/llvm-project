@@ -123,6 +123,10 @@ namespace __hwasan {
 extern int hwasan_inited;
 extern bool hwasan_init_is_running;
 extern int hwasan_report_count;
+extern __sanitizer::atomic_uint64_t checks_on_uninited_shadow; 
+extern __sanitizer::atomic_uint64_t checks_on_untagged_ptr; 
+extern __sanitizer::atomic_uint64_t total_checks; 
+extern __sanitizer::atomic_uint64_t overflows;
 
 bool InitShadow();
 void InitializeOsSupport();
