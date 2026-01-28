@@ -534,6 +534,7 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
     return PreservedAnalyses::all();
   const StackSafetyGlobalInfo *SSI = nullptr;
   const Triple &TargetTriple = M.getTargetTriple();
+  // TODO: investigate this, what if it removes UB?
   if (shouldUseStackSafetyAnalysis(TargetTriple, Options.DisableOptimization))
     SSI = &MAM.getResult<StackSafetyGlobalAnalysis>(M);
 
@@ -910,11 +911,11 @@ bool HWAddressSanitizer::ignoreAccessWithoutRemark(Instruction *Inst,
       return true;
   }
 
-  if (isa<GlobalVariable>(getUnderlyingObject(Ptr))) {
-    if (!InstrumentGlobals)
-      return true;
+  // if (isa<GlobalVariable>(getUnderlyingObject(Ptr))) {
+  //   if (!InstrumentGlobals)
+  //     return true;
     // TODO: Optimize inbound global accesses, like Asan `instrumentMop`.
-  }
+  // }
 
   return false;
 }
@@ -1756,7 +1757,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     /* NOTE: ideally, one wants to instrument memcpy/memmove/memset only when
      * they operate on non-root pointers*/
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
-      if (!ignoreMemIntrinsic(ORE, MI))
+      // if (!ignoreMemIntrinsic(ORE, MI))
         IntrinToInstrument.push_back(MI);
 
     if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(&Inst)) {
@@ -1822,6 +1823,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   // for (auto &GEPI : GEPsToInstrument) {
   //   PreprocessGEP(GEPI);
   // }
+  // TODO: TypeCopilot analysis here!
   for (auto &PAIR : CallsToAllocator) {
     TagAllocChunksBeforeUse(PAIR.first, PAIR.second);
   }
@@ -2026,6 +2028,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
                << ". Can't handle here because of type "
                   "opaqueness.\n";
         continue;
+        // TODO: query TypeCopilot analysis in this case
       }
 
       if (GetElementPtrInst *GEP_where_stored =
@@ -2036,6 +2039,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
         errs() << "\n";
         // NOTE: types are opaque! Field type is gonna be "ptr".
         continue;
+        // TODO: query TypeCopilot analysis in this case
       }
     } // STOREs
   } // for each user
