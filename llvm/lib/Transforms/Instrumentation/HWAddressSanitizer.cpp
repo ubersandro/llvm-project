@@ -26,6 +26,7 @@
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/StackSafetyAnalysis.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/TypeCopilot.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/BinaryFormat/ELF.h"
@@ -308,13 +309,16 @@ bool shouldUseStackSafetyAnalysis(const Triple &TargetTriple,
 class HWAddressSanitizer {
 public:
   HWAddressSanitizer(Module &M, bool CompileKernel, bool Recover,
-                     const StackSafetyGlobalInfo *SSI)
-      : M(M), SSI(SSI) {
+                     const StackSafetyGlobalInfo *SSI,
+                     const TypeCopilotResult *RetrievedTypes)
+      : M(M), SSI(SSI), RetrievedTypes(RetrievedTypes) {
     this->Recover = optOr(ClRecover, Recover);
     this->CompileKernel =
         optOr(ClEnableKhwasan, CompileKernel); // TODO: remove later
 
     initializeModule(); // globals are initialized in here at some point.
+    // TODO: introduce new analysis for heap, I need to be able to run it from
+    // whatever LLVM pass at whatever point of the optimization pipeline
   }
 
   void sanitizeFunction(Function &F, FunctionAnalysisManager &FAM);
@@ -347,6 +351,7 @@ private:
 
   void InstrumentGEP(GetElementPtrInst *GEPI);
   void PreprocessGEP(GetElementPtrInst *GEPI);
+  void InstrumentStoreOfFunctionArg(StoreInst *SI);
   void TagAllocChunksBeforeUse(CallInst *CI,
                                const std::string &DemangledName); // FieldArmor
   Value *GetArraySize(CallInst *CI, StructType *t,
@@ -436,6 +441,7 @@ private:
   LLVMContext *C;
   Module &M;
   const StackSafetyGlobalInfo *SSI;
+  const TypeCopilotResult *RetrievedTypes;
   Triple TargetTriple;
 
   /// This struct defines the shadow mapping using the rule:
@@ -533,12 +539,18 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
   if (checkIfAlreadyInstrumented(M, "nosanitize_hwaddress"))
     return PreservedAnalyses::all();
   const StackSafetyGlobalInfo *SSI = nullptr;
+  const TypeCopilotResult *RetrievedTypes = nullptr;
+  MAM.registerPass([&] {
+    return TypeReconstructionAnalysis();
+  }); // TODO: this does not go here!
+  RetrievedTypes = &MAM.getResult<TypeReconstructionAnalysis>(M);
   const Triple &TargetTriple = M.getTargetTriple();
-  // TODO: investigate this, what if it removes UB?
+  // TODO: investigate this, what if it hides UB?
   if (shouldUseStackSafetyAnalysis(TargetTriple, Options.DisableOptimization))
     SSI = &MAM.getResult<StackSafetyGlobalAnalysis>(M);
 
-  HWAddressSanitizer HWASan(M, Options.CompileKernel, Options.Recover, SSI);
+  HWAddressSanitizer HWASan(M, Options.CompileKernel, Options.Recover, SSI,
+                            RetrievedTypes);
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
   for (Function &F : M) {
@@ -914,7 +926,7 @@ bool HWAddressSanitizer::ignoreAccessWithoutRemark(Instruction *Inst,
   // if (isa<GlobalVariable>(getUnderlyingObject(Ptr))) {
   //   if (!InstrumentGlobals)
   //     return true;
-    // TODO: Optimize inbound global accesses, like Asan `instrumentMop`.
+  // TODO: Optimize inbound global accesses, like Asan `instrumentMop`.
   // }
 
   return false;
@@ -1733,9 +1745,10 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   // FieldArmor
   SmallVector<GetElementPtrInst *, 40> GEPsToInstrument;
   SmallVector<CmpInst *, 40> CMPsToInstrument;
-  SmallVector<BinaryOperator *, 40> ArithInstructions;
-  SmallVector<PtrToIntInst *, 40> PointerToIntInstructions;
+  // SmallVector<BinaryOperator *, 40> ArithInstructions;
+  // SmallVector<PtrToIntInst *, 40> PointerToIntInstructions;
   SmallVector<ConstantExpr *, 40> ConstGEPsToInstrument;
+  SmallVector<StoreInst *, 40> StoresToInstrument;
   SmallVector<std::pair<CallInst *, std::string>, 40> CallsToAllocator;
   // FieldArmor
 
@@ -1758,7 +1771,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
      * they operate on non-root pointers*/
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
       // if (!ignoreMemIntrinsic(ORE, MI))
-        IntrinToInstrument.push_back(MI);
+      IntrinToInstrument.push_back(MI);
 
     if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(&Inst)) {
       GEPsToInstrument.push_back(GEPI);
@@ -1787,6 +1800,17 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(&Inst)) {
       if (CE->getOpcode() == Instruction::GetElementPtr) {
         ConstGEPsToInstrument.push_back(CE);
+      }
+    }
+    if(StoreInst *SI = dyn_cast<StoreInst>(&Inst)) {
+      Value *ValueOperand = SI->getValueOperand();
+      auto functionArgs = F.args();
+      for (auto &Arg : functionArgs) {
+        if (ValueOperand == &Arg && Arg.getType()->isPointerTy()) {
+          errs() << "[FieldArmor] Instrumenting store of function arg: " << *SI << "\n";
+          StoresToInstrument.push_back(SI);
+          break;
+        }
       }
     }
   }
@@ -1896,7 +1920,10 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   //   InstrumentCall(CI);
   // }
   // NOTE: this might not be necessary.
-
+  // for( auto &SI : StoresToInstrument) {
+  //   InstrumentStoreOfFunctionArg(SI);
+  // }
+  
   // TODO: remove checks on ".untagged" pointers.
   DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
   PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
@@ -1955,7 +1982,7 @@ Value *HWAddressSanitizer::GetArraySize(CallInst *CI, StructType *t,
     return 0;
   }
 
-  errs() << "[FieldArmor] SIZE RECON for: " << demangledName << "\n";
+  // errs() << "[FieldArmor] SIZE RECON for: " << demangledName << "\n";
   uint64_t typeSize = M.getDataLayout().getTypeAllocSize(t);
 
   if (typeSize == 0) {
@@ -1987,85 +2014,192 @@ Value *HWAddressSanitizer::GetArraySize(CallInst *CI, StructType *t,
   return nullptr;
 }
 
+bool augmentSeenTypesFromTypeSet(std::set<Type *> &SeenTypes, const TypeSet *ts,
+                                 LLVMContext &C) {
+  auto before = SeenTypes.size();
+  // auto seenTypesWasEmpty = true;
+  // for( auto &t : SeenTypes){
+  //   seenTypesWasEmpty &= !t->isStructTy();
+  // }
+  // RATIO: if there are no struct types, it's essentially empty!
+
+  for (auto &t : ts->types) {
+    int levelsOfInd = std::count(t.begin(), t.end(), '*');
+
+    errs() << "\t\t T: " << t << " levels of indirection: " << levelsOfInd
+           << "\n";
+    if (levelsOfInd > 2) {
+      errs() << "\t\t [FieldArmor] WARNING: skipping array of pointers: " << t
+             << "\n";
+      // I assume I can tag chunks as their pointers are created and
+      // they are allocated and store here
+      // TODO: this could be a corner case 
+      return false;
+    }
+    bool containsPorcodio = (t.find('%') != std::string::npos);
+    auto subStringSize = t.find_first_of('*') -
+                         (containsPorcodio ? t.find_first_of('%') + 1 : 0);
+    std::string substringWithNoAsterisk = t.substr(
+        containsPorcodio ? t.find_first_of('%') + 1 : 0, subStringSize);
+
+    StructType *ST = StructType::getTypeByName(C, substringWithNoAsterisk);
+    if (!ST) {
+      errs() << "\t\t [FieldArmor] WARNING: could not get StructType "
+                "from name: "
+             << substringWithNoAsterisk << "\n";
+      continue;
+    } else
+      errs() << "\t\t Retrieved StructType from name: " << t
+             << " levels of indirection: " << levelsOfInd << "\n";
+    ST->print(errs());
+    errs() << "\n";
+    SeenTypes.insert(ST);
+  }
+  bool changed = (SeenTypes.size() - before) > 0;
+  if(changed)
+    errs() << "\t\t [FieldArmor] INTERESTING INFO: populated SeenTypes from TypeSet.\n";
+  return changed;
+} // augmentSeenTypesFromTypeSet
+
 /** Analyze uses at allocation site, if a type can be reliably reconstructed,
  * then tag memory. This almost never works.*/
 void HWAddressSanitizer::TagAllocChunksBeforeUse(
     CallInst *CI, const std::string &DemangledName) {
-  errs() << "[FieldArmor] ALLOC CALL: " << DemangledName << ", RET: " << *(CI)
-         << "\n";
+  // TODO: handle xmalloc and xcalloc, these wrappers are simple
+  // TODO: handle ConstExpr GEPs used as pointers in the StoreInsts
+  // TODO: convert TypeSet members to IR types
+  // TODO: debug arrays of pointers, everything is wrong here!!!
 
   std::set<Type *> SeenTypes;
   auto nUses = CI->getNumUses();
   if (nUses == 0)
     return;
+  errs() << "\n[FieldArmor] ALLOC CALL: " << DemangledName << ", RET: " << *(CI)
+         << "\n";
+  bool isArrayOfPointers = false; // TODO
 
   for (auto *U : CI->users()) {
     if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
       if (GEP->getOperand(0) != CI)
         continue;
-      SeenTypes.insert(GEP->getSourceElementType());
-      errs() << "\t GEP User: ";
-      GEP->print(errs());
-      errs() << "\n";
-    } // GEPs
+      Type* tmp = GEP->getSourceElementType();
+      if(tmp->isStructTy()) 
+        SeenTypes.insert(GEP->getSourceElementType());
+    } // GEP USER
 
     else if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-      // this case cannot be handled here.
-      if (SI->getValueOperand() != CI)
+      // process stores OF the malloc'd pointer
+      auto whatIsStored = SI->getValueOperand();
+      if (whatIsStored != CI)
         continue;
       auto whereToStore = SI->getPointerOperand();
       auto underlyingObject = getUnderlyingObject(whereToStore);
 
-      errs() << "\t STORE User: ";
-      SI->print(errs());
-      errs() << "\n";
-      errs() << "\t Underlying object of store ptr: ";
-      underlyingObject->print(errs());
-      errs() << "\n";
+      if (ConstantExpr *CR = dyn_cast<ConstantExpr>(whereToStore)) {
+        // GEPs into GV are CEs
+        if (CR->getOpcode() == Instruction::GetElementPtr) {
+          GlobalVariable *GV = dyn_cast<GlobalVariable>(underlyingObject);
+          if (!GV || !GV->getValueType()->isStructTy())
+            continue;
+          // TODO: reconstruct the type of the field where this is stored!
+          errs() << "\t\t STORE IN CONSTEXPR GEP: " << *CR << "\n";
+          errs() << "\t\t Underlying object of CE GEP: ";
+          underlyingObject->print(errs());
+          auto *GEP = dyn_cast<GEPOperator>(CR);
+          auto *offset = GEP->getOperand(1);
+          auto *ConstOffset = dyn_cast<ConstantInt>(offset);
+          uint64_t IntOffset = ConstOffset->getZExtValue();
 
-      if (GlobalVariable *GV = dyn_cast<GlobalVariable>(underlyingObject)) {
-        errs() << "\t\t STORE IN GLOBAL: " << *GV
-               << ". Can't handle here because of type "
-                  "opaqueness.\n";
+          const DataLayout &DL = M.getDataLayout();
+          StructType *StructTy = dyn_cast<StructType>(GV->getValueType());
+          const StructLayout *SL = DL.getStructLayout(StructTy);
+          unsigned FieldIdx = SL->getElementContainingOffset(IntOffset);
+          errs() << "\n\t\t GEP field index: " << FieldIdx << "\n";
+          // TODO: from idx and struct type, get field type and insert in
+          // SeenTypes
+          continue;
+        }
+      } // STORE in FIELD of GLOBAL via CONSTEXPR GEP
+
+      else if (GlobalVariable *GV =
+                   dyn_cast<GlobalVariable>(underlyingObject)) {
+        errs() << "\t\t STORE IN GLOBAL: " << *GV << "\n";
+        auto F = SI->getFunction();
+        if (!RetrievedTypes) {
+          errs() << "\t\t [FieldArmor] WARNING: RetrievedTypes map is null!\n";
+        } else {
+          const TypeSet *ts = RetrievedTypes->lookup(GV, F);
+          if (ts)
+            augmentSeenTypesFromTypeSet(SeenTypes, ts, *C);
+          else
+            errs() << "\t\t <none>\n";
+        }
+      } // STORE in GLOBAL
+
+      else if (GetElementPtrInst *GEP_where_stored =
+                   dyn_cast<GetElementPtrInst>(whereToStore)) {
+        errs() << "\t\t STORE IN STRUCT FIELD   " << *GEP_where_stored << "\n";
+
+        const TypeSet *ts =
+            RetrievedTypes->lookup(GEP_where_stored, SI->getFunction());
+        if (ts)
+          augmentSeenTypesFromTypeSet(SeenTypes, ts, *C);
+        else
+          errs() << "\t\t ts = <none>\n";
+
+      } // STORE in GEP
+      else if (AllocaInst *AI = dyn_cast<AllocaInst>(underlyingObject)) {
+        errs() << "\t\t STORE IN ALLOCA: TODO " << *AI << "\n";
         continue;
-        // TODO: query TypeCopilot analysis in this case
-      }
-
-      if (GetElementPtrInst *GEP_where_stored =
-              dyn_cast<GetElementPtrInst>(whereToStore)) {
-        errs() << "\t\t STORE IN STRUCT FIELD: cant handle here because we "
-                  "don't know the type of the field. ";
-        GEP_where_stored->print(errs());
+      } // STORE in ALLOCA
+      else if (PHINode *PN = dyn_cast<PHINode>(underlyingObject)) {
+        errs() << "\t\t STORE IN PHI NODE: TODO " << *PN << "\n";
+        continue;
+      } // STORE in PHI
+      else {
+        errs() << "\t\t [FieldArmor] WARNING: STORE in UNKNOWN ptr: ";
+        whereToStore->print(errs());
         errs() << "\n";
-        // NOTE: types are opaque! Field type is gonna be "ptr".
-        continue;
-        // TODO: query TypeCopilot analysis in this case
-      }
-    } // STOREs
+      } // STORE in UNKNOWN ptr
+    } // STORE USER
+
+    else {
+      // TODO these are the funny ones
+      errs() << "\t OTHER USER: ";
+      U->print(errs());
+      errs() << "\n";
+    } // OTHER USER
+
   } // for each user
 
-  if (SeenTypes.empty())
+  if (SeenTypes.empty()){
+    errs() << "[FieldArmor] WARNING: could not reconstruct any type for "
+              "malloc'd pointer. Skipping instrumentation.\n";
     return;
+  } 
 
   if (SeenTypes.size() > 1) {
     std::vector<Type *> TypesToRemove;
     for (auto *type : SeenTypes) {
-      errs() << "\t Seen Type: ";
-      type->print(errs());
-      errs() << "\n";
       if (!type->isStructTy())
         TypesToRemove.push_back(type);
     }
     for (auto *type : TypesToRemove) {
+      errs() << "[FieldArmor] Removing non-struct type from SeenTypes: ";
+      type->print(errs());
+      errs() << "\n";
       SeenTypes.erase(type);
     }
 
-    if (SeenTypes.empty())
+    if (SeenTypes.empty()) {
+      errs() << "[FieldArmor] WARNING: Malloc'd pointer used with no struct "
+                "types. Skipping instrumentation.\n";
       return;
+    }
 
     if (SeenTypes.size() > 1) {
-      errs() << "[FieldArmor] UNSAFE: Malloc'd pointer used with multiple "
-                "types. Skipping instrumentation.\n";
+      errs() << "[FieldArmor] WARNING: Malloc'd pointer used with multiple "
+                "struct types. Skipping instrumentation.\n";
       for (auto *type : SeenTypes) {
         errs() << "\t Type: ";
         type->print(errs());
@@ -2081,7 +2215,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
   if (!type->isStructTy())
     return;
 
-  errs() << "[FieldArmor] Malloc'd pointer used with type: ";
+  errs() << "[FieldArmor] Result of type reconstruction for MALLOC'd pointer: ";
   type->print(errs());
   errs() << "\n";
 
@@ -2114,7 +2248,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
   uint64_t typeSize = M.getDataLayout().getTypeAllocSize(srcType);
   errs() << "[FieldArmor] Tagging malloc'd memory of type "
          << srcType->getStructName() << " Array size: " << *ArraySizeValue
-         << "\n";
+         << "\n\n";
 
   IRB.CreateCall(fieldarmor_tag_memory,
                  {IRB.CreatePointerCast(CI, PtrTy),
@@ -2379,7 +2513,27 @@ void HWAddressSanitizer::PreprocessGEP(GetElementPtrInst *GEPI) {
   }
 }
 
+void HWAddressSanitizer::InstrumentStoreOfFunctionArg(StoreInst *SI) {
+  // storing tagged pointers is not allowed
+  auto valueOperand = SI->getValueOperand();
+  assert(valueOperand && valueOperand->getType()->isPointerTy());
+  IRBuilder<> IRB(SI);
+  auto* type = valueOperand->getType();
+  Value* untaggedPtrLong = untagPointer(IRB, IRB.CreatePointerCast(valueOperand, IntptrTy));
+  Value* untaggedPtr = IRB.CreateIntToPtr(untaggedPtrLong, type);
+  untaggedPtr->setName(valueOperand->hasName() ? 
+                      valueOperand->getName().str() + ".untagged" : "arg.untagged");
+  // SI->setOperand(
+  //     0, untaggedPtr);
+  SI->replaceUsesOfWith(valueOperand, untaggedPtr);
+  errs() << "[FieldArmor] Instrumented STORE of function argument to untag pointer.\n";
+  SI->print(errs());
+  errs() << "\n";
+}
+
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
+  // NOTE: new corner case: pointer passed to a function and function stores it
+  
   // Q: can I tell GEPs on globals/stack apart from heap?
   // Q: what if some global pointer is stored in a stack variable and then
   // GEPed? Do I see a store?
@@ -2458,7 +2612,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
                         ConstantInt::get(IntptrTy, 0x1Lu)),
           ConstantInt::get(IntptrTy, T_Mask)); // modulo 16
-
+      // TODO: remove this add, set the bits, instead
       Value *sonT = IRB.CreateAnd(IRB.CreateAdd(fatherT, sonIdx),
                                   ConstantInt::get(IntptrTy, T_Mask));
       // NOTE: tags might be 0 after this operation. TODO: prevent it from
@@ -3325,19 +3479,22 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
 
       if (sonType->isStructTy()) {
         StructType *ty = dyn_cast<StructType>(sonType);
-        errs() << "[FieldArmor - WARNING] Treating as scalar EMBEDDED struct "
-                  "field: ";
-        errs() << *ty << "\n";
-        errs() << "container " << *Ty << "\n";
-        errs() << "is opaque " << (ty->isOpaque() ? "true" : "false") << "\n";
-        errs() << "is literal " << (ty->isLiteral() ? "true" : "false") << "\n";
-        if (!ty->isLiteral())
-          errs() << "is union "
-                 << ((ty->getName().str().find("union.") == 0) ? "true"
-                                                               : "false")
-                 << "\n";
-        if (!ty->isLiteral())
-          errs() << "struct name " << ty->getName().str() << "\n";
+        // DEBUG
+        // errs() << "[FieldArmor - WARNING] Treating as scalar EMBEDDED struct
+        // "
+        //           "field: ";
+        // errs() << *ty << "\n";
+        // errs() << "container " << *Ty << "\n";
+        // errs() << "is opaque " << (ty->isOpaque() ? "true" : "false") <<
+        // "\n"; errs() << "is literal " << (ty->isLiteral() ? "true" : "false")
+        // << "\n"; if (!ty->isLiteral())
+        //   errs() << "is union "
+        //          << ((ty->getName().str().find("union.") == 0) ? "true"
+        //                                                        : "false")
+        //          << "\n";
+        // if (!ty->isLiteral())
+        //   errs() << "struct name " << ty->getName().str() << "\n";
+        // EDN DEBUG
         memset(&tags[sonOffset], 0x00,
                DL.getTypeAllocSize(sonType)); // treat as NULL scalar field
 
