@@ -354,6 +354,8 @@ private:
   void InstrumentStoreOfFunctionArg(StoreInst *SI);
   void TagAllocChunksBeforeUse(CallInst *CI,
                                const std::string &DemangledName); // FieldArmor
+  void HandleNewOperator(CallInst *CI,
+                         const std::string &DemangledName); // FieldArmor
   Value *GetArraySize(CallInst *CI, StructType *t,
                       IRBuilder<> &IRB); // FieldArmor
   void handleGEP2operands(GetElementPtrInst *GEPI);
@@ -1750,6 +1752,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   SmallVector<ConstantExpr *, 40> ConstGEPsToInstrument;
   SmallVector<StoreInst *, 40> StoresToInstrument;
   SmallVector<std::pair<CallInst *, std::string>, 40> CallsToAllocator;
+  SmallVector<std::pair<CallInst *, std::string>, 40> CallsToConstructor;
   // FieldArmor
 
   const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
@@ -1796,23 +1799,28 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
           demangledName == "pvalloc") {
         CallsToAllocator.push_back(std::make_pair(CI, demangledName));
       }
+
+      else if (demangledName.find("operator new") != std::string::npos) {
+        CallsToConstructor.push_back(std::make_pair(CI, demangledName));
+      }
     }
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(&Inst)) {
       if (CE->getOpcode() == Instruction::GetElementPtr) {
         ConstGEPsToInstrument.push_back(CE);
       }
     }
-    if(StoreInst *SI = dyn_cast<StoreInst>(&Inst)) {
-      Value *ValueOperand = SI->getValueOperand();
-      auto functionArgs = F.args();
-      for (auto &Arg : functionArgs) {
-        if (ValueOperand == &Arg && Arg.getType()->isPointerTy()) {
-          errs() << "[FieldArmor] Instrumenting store of function arg: " << *SI << "\n";
-          StoresToInstrument.push_back(SI);
-          break;
-        }
-      }
-    }
+    // TODO: mark them at call site and then instrument them at the single
+    // function level. This is tricky because it caused some crashes in php.
+    // if(StoreInst *SI = dyn_cast<StoreInst>(&Inst)) {
+    //   Value *ValueOperand = SI->getValueOperand();
+    //   auto functionArgs = F.args();
+    //   for (auto &Arg : functionArgs) {
+    //     if (ValueOperand == &Arg && Arg.getType()->isPointerTy()) {
+    //       errs() << "[FieldArmor] Instrumenting store of function arg: " <<
+    //       *SI << "\n"; StoresToInstrument.push_back(SI); break;
+    //     }
+    //   }
+    // }
   }
 
   memtag::StackInfo &SInfo = SIB.get();
@@ -1850,6 +1858,9 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   // TODO: TypeCopilot analysis here!
   for (auto &PAIR : CallsToAllocator) {
     TagAllocChunksBeforeUse(PAIR.first, PAIR.second);
+  }
+  for (auto &PAIR : CallsToConstructor) {
+    HandleNewOperator(PAIR.first, PAIR.second);
   }
 
   if (!SInfo.AllocasToInstrument.empty()) {
@@ -1923,7 +1934,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   // for( auto &SI : StoresToInstrument) {
   //   InstrumentStoreOfFunctionArg(SI);
   // }
-  
+
   // TODO: remove checks on ".untagged" pointers.
   DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
   PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
@@ -2013,9 +2024,30 @@ Value *HWAddressSanitizer::GetArraySize(CallInst *CI, StructType *t,
          << demangledName << "\n";
   return nullptr;
 }
+Type *fromString(std::string S, LLVMContext &C) {
+  // TODO: complete
+  if (S == "i1")
+    return Type::getInt1Ty(C);
+  if (S == "i8" || S == "i8*")
+    return Type::getInt8Ty(C);
+  if (S == "i16" || S == "i16*")
+    return Type::getInt16Ty(C);
+  if (S == "i32" || S == "i32*")
+    return Type::getInt32Ty(C);
+  if (S == "i64" || S == "i64*")
+    return Type::getInt64Ty(C);
+  if (S == "float" || S == "float*")
+    return Type::getFloatTy(C);
+  if (S == "double" || S == "double*")
+    return Type::getDoubleTy(C);
+  if (S == "void" || S == "void*")
+    return Type::getVoidTy(C);
+  return nullptr;
+}
 
 bool augmentSeenTypesFromTypeSet(std::set<Type *> &SeenTypes, const TypeSet *ts,
-                                 LLVMContext &C) {
+                                 LLVMContext &C,
+                                 std::set<Type *> &allTypesNoFilters) {
   auto before = SeenTypes.size();
   // auto seenTypesWasEmpty = true;
   // for( auto &t : SeenTypes){
@@ -2026,27 +2058,47 @@ bool augmentSeenTypesFromTypeSet(std::set<Type *> &SeenTypes, const TypeSet *ts,
   for (auto &t : ts->types) {
     int levelsOfInd = std::count(t.begin(), t.end(), '*');
 
-    errs() << "\t\t T: " << t << " levels of indirection: " << levelsOfInd
-           << "\n";
     if (levelsOfInd > 2) {
       errs() << "\t\t [FieldArmor] WARNING: skipping array of pointers: " << t
              << "\n";
       // I assume I can tag chunks as their pointers are created and
       // they are allocated and store here
-      // TODO: this could be a corner case 
+      // TODO: this could be a corner case
+      Type *tmp = fromString(t, C);
+      if (tmp)
+        allTypesNoFilters.insert(tmp);
       return false;
     }
     bool containsPorcodio = (t.find('%') != std::string::npos);
     auto subStringSize = t.find_first_of('*') -
                          (containsPorcodio ? t.find_first_of('%') + 1 : 0);
+    // note: this could contain the name "union"
     std::string substringWithNoAsterisk = t.substr(
         containsPorcodio ? t.find_first_of('%') + 1 : 0, subStringSize);
 
     StructType *ST = StructType::getTypeByName(C, substringWithNoAsterisk);
     if (!ST) {
+
+      // try again, maybe it's a union
+      std::string maybeUnionName = substringWithNoAsterisk;
+      std::replace(maybeUnionName.begin(), maybeUnionName.end(), ' ', '.');
+
+      ST = StructType::getTypeByName(C, maybeUnionName);
+      if (ST) {
+        errs() << "\t\t Retrieved StructType (union?) from name: " << t
+               << " levels of indirection: " << levelsOfInd << "\n";
+        ST->print(errs());
+        errs() << "\n";
+        SeenTypes.insert(ST);
+        allTypesNoFilters.insert(ST);
+        continue;
+      }
       errs() << "\t\t [FieldArmor] WARNING: could not get StructType "
                 "from name: "
              << substringWithNoAsterisk << "\n";
+      Type *tmp = fromString(t, C);
+      if (tmp)
+        allTypesNoFilters.insert(tmp);
       continue;
     } else
       errs() << "\t\t Retrieved StructType from name: " << t
@@ -2054,10 +2106,12 @@ bool augmentSeenTypesFromTypeSet(std::set<Type *> &SeenTypes, const TypeSet *ts,
     ST->print(errs());
     errs() << "\n";
     SeenTypes.insert(ST);
+    allTypesNoFilters.insert(ST);
   }
   bool changed = (SeenTypes.size() - before) > 0;
-  if(changed)
-    errs() << "\t\t [FieldArmor] INTERESTING INFO: populated SeenTypes from TypeSet.\n";
+  if (changed)
+    errs() << "\t\t [FieldArmor] INTERESTING INFO: populated SeenTypes from "
+              "TypeSet.\n";
   return changed;
 } // augmentSeenTypesFromTypeSet
 
@@ -2069,22 +2123,41 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
   // TODO: handle ConstExpr GEPs used as pointers in the StoreInsts
   // TODO: convert TypeSet members to IR types
   // TODO: debug arrays of pointers, everything is wrong here!!!
-
+  std::set<Type *>
+      allTypesNoFilters; // store ALL found type here for statistics
   std::set<Type *> SeenTypes;
   auto nUses = CI->getNumUses();
-  if (nUses == 0)
+  if (nUses == 0) {
+    errs() << "[FieldArmor] CORNER CASE: malloc/realloc/calloc return value "
+              "not used: "
+           << *CI << "\n";
     return;
-  errs() << "\n[FieldArmor] ALLOC CALL: " << DemangledName << ", RET: " << *(CI)
-         << "\n";
-  bool isArrayOfPointers = false; // TODO
+  }
+
+  errs() << "\n[FieldArmor] ALLOC SITE: " << DemangledName
+         << "\n\tRET: " << *(CI)
+         << "\n\tFUNCTION: " << CI->getFunction()->getName() << "\n";
+  if (const DebugLoc &DL = CI->getDebugLoc()) {
+    if (DILocation *Loc = DL.get()) {
+      StringRef File = Loc->getFilename();
+      StringRef Dir = Loc->getDirectory();
+      unsigned Line = Loc->getLine();
+      unsigned Col = Loc->getColumn();
+      errs() << "\tLOCATION: " << Dir << "/" << File << ":" << Line << ":"
+             << Col << "\n";
+    }
+  } else
+    errs() << "\tLOCATION: <unknown>\n";
 
   for (auto *U : CI->users()) {
     if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
       if (GEP->getOperand(0) != CI)
         continue;
-      Type* tmp = GEP->getSourceElementType();
-      if(tmp->isStructTy()) 
+      Type *tmp = GEP->getSourceElementType();
+      if (tmp->isStructTy())
         SeenTypes.insert(GEP->getSourceElementType());
+
+      allTypesNoFilters.insert(GEP->getSourceElementType()); // insert anyways
     } // GEP USER
 
     else if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
@@ -2101,7 +2174,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
           GlobalVariable *GV = dyn_cast<GlobalVariable>(underlyingObject);
           if (!GV || !GV->getValueType()->isStructTy())
             continue;
-          // TODO: reconstruct the type of the field where this is stored!
+
           errs() << "\t\t STORE IN CONSTEXPR GEP: " << *CR << "\n";
           errs() << "\t\t Underlying object of CE GEP: ";
           underlyingObject->print(errs());
@@ -2115,9 +2188,39 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
           const StructLayout *SL = DL.getStructLayout(StructTy);
           unsigned FieldIdx = SL->getElementContainingOffset(IntOffset);
           errs() << "\n\t\t GEP field index: " << FieldIdx << "\n";
-          // TODO: from idx and struct type, get field type and insert in
-          // SeenTypes
-          continue;
+          std::string field =
+              RetrievedTypes->helper->getDIStructField(StructTy, FieldIdx);
+          bool containsPorcodio = false;
+          // errs() << "\t\t DBG DBG DBG Field name: " << field << "\n";
+          if (field == "") {
+            continue;
+          } else {
+            containsPorcodio = (field.find("%") != std::string::npos);
+          }
+          auto subStringSize =
+              field.find_first_of('*') -
+              (containsPorcodio ? field.find_first_of('%') + 1 : 0);
+          std::string clean_name =
+              field.substr(containsPorcodio ? field.find_first_of('%') + 1 : 0,
+                           subStringSize);
+
+          StructType *FieldType = StructType::getTypeByName(*C, clean_name);
+          if (FieldType) {
+            SeenTypes.insert(FieldType);
+            errs() << "\t\t Retrieved StructType from field name: " << field
+                   << "\n";
+            FieldType->print(errs());
+            errs() << "\n";
+          } else
+            errs() << "\t\t [FieldArmor] WARNING: could not get StructType "
+                      "from field name:"
+                   << clean_name << "\n";
+
+          // STATISTICS
+          Type *tmp = fromString(clean_name, *C);
+          if (tmp)
+            allTypesNoFilters.insert(tmp);
+          // STATISTICS
         }
       } // STORE in FIELD of GLOBAL via CONSTEXPR GEP
 
@@ -2125,15 +2228,12 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
                    dyn_cast<GlobalVariable>(underlyingObject)) {
         errs() << "\t\t STORE IN GLOBAL: " << *GV << "\n";
         auto F = SI->getFunction();
-        if (!RetrievedTypes) {
-          errs() << "\t\t [FieldArmor] WARNING: RetrievedTypes map is null!\n";
-        } else {
-          const TypeSet *ts = RetrievedTypes->lookup(GV, F);
-          if (ts)
-            augmentSeenTypesFromTypeSet(SeenTypes, ts, *C);
-          else
-            errs() << "\t\t <none>\n";
-        }
+        const TypeSet *ts = RetrievedTypes->lookup(GV, F);
+        if (ts)
+          augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
+        else
+          errs() << "\t\t <none> - TypeCopilot FAIL\n";
+
       } // STORE in GLOBAL
 
       else if (GetElementPtrInst *GEP_where_stored =
@@ -2143,9 +2243,9 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
         const TypeSet *ts =
             RetrievedTypes->lookup(GEP_where_stored, SI->getFunction());
         if (ts)
-          augmentSeenTypesFromTypeSet(SeenTypes, ts, *C);
+          augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
         else
-          errs() << "\t\t ts = <none>\n";
+          errs() << "\t\t ts = <none> - TypeCopilot FAIL\n";
 
       } // STORE in GEP
       else if (AllocaInst *AI = dyn_cast<AllocaInst>(underlyingObject)) {
@@ -2157,26 +2257,95 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
         continue;
       } // STORE in PHI
       else {
-        errs() << "\t\t [FieldArmor] WARNING: STORE in UNKNOWN ptr: ";
+        errs() << "\t\t [FieldArmor] WARNING: STORE in UNKNOWN ptr TODO: ";
         whereToStore->print(errs());
         errs() << "\n";
       } // STORE in UNKNOWN ptr
     } // STORE USER
 
+    else if (CallInst *CII = dyn_cast<CallInst>(U)) {
+
+      Type *typeOfArg = nullptr;
+      Function *Callee = CII->getCalledFunction();
+      if (!Callee) {
+        // NOTE: I think we can't do anything in this case
+        errs() << "\t\t CALL USER INDIRECT CALL: ";
+        CII->print(errs());
+        errs() << "\n";
+        continue;
+      }
+
+      if (Callee->getName().find("llvm.memcpy") != std::string::npos ||
+          Callee->getName().find("llvm.memmove") != std::string::npos ||
+          Callee->getName().find("llvm.memset") != std::string::npos ||
+          Callee->getName().find("memcpy") != std::string::npos ||
+          Callee->getName().find("memmove") != std::string::npos ||
+          Callee->getName().find("memset") != std::string::npos ||
+          Callee->getName().find("free") != std::string::npos ||
+          Callee->getName().find("printf") != std::string::npos) {
+        // these functions dont tell me anything
+        // skip memcpy/memmove calls
+        continue;
+      }
+      errs() << "\t CALL USER: ";
+      CII->print(errs());
+      errs() << "\n";
+
+      int idx = -1;
+
+      for (unsigned i = 0; i < Callee->arg_size(); i++) {
+        if (CII->getArgOperand(i) == CI) {
+          idx = i;
+        } // if
+      } // for
+
+      if (idx == -1) {
+        errs() << "\t\t CALL USER but could not find arg matching malloc BUG "
+                  "BUG BUG "
+                  "return value: ";
+        CII->print(errs());
+        errs() << "\n";
+        continue;
+      }
+
+      const TypeSet *ts = RetrievedTypes->lookup(Callee->getArg(idx), Callee);
+
+      if (ts) {
+        errs() << "\t\t TypeSet from CALL ARG TYPE: ";
+        for (auto &t : ts->types) {
+          errs() << t << " ";
+        }
+        errs() << "\n";
+      }
+
+      else {
+        errs() << "\t\t ts = <none> - TypeCopilot FAIL\n";
+        continue;
+      }
+      augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
+    }
+
     else {
-      // TODO these are the funny ones
-      errs() << "\t OTHER USER: ";
+      errs() << "\t\t OTHER USER: ";
       U->print(errs());
       errs() << "\n";
     } // OTHER USER
 
   } // for each user
 
-  if (SeenTypes.empty()){
-    errs() << "[FieldArmor] WARNING: could not reconstruct any type for "
-              "malloc'd pointer. Skipping instrumentation.\n";
+  if (SeenTypes.empty()) {
+    if (!allTypesNoFilters.empty()) {
+      errs() << "[FieldArmor]\tTYPE RECON: UNINTERESTING: \n";
+      for (auto *type : allTypesNoFilters) {
+        errs() << "\t Type: ";
+        type->print(errs());
+        errs() << "\n";
+      }
+    } else
+      errs() << "[FieldArmor]\tTYPE RECON: no types found at all. Bailing "
+                "out.\n";
     return;
-  } 
+  }
 
   if (SeenTypes.size() > 1) {
     std::vector<Type *> TypesToRemove;
@@ -2185,21 +2354,21 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
         TypesToRemove.push_back(type);
     }
     for (auto *type : TypesToRemove) {
-      errs() << "[FieldArmor] Removing non-struct type from SeenTypes: ";
+      errs() << "[FieldArmor]\tRemoving non-struct type from SeenTypes: ";
       type->print(errs());
       errs() << "\n";
       SeenTypes.erase(type);
     }
 
     if (SeenTypes.empty()) {
-      errs() << "[FieldArmor] WARNING: Malloc'd pointer used with no struct "
-                "types. Skipping instrumentation.\n";
+      errs() << "[FieldArmor]\tTYPE RECON FAIL: NO STRUCT TYPE FOUND. \n";
       return;
     }
 
     if (SeenTypes.size() > 1) {
-      errs() << "[FieldArmor] WARNING: Malloc'd pointer used with multiple "
-                "struct types. Skipping instrumentation.\n";
+      // TODO: handle n paths separately, or at least try, unless they are in
+      // some loop?
+      errs() << "[FieldArmor]\tTYPE RECON FAIL: ambiguity. Bailing out.\n";
       for (auto *type : SeenTypes) {
         errs() << "\t Type: ";
         type->print(errs());
@@ -2209,13 +2378,19 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
     }
   } // more than 1 type
 
-  if (SeenTypes.empty())
+  if (SeenTypes.empty()) {
+    errs() << "[FieldArmor]\tTYPE RECON FAIL: no struct types found. Bailing "
+              "out.\n";
     return;
-  Type *type = *SeenTypes.begin();
-  if (!type->isStructTy())
-    return;
+  }
 
-  errs() << "[FieldArmor] Result of type reconstruction for MALLOC'd pointer: ";
+  Type *type = *SeenTypes.begin();
+  // if (!type->isStructTy())
+  //   return;
+  assert(type->isStructTy() &&
+         "After filtering, only struct types should remain in SeenTypes");
+
+  errs() << "[FieldArmor]\tTYPE RECON SUCCESS! Inferred type: ";
   type->print(errs());
   errs() << "\n";
 
@@ -2223,31 +2398,34 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
   // NOTE: this is safe even if before ICMP null
   auto srcType = dyn_cast<StructType>(type);
 
-  if (srcType->isLiteral() || srcType->getName().str().find("union.") == 0)
+  if (srcType->isLiteral() || srcType->getName().str().find("union.") == 0) {
+    errs()
+        << "[FieldArmor]\tTYPE RECON: union type not supported. Bailing out.\n";
     return;
+  }
 
   auto tagVector = M.getGlobalVariable(
       srcType->getStructName().str() + ".fieldarmor.tagvec", true);
   assert(tagVector && "Tag vector for malloc'd struct type does not exist!");
 
+  // TODO: this must be put AFTER the CMP null that checks malloc result
   FunctionCallee fieldarmor_tag_memory =
       M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy,
                             PtrTy, PtrTy, Int64Ty, Int64Ty);
 
   Value *ArraySizeValue = GetArraySize(CI, srcType, IRB);
   if (!ArraySizeValue) {
-    errs() << "[FieldArmor] WARNING Allocation size reconstruction did not "
-              "work!\n";
+    errs() << "[FieldArmor] ERROR SIZE RECON FOR ALLOC CALL: ";
     CI->print(errs());
-    errs() << " ARG 0: ";
+    errs() << "\tARG 0: ";
     CI->getArgOperand(0)->print(errs());
     errs() << "\n";
     return;
   }
 
   uint64_t typeSize = M.getDataLayout().getTypeAllocSize(srcType);
-  errs() << "[FieldArmor] Tagging malloc'd memory of type "
-         << srcType->getStructName() << " Array size: " << *ArraySizeValue
+  errs() << "[FieldArmor]\t\tDYNAMIC TAGGING SUCCESS: "
+         << srcType->getStructName() << ", array size: " << *ArraySizeValue
          << "\n\n";
 
   IRB.CreateCall(fieldarmor_tag_memory,
@@ -2257,6 +2435,46 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
 
   SeenTypes.clear();
 } // TagAllocChunksBeforeUse
+
+void debugCallSitePrint(CallInst *CI) {
+  errs() << "HANDLING CALL TO NEW: ";
+  CI->print(errs());
+  errs() << "\n";
+  auto demangledFunctionName =
+      demangle(CI->getCalledFunction()->getName().str());
+  errs() << " FUNCTION: " << demangledFunctionName << "\n";
+  if (const DebugLoc &DL = CI->getDebugLoc()) {
+    if (DILocation *Loc = DL.get()) {
+      StringRef File = Loc->getFilename();
+      StringRef Dir = Loc->getDirectory();
+      unsigned Line = Loc->getLine();
+      unsigned Col = Loc->getColumn();
+      errs() << "\tLOCATION: " << Dir << "/" << File << ":" << Line << ":"
+             << Col << "\n";
+    }
+  } else
+    errs() << "\tLOCATION: <unknown>\n";
+}
+
+void HWAddressSanitizer::HandleNewOperator(CallInst *CI,
+                                           const std::string &DemangledName) {
+  // infer type for new operator
+  debugCallSitePrint(CI);
+  for (auto *user : CI->users()) {
+    errs() << "\t USER OF NEW OPERATOR: ";
+    user->print(errs());
+    errs() << "\n";
+  }
+
+  auto *ts = RetrievedTypes->lookup(CI, CI->getFunction());
+  if (!ts) {
+    errs() << "\t\t ts = <none> - TypeCopilot FAIL\n";
+    return;
+  }
+  for (auto &t : ts->types) {
+    errs() << "\t\t T: " << t << "\n";
+  }
+}
 
 void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   // auto GEPResultType = GEPI->getResultElementType();
@@ -2518,22 +2736,25 @@ void HWAddressSanitizer::InstrumentStoreOfFunctionArg(StoreInst *SI) {
   auto valueOperand = SI->getValueOperand();
   assert(valueOperand && valueOperand->getType()->isPointerTy());
   IRBuilder<> IRB(SI);
-  auto* type = valueOperand->getType();
-  Value* untaggedPtrLong = untagPointer(IRB, IRB.CreatePointerCast(valueOperand, IntptrTy));
-  Value* untaggedPtr = IRB.CreateIntToPtr(untaggedPtrLong, type);
-  untaggedPtr->setName(valueOperand->hasName() ? 
-                      valueOperand->getName().str() + ".untagged" : "arg.untagged");
+  auto *type = valueOperand->getType();
+  Value *untaggedPtrLong =
+      untagPointer(IRB, IRB.CreatePointerCast(valueOperand, IntptrTy));
+  Value *untaggedPtr = IRB.CreateIntToPtr(untaggedPtrLong, type);
+  untaggedPtr->setName(valueOperand->hasName()
+                           ? valueOperand->getName().str() + ".untagged"
+                           : "arg.untagged");
   // SI->setOperand(
   //     0, untaggedPtr);
   SI->replaceUsesOfWith(valueOperand, untaggedPtr);
-  errs() << "[FieldArmor] Instrumented STORE of function argument to untag pointer.\n";
+  errs() << "[FieldArmor] Instrumented STORE of function argument to untag "
+            "pointer.\n";
   SI->print(errs());
   errs() << "\n";
 }
 
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   // NOTE: new corner case: pointer passed to a function and function stores it
-  
+
   // Q: can I tell GEPs on globals/stack apart from heap?
   // Q: what if some global pointer is stored in a stack variable and then
   // GEPed? Do I see a store?
@@ -2612,9 +2833,11 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
                         ConstantInt::get(IntptrTy, 0x1Lu)),
           ConstantInt::get(IntptrTy, T_Mask)); // modulo 16
-      // TODO: remove this add, set the bits, instead
-      Value *sonT = IRB.CreateAnd(IRB.CreateAdd(fatherT, sonIdx),
-                                  ConstantInt::get(IntptrTy, T_Mask));
+      // NOTE: this add was a remnant of old fieldarmor scheme RLT
+      // TODO:
+      // Value *sonT = IRB.CreateAnd(IRB.CreateAdd(fatherT, sonIdx),
+      //                             ConstantInt::get(IntptrTy, T_Mask));
+      Value *sonT = IRB.CreateAnd(sonIdx, ConstantInt::get(IntptrTy, T_Mask));
       // NOTE: tags might be 0 after this operation. TODO: prevent it from
       // happening
 
@@ -2991,6 +3214,22 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
              << struct_name << "\n";
       errs() << *GV << "\n";
       errs() << *type << "\n";
+      errs() << "isStructTy()? " << type->isStructTy() << "\n";
+      errs() << "isArrayTy()? " << type->isArrayTy() << "\n";
+      errs() << "isMatrixOfStructs? " << isMatrixOfStructs << "\n";
+      errs() << "isArrayOfStructs? " << isArrayOfStructs << "\n";
+      errs() << "isLiteral? "
+             << (type->isStructTy() ? dyn_cast<StructType>(type)->isLiteral()
+                                    : false)
+             << "\n";
+      errs() << "isOpaque? "
+             << (type->isStructTy() ? dyn_cast<StructType>(type)->isOpaque()
+                                    : false)
+             << "\n";
+      errs() << "isSized?"
+             << (type->isStructTy() ? dyn_cast<StructType>(type)->isSized()
+                                    : false)
+             << "\n";
       assert(TagVector &&
              "Tag vector global must exist and be properly initialized.");
     }
@@ -3277,12 +3516,12 @@ void HWAddressSanitizer::createTagVectors() {
 
   for (auto t : identifiedStructTypes) {
     StructType *ty = dyn_cast<StructType>(t);
-
+    errs() << "[FieldArmor] Creating tag vector for StructType " << *t << "\n";
     /** NOTE: opaque types are not sized. */
     if (!ty->isSized()) {
       // Q: what is the solution to this?
       errs() << "[FieldArmor] StructType " << *t << " is not sized!\n";
-      return;
+      continue;
     }
 
     createTagVector(t);

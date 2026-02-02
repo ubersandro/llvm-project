@@ -1182,9 +1182,10 @@ private:
   TypeGraph *tg;
 
 public:
-  TypeCopilotResult(TypeGraph *tg = nullptr) : tg(tg) {} // TypeCopilotResult
+  DebugInfoHelper *helper;
+  TypeCopilotResult(TypeGraph *tg = nullptr, DebugInfoHelper *helper = nullptr)
+      : tg(tg), helper(helper) {} // TypeCopilotResult
   const TypeSet *lookup(Value *v, Function *f) const {
-    errs() << "[DBG] TypeCopilotResult lookup called for value: " << *v << "\n";
     return tg->get(f, v);
   } // lookup
 };
@@ -1254,7 +1255,7 @@ public:
       }
     } // while
     // return TypeCopilotResult(tg);
-    Ret = std::make_unique<TypeCopilotResult>(tg);
+    Ret = std::make_unique<TypeCopilotResult>(tg, diHelper);
     errs() << "[DBG] Type Reconstruction Analysis finished.\n";
     return *Ret;
   }
