@@ -235,9 +235,11 @@ public:
     return type + "*";
   }
 
-  bool canFlow(std::string &type) { return !type.empty() && !isOpaque(type); }
+  bool isNotPtrOpaque(std::string &type) {
+    return !type.empty() && !isOpaque(type);
+  }
 
-  bool canFlow(TypeSet *typeset) {
+  bool isNotPtrOpaque(TypeSet *typeset) {
     if (!typeset)
       return false;
     return !typeset->empty() && !typeset->isOpaque() &&
@@ -299,27 +301,29 @@ class TypeGraph {
 
 private:
   const bool DEBUG = false;
-  bool canFlow(std::string type) { return !type.empty() && type != "ptr"; }
-  bool canFlow(std::set<std::string> typeset) {
+  bool isNotPtrOpaque(std::string type) {
+    return !type.empty() && type != "ptr";
+  }
+  bool isNotPtrOpaque(std::set<std::string> typeset) {
     return !typeset.empty() && !typeset.count("ptr");
   }
 
-  bool isInternal(Value *v) {
-    auto name = v->getName();
-    if (name.starts_with("."))
-      return true;
-    if (name.count(".") > 1)
-      return true;
-    if (name.count(".") == 1) {
-      auto subname = name.split(".").second;
-      for (auto ch : subname) {
-        if (!isDigit(ch))
-          return true;
-      }
-    }
+  // bool isInternal(Value *v) {
+  //   auto name = v->getName();
+  //   if (name.starts_with("."))
+  //     return true;
+  //   if (name.count(".") > 1)
+  //     return true;
+  //   if (name.count(".") == 1) {
+  //     auto subname = name.split(".").second;
+  //     for (auto ch : subname) {
+  //       if (!isDigit(ch))
+  //         return true;
+  //     }
+  //   }
 
-    return false;
-  }
+  //   return false;
+  // }
 
 public:
   TypeMap globalMap;
@@ -596,14 +600,25 @@ public:
     // map structure type to DIType
     DebugInfoFinder finder;
     finder.processModule(*module);
-    // errs() << "[TypeCopilot] Mapping struct types to DI types...\n";
+    // TODO: handle classes, maybe they have rich DBG info as well
+    
     for (auto s : module->getIdentifiedStructTypes()) {
       // NOTE: literal structs are skipped
       if (!s->hasName())
         continue;
-
+      auto isClass = s->getName().find("class.") != StringRef::npos;
       auto structName = s->getName();
-      structName.consume_front("struct.");
+
+      if (!isClass) {
+        structName.consume_front("struct.");
+
+      } // is not class
+      else {
+        // it's a class
+        errs() << "[TypeCopilot] Found class: " << structName << "\n";
+        structName.consume_front("class.");
+      } // CLASS CASE
+
       for (auto type : finder.types()) {
         // typedef
         if (auto *derived = dyn_cast<DIDerivedType>(type)) {
@@ -624,12 +639,12 @@ public:
 
               structMap.insert({s, composite});
               break;
-            }
-          }
-        }
-      }
-    }
-    // errs() << "[TypeCopilot] Globals initialization...\n";
+            } // is struct
+          } // is struct
+        } // is composite
+      } // for types
+    } // for struct types
+
     for (auto &global : module->globals()) {
       SmallVector<DIGlobalVariableExpression *> di_global_exps;
       global.getDebugInfo(di_global_exps);
@@ -924,7 +939,7 @@ public:
     Value *b = select.getFalseValue();
 
     auto typeB = tg->get(scope, b);
-    if (tyHelper->canFlow(typeB)) {
+    if (tyHelper->isNotPtrOpaque(typeB)) {
       if (tg->put(scope, a, tg->get(scope, b)))
         worklist->push_user(a);
 
@@ -933,7 +948,7 @@ public:
     }
 
     auto typeA = tg->get(scope, a);
-    if (tyHelper->canFlow(typeA)) {
+    if (tyHelper->isNotPtrOpaque(typeA)) {
       if (tg->put(scope, b, tg->get(scope, a)))
         worklist->push_user(b);
 
@@ -953,7 +968,7 @@ public:
 
     // base type
     auto baseName = tyHelper->getTypeName(baseType);
-    if (tg->isOpaque(scope, base) && tyHelper->canFlow(baseName)) {
+    if (tg->isOpaque(scope, base) && tyHelper->isNotPtrOpaque(baseName)) {
       if (tg->put(scope, base, tyHelper->getReference(baseName)))
         worklist->push_user(base);
     }
@@ -1007,12 +1022,13 @@ public:
       }
     }
 
-    if (tyHelper->canFlow(
+    if (tyHelper->isNotPtrOpaque(
             typeName)) { // tg->isOpaque(scope, lhs) &&  REMOVED vaffanculo
       if (tg->put(scope, lhs, tyHelper->getReference(typeName))) {
         // errs() << "[DBG] GEP update LHS" << *lhs << " to " << typeName
-        //        << " isOpaque? " << tg->isOpaque(scope, lhs) << " canFlow? "
-        //        << tyHelper->canFlow(typeName) << "\n";
+        //        << " isOpaque? " << tg->isOpaque(scope, lhs) << "
+        //        isNotPtrOpaque? "
+        //        << tyHelper->isNotPtrOpaque(typeName) << "\n";
         worklist->push_user(lhs);
 
       } // NOTE: there could be no update due to how the put is implemented,
@@ -1021,8 +1037,9 @@ public:
       // TODO: debug the following, it's not over yet
       // else
       //   errs() << "[DBG] GEP NO update LHS" << *lhs << " to " << typeName
-      //          << " isOpaque? " << tg->isOpaque(scope, lhs) << " canFlow? "
-      //          << tyHelper->canFlow(typeName) << "\n";
+      //          << " isOpaque? " << tg->isOpaque(scope, lhs) << "
+      //          isNotPtrOpaque? "
+      //          << tyHelper->isNotPtrOpaque(typeName) << "\n";
     }
   }
 
@@ -1040,13 +1057,13 @@ public:
     Value *src = call.getArgOperand(1);
 
     auto dstType = tg->get(scope, dst);
-    if (tyHelper->canFlow(dstType)) {
+    if (tyHelper->isNotPtrOpaque(dstType)) {
       if (tg->put(scope, src, dstType))
         worklist->push_user(src);
     }
 
     auto srcType = tg->get(scope, src);
-    if (tyHelper->canFlow(srcType)) {
+    if (tyHelper->isNotPtrOpaque(srcType)) {
       if (tg->put(scope, dst, srcType))
         worklist->push_user(dst);
     }
@@ -1077,7 +1094,7 @@ public:
 
         // argValue flows to paramValue
         auto argType = tg->get(scope, argValue);
-        if (tyHelper->canFlow(argType))
+        if (tyHelper->isNotPtrOpaque(argType))
           if (tg->put(calledFunc, paramValue, argType))
             worklist->push_user(paramValue);
       }
@@ -1096,7 +1113,7 @@ public:
     // process return value
     Value *dst = dyn_cast<Value>(&call);
     auto dstType = tg->get(nullptr, calledFunc);
-    if (tyHelper->canFlow(dstType))
+    if (tyHelper->isNotPtrOpaque(dstType))
       if (tg->put(scope, dst, dstType))
         worklist->push_user(dst);
   }
@@ -1106,13 +1123,13 @@ public:
     Value *dst = dyn_cast<Value>(&load);
 
     auto deref = tg->dereference(scope, src);
-    if (tyHelper->canFlow(deref))
+    if (tyHelper->isNotPtrOpaque(deref))
       if (tg->put(scope, dst, deref))
         worklist->push_user(dst);
     delete deref;
 
     auto ref = tg->reference(scope, dst);
-    if (tyHelper->canFlow(ref))
+    if (tyHelper->isNotPtrOpaque(ref))
       if (tg->put(scope, src, ref))
         worklist->push_user(src);
     delete ref;
@@ -1123,13 +1140,13 @@ public:
     Value *dst = store.getPointerOperand();
 
     auto ref = tg->reference(scope, src);
-    if (tyHelper->canFlow(ref))
+    if (tyHelper->isNotPtrOpaque(ref))
       if (tg->put(scope, dst, ref))
         worklist->push_user(dst);
     delete ref;
 
     auto deref = tg->dereference(scope, dst);
-    if (tyHelper->canFlow(deref))
+    if (tyHelper->isNotPtrOpaque(deref))
       if (tg->put(scope, src, deref))
         worklist->push_user(src);
     delete deref;
@@ -1142,7 +1159,7 @@ public:
     Value *r = dyn_cast<Value>(&binop);
 
     auto typeB = tg->get(scope, b);
-    if (tyHelper->canFlow(typeB)) {
+    if (tyHelper->isNotPtrOpaque(typeB)) {
       if (tg->put(scope, a, tg->get(scope, b)))
         worklist->push_user(a);
       if (tg->put(scope, r, tg->get(scope, b)))
@@ -1150,7 +1167,7 @@ public:
     }
 
     auto typeA = tg->get(scope, a);
-    if (tyHelper->canFlow(typeA)) {
+    if (tyHelper->isNotPtrOpaque(typeA)) {
       if (tg->put(scope, b, tg->get(scope, a)))
         worklist->push_user(b);
       if (tg->put(scope, r, tg->get(scope, a)))
@@ -1215,8 +1232,6 @@ public:
     // TODO: debug cases in which the name of some vars of functions is "". This
     // can break and put rogue data inside the graph. There are many occurrences
     // of just "*" without any further information.
-    errs() << "[DBG] Type Reconstruction Analysis started for module: "
-           << M.getName() << "\n";
     DebugInfoHelper *diHelper = new DebugInfoHelper();
     tg = new TypeGraph();
     diHelper->initialize(&M, tg);
@@ -1256,7 +1271,7 @@ public:
     } // while
     // return TypeCopilotResult(tg);
     Ret = std::make_unique<TypeCopilotResult>(tg, diHelper);
-    errs() << "[DBG] Type Reconstruction Analysis finished.\n";
+    // errs() << "[DBG] Type Reconstruction Analysis finished.\n";
     return *Ret;
   }
   const TypeCopilotResult &getResult() const { return *Ret; }

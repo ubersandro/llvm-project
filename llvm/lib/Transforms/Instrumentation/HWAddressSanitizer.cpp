@@ -1689,23 +1689,24 @@ bool HWAddressSanitizer::selectiveInstrumentationShouldSkip(
 
 /** Blocklist C++ templates because they are broken with my instumentation.*/
 bool HWAddressSanitizer::potentiallyBlacklistFunction(Function &F) {
-  std::string demangledName = demangle(F.getName().str());
+  // std::string demangledName = demangle(F.getName().str());
 
-  // blocking functions that start with std:: (enforce starts with)
-  if ((demangledName.find("std::") != std::string::npos &&
-       demangledName.find("std::") == 0) ||
-      demangledName.find("llvm::") != std::string::npos) {
-    // errs() << "[++] Blocklisting function: " << demangledName << "\n";
-    return true;
-  }
+  // // blocking functions that start with std:: (enforce starts with)
+  // if ((demangledName.find("std::") != std::string::npos &&
+  //      demangledName.find("std::") == 0) ||
+  //     demangledName.find("llvm::") != std::string::npos) {
+  //   // errs() << "[++] Blocklisting function: " << demangledName << "\n";
+  //   return true;
+  // }
 
-  if (demangledName.find("Perl_Slab") != std::string::npos) {
-    errs() << "[++] Blocklisting function: " << demangledName << "\n";
-    return true;
-    // TODO: solve bugs in there because of PTR arithmetics.
-    // PtrToInt instrumentation was solving the mess there, so it must be easy
-    // to figure bugs out. Only two functions are blocklisted.
-  }
+  // if (demangledName.find("Perl_Slab") != std::string::npos) {
+  //   errs() << "[++] Blocklisting function: " << demangledName << "\n";
+  //   return true;
+  //   // TODO: solve bugs in there because of PTR arithmetics.
+  //   // PtrToInt instrumentation was solving the mess there, so it must be
+  //   easy
+  //   // to figure bugs out. Only two functions are blocklisted.
+  // }
   return false;
 }
 
@@ -1747,12 +1748,10 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   // FieldArmor
   SmallVector<GetElementPtrInst *, 40> GEPsToInstrument;
   SmallVector<CmpInst *, 40> CMPsToInstrument;
-  // SmallVector<BinaryOperator *, 40> ArithInstructions;
-  // SmallVector<PtrToIntInst *, 40> PointerToIntInstructions;
   SmallVector<ConstantExpr *, 40> ConstGEPsToInstrument;
   SmallVector<StoreInst *, 40> StoresToInstrument;
   SmallVector<std::pair<CallInst *, std::string>, 40> CallsToAllocator;
-  SmallVector<std::pair<CallInst *, std::string>, 40> CallsToConstructor;
+  SmallVector<std::pair<CallInst *, std::string>, 40> CallsToNew;
   // FieldArmor
 
   const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
@@ -1768,6 +1767,9 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       LandingPadVec.push_back(&Inst);
 
     // TODO: filter out something
+    // TODO: I am ignoring ORE at the moment, I think it's fine to have the
+    // RemarkEmitter emit info in SIB, just double check that it does not break
+    // stuff.
     getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
 
     /* NOTE: ideally, one wants to instrument memcpy/memmove/memset only when
@@ -1801,7 +1803,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       }
 
       else if (demangledName.find("operator new") != std::string::npos) {
-        CallsToConstructor.push_back(std::make_pair(CI, demangledName));
+        CallsToNew.push_back(std::make_pair(CI, demangledName));
       }
     }
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(&Inst)) {
@@ -1809,18 +1811,6 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
         ConstGEPsToInstrument.push_back(CE);
       }
     }
-    // TODO: mark them at call site and then instrument them at the single
-    // function level. This is tricky because it caused some crashes in php.
-    // if(StoreInst *SI = dyn_cast<StoreInst>(&Inst)) {
-    //   Value *ValueOperand = SI->getValueOperand();
-    //   auto functionArgs = F.args();
-    //   for (auto &Arg : functionArgs) {
-    //     if (ValueOperand == &Arg && Arg.getType()->isPointerTy()) {
-    //       errs() << "[FieldArmor] Instrumenting store of function arg: " <<
-    //       *SI << "\n"; StoresToInstrument.push_back(SI); break;
-    //     }
-    //   }
-    // }
   }
 
   memtag::StackInfo &SInfo = SIB.get();
@@ -1850,16 +1840,11 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   //                  Mapping.withFrameRecord() &&
   //                  !SInfo.AllocasToInstrument.empty());
 
-  // HEAP
-  // NOTE: this approach introduces FPs in CMA benchmarks
-  // for (auto &GEPI : GEPsToInstrument) {
-  //   PreprocessGEP(GEPI);
-  // }
-  // TODO: TypeCopilot analysis here!
   for (auto &PAIR : CallsToAllocator) {
     TagAllocChunksBeforeUse(PAIR.first, PAIR.second);
   }
-  for (auto &PAIR : CallsToConstructor) {
+
+  for (auto &PAIR : CallsToNew) {
     HandleNewOperator(PAIR.first, PAIR.second);
   }
 
@@ -1905,6 +1890,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     InstrumentCMP(CMPI);
   }
 
+  // TODO: properly handle container-of macros
   // NOTE: container_of-like macros subtract ints to pointers. To preserve
   // semantic, tag is removed so that the result is always untagged. This causes
   // tag loss. However, FPs resulting from a non-root ptr used to access a
@@ -1918,21 +1904,6 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
    * an invalid malloc when size is computed using ptr arithm. */
   // for (auto &BO : ArithInstructions) {
   //   InstrumentArithmetic(BO);
-  // }
-
-  /** Since most sanitizers don't do it, I believe it's not necessary! Even
-   * though it fixes a problem in 500, it should not be introduced randomly. It
-   * breaks 502 (comparison between a ptr and (void*) -1). */
-  // for (auto &PI : PointerToIntInstructions) {
-  //   InstrumentPtrToInt(PI);
-  // }
-
-  // for (auto &CI : CallsToAllocator) {
-  //   InstrumentCall(CI);
-  // }
-  // NOTE: this might not be necessary.
-  // for( auto &SI : StoresToInstrument) {
-  //   InstrumentStoreOfFunctionArg(SI);
   // }
 
   // TODO: remove checks on ".untagged" pointers.
@@ -2260,6 +2231,11 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
         errs() << "\t\t [FieldArmor] WARNING: STORE in UNKNOWN ptr TODO: ";
         whereToStore->print(errs());
         errs() << "\n";
+        auto underlyingObject = getUnderlyingObject(whereToStore);
+        errs() << "\t\t Underlying object: ";
+        underlyingObject->print(errs());
+        errs() << "\n";
+        // could be a function argument or something derived from it
       } // STORE in UNKNOWN ptr
     } // STORE USER
 
@@ -2285,6 +2261,9 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
           Callee->getName().find("printf") != std::string::npos) {
         // these functions dont tell me anything
         // skip memcpy/memmove calls
+        errs() << "\t\t CALL USER (memcpy/memmove/memset/free/printf): ";
+        CII->print(errs());
+        errs() << "\n";
         continue;
       }
       errs() << "\t CALL USER: ";
@@ -2395,7 +2374,8 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
   errs() << "\n";
 
   IRBuilder<> IRB(CI->getNextNonDebugInstruction());
-  // NOTE: this is safe even if before ICMP null
+  // NOTE: this is safe even if before ICMP null because of how the runtime
+  // tagging function is written
   auto srcType = dyn_cast<StructType>(type);
 
   if (srcType->isLiteral() || srcType->getName().str().find("union.") == 0) {
@@ -2456,25 +2436,204 @@ void debugCallSitePrint(CallInst *CI) {
     errs() << "\tLOCATION: <unknown>\n";
 }
 
+Value *retrieveTagVector(StructType *srcType, Module &M, bool try_base = true) {
+  auto typeName = srcType->getStructName().str();
+  bool isClass = typeName.find("class.") == 0;
+  std::string lookupName = typeName;
+  if (isClass && typeName.find(".base") == std::string::npos && try_base) {
+    lookupName = typeName + ".base";
+  }
+  auto tagVector = M.getGlobalVariable(lookupName + ".fieldarmor.tagvec", true);
+  if (!tagVector) {
+    errs() << "[FieldArmor] LOOKUP ERROR: Tag vector for struct type: ";
+    srcType->print(errs());
+    errs() << "lookup type: " << lookupName;
+    errs() << "\n";
+    return nullptr;
+  }
+  errs() << "[FieldArmor] LOOKUP OK: Retrieved tag vector for LOOKUP NAME: "
+         << lookupName << ", type name: " << typeName << "\n";
+  return tagVector;
+}
+
 void HWAddressSanitizer::HandleNewOperator(CallInst *CI,
                                            const std::string &DemangledName) {
   // infer type for new operator
+  std::set<Type *> SeenTypes;
   debugCallSitePrint(CI);
   for (auto *user : CI->users()) {
     errs() << "\t USER OF NEW OPERATOR: ";
     user->print(errs());
     errs() << "\n";
+    if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(user)) {
+      errs() << "\t\t GEP user";
+      GEPI->print(errs());
+      errs() << "\n";
+      auto *GEPType = GEPI->getSourceElementType();
+      std::string typeName;
+      raw_string_ostream rso(typeName);
+      GEPType->print(rso);
+      // NOTE: when allocating arrays of ptrs, the GEP source type is ptr
+      if (!(typeName == "ptr"))
+        SeenTypes.insert(GEPType);
+      else
+        // array of ptrs
+        errs() << "[FieldArmor]\t\tTYPE RECON: UNINTERESTING: \n";
+    }
+
+    // H1 : if a user is a call to strlen, strcpy and similar, then it's a
+    // string
+    if (CallInst *CI = dyn_cast<CallInst>(user)) {
+      Function *Callee = CI->getCalledFunction();
+
+      if (!Callee) {
+        // NOTE: I think we can't do anything in this case
+        errs() << "\t\t CALL USER INDIRECT CALL: ";
+        CI->print(errs());
+        errs() << "\n";
+        continue;
+      }
+      std::string calleeName = demangle(Callee->getName().str());
+      if (calleeName == "strlen" || calleeName == "strcpy" ||
+          calleeName == "strcmp" || calleeName == "strcat") {
+        errs()
+            << "[FieldArmor]\tTYPE RECON: UNINTERESTING: called function is ";
+        errs() << calleeName << "\n";
+        return; // ignore this allocation site
+      }
+    } // CALL INST USER
+
+    // H2: handle PHI, many ptrs are null and maybe what's created has a type
+    if (PHINode *PN = dyn_cast<PHINode>(user)) {
+      errs() << "\t\t PHI NODE USER: ";
+      PN->print(errs());
+      errs() << "\n";
+
+      for (unsigned i = 0; i < PN->getNumIncomingValues(); i++) {
+        Value *incoming = PN->getIncomingValue(i);
+        // if incoming is a null ptr, skip
+        if (ConstantPointerNull *CPN = dyn_cast<ConstantPointerNull>(incoming))
+          continue;
+        if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(incoming)) {
+          errs() << "\t\t GEP incoming value to PHI: ";
+          GEPI->print(errs());
+          errs() << "\n";
+          auto *GEPType = GEPI->getSourceElementType();
+          errs() << "\t\t GEP TYPE: ";
+          GEPType->print(errs());
+          errs() << "\n";
+
+          std::string typeName;
+          raw_string_ostream rso(typeName);
+          GEPType->print(rso);
+          // NOTE: when allocating arrays of ptrs, the GEP source type is ptr
+
+          if (!(typeName == "ptr"))
+            SeenTypes.insert(GEPType);
+          else {
+            // array of ptrs
+            errs() << "[FieldArmor]\t NOT ADDING TO SEENTYPES: \n";
+            GEPType->print(errs());
+            errs() << "\n";
+          }
+        } // GEP incoming value
+      } // for each incoming value
+    } // PHI NODE USER
   }
 
   auto *ts = RetrievedTypes->lookup(CI, CI->getFunction());
   if (!ts) {
     errs() << "\t\t ts = <none> - TypeCopilot FAIL\n";
+  } else
+    for (auto &t : ts->types)
+      errs() << "\t\t T: " << t << "\n";
+
+  if (SeenTypes.size() > 1) {
+    errs() << "[FieldArmor]\t WARNING: more than 1 type id\n";
+  }
+
+  std::set<StructType *> structTypes;
+  for (auto *t : SeenTypes) {
+    if (t->isStructTy()) {
+      structTypes.insert(dyn_cast<StructType>(t));
+    }
+  }
+
+  if (structTypes.size() == 0) {
+    errs() << "[FieldArmor]\t TYPE RECON: UNINTERESTING ?.\n";
+    return;
+  } else if (structTypes.size() > 1) {
+    errs() << "[FieldArmor]\t TYPE RECON: AMBIGUITY. BAILING OUT.\n";
+    // return;
     return;
   }
-  for (auto &t : ts->types) {
-    errs() << "\t\t T: " << t << "\n";
+  auto *t = *structTypes.begin();
+  errs() << "\t\t TYPE RECON SUCCESS: ";
+  t->print(errs());
+  errs() << "\n";
+
+  StructType *srcType = dyn_cast<StructType>(t);
+  IRBuilder<> IRB(CI->getNextNonDebugInstruction());
+  // NOTE: this is safe even if before ICMP null because of how the runtime
+  // tagging function is written
+  if (srcType->isLiteral() || srcType->getName().str().find("union.") == 0) {
+    errs()
+        << "[FieldArmor]\tTYPE RECON: union type not supported. Bailing out.\n";
+    return;
   }
-}
+
+  auto baseSrcType = StructType::getTypeByName(
+      M.getContext(), srcType->getStructName().str() + ".base");
+  if (!baseSrcType) {
+    errs() << "[FieldArmor] NO BASE TYPE? : ";
+    srcType->print(errs());
+    errs() << "\n";
+    baseSrcType = srcType;
+  }
+
+  auto tagVector = retrieveTagVector(baseSrcType, M, false);
+  if (!tagVector) {
+    errs() << "[FieldArmor] TV not there -> trying to create TB for TYPE: ";
+    baseSrcType->print(errs());
+    errs() << "\n";
+
+    createTagVector(baseSrcType);
+    tagVector = retrieveTagVector(baseSrcType, M, false);
+    if (!tagVector) {
+      errs()
+          << "[FieldArmor] Could not find or create tag vector for BASE type: ";
+      baseSrcType->print(errs());
+      errs() << "\n";
+    }
+  }
+
+  // TODO: insert only if creation went fine!!
+  FunctionCallee fieldarmor_tag_memory =
+      M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy,
+                            PtrTy, PtrTy, Int64Ty, Int64Ty);
+
+  auto TypeSize = M.getDataLayout().getTypeAllocSize(srcType);
+  Value *ArraySizeValue =
+      IRB.CreateUDiv(CI->getArgOperand(0), ConstantInt::get(Int64Ty, TypeSize));
+
+  if (!ArraySizeValue) {
+    errs() << "[FieldArmor] ERROR SIZE RECON FOR ALLOC CALL: ";
+    CI->print(errs());
+    errs() << "\tARG 0: ";
+    CI->getArgOperand(0)->print(errs());
+    errs() << "\n";
+    return;
+  }
+  errs() << "[FieldArmor]\t\tDYNAMIC TAGGING ON NEW SUCCESS: "
+         << srcType->getStructName() << ", array size: " << *ArraySizeValue
+         << ", tagvec: " << *tagVector << "\n\n";
+  IRB.CreateCall(fieldarmor_tag_memory,
+                 {IRB.CreatePointerCast(CI, PtrTy),
+                  IRB.CreatePointerCast(tagVector, PtrTy),
+                  ConstantInt::get(Int64Ty, TypeSize), ArraySizeValue});
+
+  SeenTypes.clear();
+} // HandleNewOperator
 
 void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   // auto GEPResultType = GEPI->getResultElementType();
@@ -2505,255 +2664,9 @@ void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   }
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wall"
-#pragma GCC diagnostic ignored "-Wextra"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#pragma GCC diagnostic ignored "-Wunused-variable"
-#pragma GCC diagnostic ignored "-Wunused-function"
-#pragma GCC diagnostic ignored "-Wsign-compare"
-#pragma GCC diagnostic ignored "-Wconversion"
-#pragma GCC diagnostic ignored "-Wshadow"
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
-void HWAddressSanitizer::PreprocessGEP(GetElementPtrInst *GEPI) {
-  // whenever the pointer to an aggregate is retrieved for the first time, I
-  // want to check if it's tagged or not. If not, I tag it. Just tag structs
-  // on first use!!!
-  auto operand0 = GEPI->getOperand(0);
-  auto GepSourceType = GEPI->getSourceElementType();
-  if (!GepSourceType->isStructTy()) {
-    return;
-  }
-
-  if (AllocaInst *AI = dyn_cast<AllocaInst>(operand0)) {
-    // put the STACK prefix to it
-    GEPI->setName("stackGEP." + GEPI->getName().str());
-    return;
-  }
-
-  else if (GlobalVariable *GV = dyn_cast<GlobalVariable>(operand0)) {
-    GEPI->setName("globalGEP." + GEPI->getName().str());
-    return;
-  }
-
-  if (GetElementPtrInst *GEPporcodio = dyn_cast<GetElementPtrInst>(operand0)) {
-    // chain of GEPs
-    if (GEPporcodio->hasName() &&
-        GEPporcodio->getName().str().find("globalGEP") != std::string::npos) {
-      GEPI->setName("globalGEP." + GEPI->getName().str());
-      return;
-    } else if (GEPporcodio->hasName() && GEPporcodio->getName().str().find(
-                                             "stackGEP") != std::string::npos) {
-      GEPI->setName("stackGEP." + GEPI->getName().str());
-      return;
-    }
-  }
-  // at this point, operand0 is neither ALLOCA nor GLOBAL nor GEP
-
-  else {
-    /* Always care about the very first GEP of a chain */
-    GetElementPtrInst *GEPop0 = dyn_cast<GetElementPtrInst>(operand0);
-    if (!GEPop0) {
-
-      // errs() << "[FSan] GEP on NON-GEP, NON-ALLOC, NON-GLOBAL\n";
-      Value *src = getUnderlyingObject(operand0, 20);
-      auto isFunctionArgument = isa<Argument>(src);
-
-      if (isFunctionArgument) {
-        return;
-        // // unconditionally tag the memory
-        // auto srcType = dyn_cast<StructType>(GepSourceType);
-        // IRBuilder<> IRB(GEPI); // BEFORE the GEP
-        // if (srcType->isLiteral()) {
-        //   errs() << "[FieldArmor] Skipping literal struct - TR\n";
-        //   srcType->print(errs());
-        //   errs() << "\n";
-        //   return;
-        // }
-        // if (srcType->getName().str().find("union.") == 0) {
-        //   errs() << "[FieldArmor] Skipping union struct - TR\n";
-        //   srcType->print(errs());
-        //   errs() << "\n";
-        //   return;
-        // }
-
-        // assert(srcType && "Source type must be struct here");
-
-        // auto tagVector = M.getGlobalVariable(
-        //     srcType->getStructName().str() + ".fieldarmor.tagvec", true);
-        // assert(tagVector && "Tag vector must exist here");
-
-        // FunctionCallee fieldarmor_tag_memory =
-        //     M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm",
-        //                           PtrTy, PtrTy, PtrTy, Int64Ty, Int64Ty);
-        // auto typeSize = M.getDataLayout().getTypeAllocSize(GepSourceType);
-
-        // // is operand0 the right pointer to tag?
-        // IRB.CreateCall(fieldarmor_tag_memory,
-        //                {IRB.CreatePointerCast(operand0, PtrTy),
-        //                 IRB.CreatePointerCast(tagVector, PtrTy),
-        //                 ConstantInt::get(Int64Ty, typeSize),
-        //                 ConstantInt::get(Int64Ty, 1)});
-
-      } // function argument case
-
-      // else if (GlobalVariable *GV = dyn_cast<GlobalVariable>(src)) {
-      //   // Q: can this case happen?
-      //   assert(false && "GEP on global variable should have been "
-      //                  "caught earlier!");
-      // NOTE: this case has been deleted because does not seem to make sense
-      // }
-
-      else {
-        // can be a LOAD, CALL, PHI, SELECT
-        if (SelectInst *SEL = dyn_cast<SelectInst>(src)) {
-
-        } else if (LoadInst *LI = dyn_cast<LoadInst>(src)) {
-          // NOTE: ideally, only what gets accessed should be tagged
-          return; // DEBUG dont do anything for now!
-          auto srcType = dyn_cast<StructType>(GepSourceType);
-          if (srcType->isLiteral()) {
-            errs() << "[FieldArmor] Skipping literal struct - type "
-                      "instrumentation\n";
-            srcType->print(errs());
-            errs() << "\n";
-            return;
-          }
-          if (srcType->getName().str().find("union.") == 0) {
-            errs() << "[FieldArmor] Skipping union struct - type "
-                      "instrumentation\n";
-            srcType->print(errs());
-            errs() << "\n";
-            return;
-          }
-
-          IRBuilder<> IRB(GEPI);
-          Value *loadedPtrLong = IRB.CreatePointerCast(LI, IntptrTy);
-          Value *untaggedPtrLong = untagPointer(IRB, loadedPtrLong);
-          // Q: is everything untagged on the heap?
-          // Q: what if the loaded pointer belongs to the stack or global? Can
-          // this still happen?
-          Value *shadowLoadedPtr =
-              memToShadow(untaggedPtrLong, IRB); // this is a pointer
-
-          Value *loadedShadowStart = IRB.CreateLoad(Int64Ty, shadowLoadedPtr);
-
-          // Value *cmpout = IRB.CreateCmp(ICmpInst::ICMP_EQ,
-          // loadedShadowStart,
-          //                               ConstantInt::get(Int64Ty, 0));
-          // cmpout->setName("fsan.tagged_check.load"); // DEBUG
-          // // Create blocks for then and else
-          Function *ParentFunc = GEPI->getFunction();
-          BasicBlock *OrigBB = GEPI->getParent();
-          BasicBlock *ThenBB = BasicBlock::Create(
-              OrigBB->getContext(), "tagged_check_then", ParentFunc);
-          BasicBlock *ContBB = OrigBB->splitBasicBlock(IRB.GetInsertPoint(),
-                                                       "tagged_check_cont");
-
-          // Remove the unconditional branch inserted by splitBasicBlock
-          OrigBB->getTerminator()->eraseFromParent();
-
-          // Insert conditional branch
-          IRB.SetInsertPoint(OrigBB);
-          // IRB.CreateCondBr(cmpout, ThenBB, ContBB); // DEBUG
-          IRB.CreateBr(ThenBB); // JUMP UNCOND
-          // In ThenBB, print a message and jump to ContBB
-          IRBuilder<> IRBThen(ThenBB);
-          // FunctionType *PrintfTy = FunctionType::get(
-          //     Type::getInt32Ty(ThenBB->getContext()),
-          //     {PointerType::getUnqual(Type::getInt8Ty(ThenBB->getContext()))},
-          //     true);
-          // FunctionCallee PrintfFunc =
-          //     GEPI->getModule()->getOrInsertFunction("printf", PrintfTy);
-          // Value *FormatStr = IRBThen.CreateGlobalStringPtr(
-          //     "[FSan] GEP on UNTAGGED pointer detected, pointer %p, shadow
-          //     %p!\n");
-          // IRBThen.CreateCall(PrintfFunc, {FormatStr, loadedPtrLong,
-          // shadowLoadedPtr}); call fieldarmor_tag
-
-          assert(srcType && "Source type must be struct here");
-
-          auto tagVector = M.getGlobalVariable(
-              srcType->getStructName().str() + ".fieldarmor.tagvec", true);
-          assert(tagVector && "Tag vector must exist here");
-
-          FunctionCallee fieldarmor_tag_memory =
-              M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm",
-                                    PtrTy, PtrTy, PtrTy, Int64Ty, Int64Ty);
-          auto typeSize = M.getDataLayout().getTypeAllocSize(GepSourceType);
-
-          IRBThen.CreateCall(fieldarmor_tag_memory,
-                             {IRB.CreatePointerCast(LI, PtrTy),
-                              IRB.CreatePointerCast(tagVector, PtrTy),
-                              ConstantInt::get(Int64Ty, typeSize),
-                              ConstantInt::get(Int64Ty, 1)});
-
-          IRBThen.CreateBr(ContBB);
-          // if zero, print a message
-
-        } else if (CallInst *CI = dyn_cast<CallInst>(src)) {
-          // errs() << "\tCALL INSTRUCTION: ";
-          // CI->print(errs());
-          // errs() << "\n";
-        } else if (InvokeInst *II = dyn_cast<InvokeInst>(src)) {
-          // errs() << "\tINVOKE INSTRUCTION: ";
-          // II->print(errs());
-          // errs() << "\n";
-        } else if (PHINode *PN = dyn_cast<PHINode>(src)) {
-          // Q: for every option, what is the underlying object?
-          // errs() << "\tPHI NODE: ";
-          // PN->print(errs());
-          // errs() << "\n";
-        } else if (IntToPtrInst *ITPI = dyn_cast<IntToPtrInst>(src)) {
-          // errs() << "\tINT TO PTR INSTRUCTION: ";
-          // ITPI->print(errs());
-          // errs() << "\n";
-          // auto underlyingObjectPtrToIntOperand =
-          //     getUnderlyingObject(ITPI->getOperand(0));
-          // errs() << "\t\t underlying object of ptrtoint operand: ";
-          // underlyingObjectPtrToIntOperand->print(errs());
-          // errs() << "\n";
-        } else {
-          // could be "ptr null"
-          errs() << "\t\t[FSan] underlying object is UNKNOWN\n";
-          GEPI->print(errs());
-          errs() << "\n";
-          src->print(errs());
-          errs() << "\n";
-        }
-      }
-    } else {
-      // operand0 is a GEP, this should not happen
-      assert(false);
-    }
-  }
-}
-
-void HWAddressSanitizer::InstrumentStoreOfFunctionArg(StoreInst *SI) {
-  // storing tagged pointers is not allowed
-  auto valueOperand = SI->getValueOperand();
-  assert(valueOperand && valueOperand->getType()->isPointerTy());
-  IRBuilder<> IRB(SI);
-  auto *type = valueOperand->getType();
-  Value *untaggedPtrLong =
-      untagPointer(IRB, IRB.CreatePointerCast(valueOperand, IntptrTy));
-  Value *untaggedPtr = IRB.CreateIntToPtr(untaggedPtrLong, type);
-  untaggedPtr->setName(valueOperand->hasName()
-                           ? valueOperand->getName().str() + ".untagged"
-                           : "arg.untagged");
-  // SI->setOperand(
-  //     0, untaggedPtr);
-  SI->replaceUsesOfWith(valueOperand, untaggedPtr);
-  errs() << "[FieldArmor] Instrumented STORE of function argument to untag "
-            "pointer.\n";
-  SI->print(errs());
-  errs() << "\n";
-}
-
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
-  // NOTE: new corner case: pointer passed to a function and function stores it
+  // NOTE: new corner case: pointer passed to a function and function stores
+  // it
 
   // Q: can I tell GEPs on globals/stack apart from heap?
   // Q: what if some global pointer is stored in a stack variable and then
@@ -2784,11 +2697,17 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   Value *untaggedResLongPtr =
       IRB.CreateIntToPtr(untaggedResLong, GEPI->getType());
 
-  Value *fullFatherTag = IRB.CreateLShr(
-      IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x7FLu << 56Lu)),
+  // Value *fullFatherTag = IRB.CreateLShr(
+  //     IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x7FLu << 56Lu)),
+  //     PointerTagShift);
+
+  // Value *fatherT = IRB.CreateAnd(fullFatherTag, T_Mask_value);
+
+  Value *fatherT = IRB.CreateLShr(
+      IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x0FLu << 56Lu)),
       PointerTagShift);
 
-  Value *fatherT = IRB.CreateAnd(fullFatherTag, T_Mask_value);
+  fatherT->setName("fatherT");
   std::string endResultName = "";
   Value *taggedPointer = nullptr;
 
@@ -2893,11 +2812,40 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     // code Q: can this fail with maps where something is stored with ptr key
     // and retrieved with tagged/untagged ptr? Q: how much detection power do
     // we lose, if any?
-    if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
-      if (SI->getValueOperand() == GEPI) {
-        safe = false;
-      }
-    }
+    // if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
+    //   if (SI->getValueOperand() == GEPI) {
+    //     safe = false;
+    //   }
+    // }
+
+    // TODO: this is too much, but how do we handle it?
+    // else if (ReturnInst *RI = dyn_cast<ReturnInst>(User)) {
+    //   if (RI->getReturnValue() == GEPI) {
+    //     safe = false;
+    //     // TODO: remove this crap
+    //   }
+    // } else if (CallInst *CI = dyn_cast<CallInst>(User)) {
+    //   auto *callee = CI->getCalledFunction();
+    //   if (!callee) {
+    //     // indirect call, be conservative
+    //     safe = false;
+    //   } else {
+    //     auto nargs = callee->arg_size();
+    //     for (unsigned i = 0; i < nargs; i++) {
+    //       if (CI->getArgOperand(i) == GEPI) {
+    //         safe = false;
+    //       }
+    //     }
+    //   }
+    // }
+
+    // NOTE: the above prevents tagged pointers from being returned, but it's
+    // just a makeshift solution for a weird behavior present inside libstdc++
+    // else errs() << "[HWASAN] GEP instrumentation: checking use in
+    // instruction: " << *User
+    //            << "\n\t resultLong: " << *resultLong << "\n\t GEPI: " <<
+    //            *GEPI
+    //            << "\n";
     return safe;
   });
   NumInstrumentedGEPs++;
@@ -3478,6 +3426,8 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
   std::string TagVecName = t->getStructName().str() + ".fieldarmor.tagvec";
   auto *TagVec = M.getGlobalVariable(TagVecName, true);
   if (TagVec) {
+    errs() << "[FieldArmor] Tag vector " << TagVecName
+           << " already exists, skipping creation.\n";
     return;
   }
   auto size = M.getDataLayout().getTypeAllocSize(t);
@@ -3508,15 +3458,19 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
       M, TagArrayType, true, GlobalVariable::PrivateLinkage, Init, TagVecName);
   NewTagVector_global->setSection("porcodiddio"); // is this necessary?
   appendToCompilerUsed(M, NewTagVector_global);
+  errs() << "[FieldArmor] Created tag vector " << TagVecName << "\n";
   NumDefinedTagVectors++;
 }
 
 void HWAddressSanitizer::createTagVectors() {
   auto identifiedStructTypes = M.getIdentifiedStructTypes();
+  for (auto t : identifiedStructTypes)
+    errs() << "[FieldArmor] Identified StructType: " << *t << "\n";
 
   for (auto t : identifiedStructTypes) {
     StructType *ty = dyn_cast<StructType>(t);
-    errs() << "[FieldArmor] Creating tag vector for StructType " << *t << "\n";
+    // errs() << "[FieldArmor] Creating tag vector for StructType " << *t <<
+    // "\n";
     /** NOTE: opaque types are not sized. */
     if (!ty->isSized()) {
       // Q: what is the solution to this?
@@ -3574,7 +3528,11 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
     auto isLitStr = ST_son && ST_son->isLiteral();
     auto isUnion =
         ST_son && !isLitStr && (ST_son->getName().find("union.") == 0);
-
+    // auto isClass = ST_son && !isLitStr && !isUnion &&
+    //                (ST_son->getName().find("class.") == 0);
+    // TODO: if a class is embedded in a struct and the class has padding in the
+    // end, that is treated as an extra field and can lead to FPs? This has
+    // never happened till now.
     if (ST_son && !isLitStr && !isUnion) {
       u_int8_t newBaseTag = 0; // FLAT scheme introduced here
       uint8_t count = 0;
@@ -3653,6 +3611,10 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
             continue;
           }
 
+          // TODO: handle arrays of C++ classes. What happens if the wrong tag
+          // vector is used? E.g. base vs non-base? Using struct size should be
+          // fine though.
+
           auto structName = structType->getStructName().str();
           auto tagVectorGlobal =
               M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
@@ -3719,13 +3681,15 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
       if (sonType->isStructTy()) {
         StructType *ty = dyn_cast<StructType>(sonType);
         // DEBUG
-        // errs() << "[FieldArmor - WARNING] Treating as scalar EMBEDDED struct
+        // errs() << "[FieldArmor - WARNING] Treating as scalar EMBEDDED
+        // struct
         // "
         //           "field: ";
         // errs() << *ty << "\n";
         // errs() << "container " << *Ty << "\n";
         // errs() << "is opaque " << (ty->isOpaque() ? "true" : "false") <<
-        // "\n"; errs() << "is literal " << (ty->isLiteral() ? "true" : "false")
+        // "\n"; errs() << "is literal " << (ty->isLiteral() ? "true" :
+        // "false")
         // << "\n"; if (!ty->isLiteral())
         //   errs() << "is union "
         //          << ((ty->getName().str().find("union.") == 0) ? "true"
@@ -3764,7 +3728,7 @@ void HWAddressSanitizer::InstrumentConstGEP(ConstantExpr *GEPI) {
   auto nOperands = GEPI->getNumOperands();
   assert(nOperands <= 3); // I expect 3 at most
   if (nOperands == 2) {
-    errs() << "[FieldArmor] CONST GEP with 2 operands found: ";
+    errs() << "[FieldArmor] WARNING: CONST GEP with 2 operands found: ";
     GEPI->print(errs());
     errs() << "\n";
     return;
