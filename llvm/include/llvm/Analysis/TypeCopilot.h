@@ -56,8 +56,9 @@ std::string di_to_ir_type(const std::string &di_type) {
     ir_type.pop_back();
     ptr_level++;
   }
+
   if (ir_type.empty()) {
-    return "unk"; // pure AI guess
+    return "unk"; // pure AI guess, TODO: look into this
   }
 
   // general types, in the table
@@ -70,6 +71,10 @@ std::string di_to_ir_type(const std::string &di_type) {
       ir_type = "\%struct." + ir_type.substr(7);
     } else if (ir_type.find("enum") == 0) {
       ir_type = "i32";
+    } else if (ir_type.find("union") == 0) {
+      ir_type = "\%union." + ir_type.substr(6);
+    } else if (ir_type.find("class") == 0) {
+      ir_type = "\%class." + ir_type.substr(6);
     }
   }
 
@@ -273,9 +278,6 @@ public:
   }
 
   void push_user(Value *value) {
-    // if (!WL) {
-    //   return;
-    // }
     if (!value->hasUseList()) {
       return;
     } // handle CMPs with constants
@@ -600,10 +602,10 @@ public:
     // map structure type to DIType
     DebugInfoFinder finder;
     finder.processModule(*module);
-    // TODO: handle classes, maybe they have rich DBG info as well
-    
+
     for (auto s : module->getIdentifiedStructTypes()) {
-      // NOTE: literal structs are skipped
+      // NOTE: literal structs are skipped. TODO: make sure they no longer
+      // exist.
       if (!s->hasName())
         continue;
       auto isClass = s->getName().find("class.") != StringRef::npos;
@@ -614,8 +616,8 @@ public:
 
       } // is not class
       else {
-        // it's a class
-        errs() << "[TypeCopilot] Found class: " << structName << "\n";
+        // TODO: investigate this, it does not produce anything useful now
+        // errs() << "[TypeCopilot] Found class: " << structName << "\n";
         structName.consume_front("class.");
       } // CLASS CASE
 
@@ -659,7 +661,7 @@ public:
         tg->put(nullptr, &global, di_to_ir_type(di_type_name));
       }
     }
-    // errs() << "[TypeCopilot] Locals initialization...\n";
+
     // parse di local variables
     for (auto &F : *module) {
       for (auto &BB : F) {
@@ -711,6 +713,8 @@ public:
         // TODO: how can some functions not have a type array?
         // process return type
         auto di_type_name = getDITypeName(typearray[0]);
+        errs() << "[TypeCopilot] Function: " << func.getName() << ", return type: "
+               << di_type_name << ", di_to_ir_type: " << di_to_ir_type(di_type_name) << "\n";
         tg->put(nullptr, funcValue, di_to_ir_type(di_type_name), true);
         // errs()<< "HERE" << "\n";
         // process parameters
@@ -875,12 +879,12 @@ public:
     case dwarf::DW_TAG_subroutine_type: {
       auto *subroutine = dyn_cast<DISubroutineType>(ditype);
       name = subroutine->getName();
-      // errs() << "[TypeCopilot] Subroutine Type Name: " << name << "\n";
     } break;
     case dwarf::DW_TAG_class_type:
       name = "class " + ditype->getName().str();
       break;
     case dwarf::DW_TAG_reference_type: {
+      // TODO: this is AI bullshit, look into it
       auto *derived = dyn_cast<DIDerivedType>(ditype);
       auto basename = derived->getBaseType() != nullptr
                           ? getDITypeName(derived->getBaseType())
@@ -888,8 +892,33 @@ public:
       name = basename + "&";
     } break;
 
+    case dwarf::DW_TAG_ptr_to_member_type: {
+      // TODO
+      errs() << "[TypeCopilot] ptr to member DIType: ";
+      ditype->print(errs());
+      errs() << ", ";
+
+      auto *derived = dyn_cast<DIDerivedType>(ditype);
+      if (!derived) {
+        errs() << "[TypeCopilot] Failed to cast to DIDerivedType\n";
+        return "";
+      }
+
+      derived->getBaseType()->print(errs());
+      errs() << "\n";
+      auto *subroutine = dyn_cast<DISubroutineType>(derived->getBaseType());
+      if (subroutine) {
+        auto typearray = subroutine->getTypeArray();
+        if (typearray.size() > 0) {
+          auto ret_type = getDITypeName(typearray[0]);
+          errs() << "[TypeCopilot] ptr to member function return type: "
+                 << ret_type << "\n";
+        }
+      }
+      // TODO: how should I use this?
+    } break;
+
     default:
-      // does not work on C++ classes :(
       errs() << "[TypeCopilot] HANDLE DWARF TAG -> " << tag << "\n";
       break;
     }
@@ -932,6 +961,42 @@ public:
       worklist->push_user(r);
   }
 
+  void processExtractValue(Function *scope, ExtractValueInst &extract) {
+    // associate R with the type of the value that gets extracted
+    Value *r = dyn_cast<Value>(&extract);
+    Value *agg = extract.getAggregateOperand();
+    auto idx = extract.getIndices()[0];
+    // Type* aggType = agg->getType();
+    Type *resType = extract.getType();
+
+    errs() << "[TypeCopilot] processExtractValue: " << extract << ", " << *agg
+           << ", " << idx << ", extracted el type: " << *resType << "\n";
+
+    // if (!tg->isOpaque(scope, agg) && tg->isOpaque(scope, r)) {
+    // if (tg->isOpaque(scope, r)) {
+    //   if (tg->put(scope, r, res))
+    //     worklist->push_user(r);
+    // }
+  }
+
+  void processInsertValue(Function *scope, InsertValueInst &insert) {
+    Value *r = dyn_cast<Value>(&insert);
+    Value *agg = insert.getAggregateOperand();
+    Value *val = insert.getInsertedValueOperand();
+    errs() << "[TypeCopilot] processInsertValue: " << insert << ", " << *agg
+           << ", " << *val << "\n";
+
+    if (!tg->isOpaque(scope, agg) && tg->isOpaque(scope, r)) {
+      if (tg->put(scope, r, tg->get(scope, agg)))
+        worklist->push_user(r);
+    }
+
+    if (!tg->isOpaque(scope, val) && tg->isOpaque(scope, r)) {
+      if (tg->put(scope, r, tg->get(scope, val)))
+        worklist->push_user(r);
+    }
+  }
+  
   void processSelect(Function *scope, SelectInst &select) {
     bool r_updated = false;
     Value *r = dyn_cast<Value>(&select);
@@ -961,8 +1026,9 @@ public:
   }
 
   void processFieldOf(Function *scope, GetElementPtrInst &gep) {
-    // infer base value's type
-    // errs() << "[DBG] GEP processing: " << gep << "\n";
+    // TODO: this cannot work
+    // errs() << "[TypeCopilot] processFieldOf: " << gep
+    //        << ", noperands: " << gep.getNumOperands() << "\n";
     Value *base = gep.getPointerOperand();
     Type *baseType = gep.getSourceElementType();
 
@@ -1179,6 +1245,7 @@ public:
   }
 
   void processCmp(Function *scope, CmpInst &cmp) {
+    // TODO: can this be improved?
     // get value a and b
     Value *a = cmp.getOperand(0);
     Value *b = cmp.getOperand(1);
@@ -1237,19 +1304,16 @@ public:
     diHelper->initialize(&M, tg);
     worklist = new WorkList(&M);
     alias = new TypeAlias(&M, tg, worklist, diHelper);
-
+    std::set<const char *> UnhandledOpcodes;
     if (!diHelper->hasDebugInfo(M)) {
       errs() << "[TypeCopilot] WARNING: " << M.getName()
              << " has no debug info! Type reconstruction will not happen.\n";
-      // assert(false && "Module has no debug info!");
       return nullptr;
     }
 
     while (!worklist->empty()) {
       auto inst = worklist->pop();
       if (auto *cast = dyn_cast<CastInst>(inst)) {
-        // NOTE: this is NOT pointless -> cast == {PtrToInt, IntToPtr, Ext,
-        // etc.}
         alias->processCast(cast->getFunction(), *cast);
       } else if (auto *load = dyn_cast<LoadInst>(inst)) {
         alias->processLoad(load->getFunction(), *load);
@@ -1267,11 +1331,26 @@ public:
         alias->processCall(call->getFunction(), *call);
       } else if (auto *select = dyn_cast<SelectInst>(inst)) {
         alias->processSelect(select->getFunction(), *select);
+      } 
+      // else if(auto* extractvalue = dyn_cast<ExtractValueInst>(inst)) {
+      //   alias->processExtractValue(extractvalue->getFunction(), *extractvalue);
+      // } else if(auto* insertvalue = dyn_cast<InsertValueInst>(inst)) {
+      //   alias->processInsertValue(insertvalue->getFunction(), *insertvalue);
+      // } 
+      else {
+        UnhandledOpcodes.insert(inst->getOpcodeName());
       }
+      // allocas, ret, invoke, call, br, extractvalue etc.
+      // NOTE: allocas are handled elsewhere, it's fine
+      // TODO: what about extractvalue?
     } // while
-    // return TypeCopilotResult(tg);
+    
+    for (auto *t : UnhandledOpcodes) {
+      errs() << "[DBG] Unhandled Inst Opcode: ";
+      errs() << t;
+      errs() << "\n";
+    }
     Ret = std::make_unique<TypeCopilotResult>(tg, diHelper);
-    // errs() << "[DBG] Type Reconstruction Analysis finished.\n";
     return *Ret;
   }
   const TypeCopilotResult &getResult() const { return *Ret; }

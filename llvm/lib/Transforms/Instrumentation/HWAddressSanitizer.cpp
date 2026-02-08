@@ -1710,6 +1710,7 @@ bool HWAddressSanitizer::potentiallyBlacklistFunction(Function &F) {
   return false;
 }
 
+// TODO: handle extractvalue
 void HWAddressSanitizer::sanitizeFunction(Function &F,
                                           FunctionAnalysisManager &FAM) {
   if (&F == HwasanCtorFunction)
@@ -2013,6 +2014,11 @@ Type *fromString(std::string S, LLVMContext &C) {
     return Type::getDoubleTy(C);
   if (S == "void" || S == "void*")
     return Type::getVoidTy(C);
+  if (S.find("**") != std::string::npos || S == "struct.") {
+    // just for convenience
+    // struct. is a literal struct -> TODO: handle later ...
+    return Type::getVoidTy(C);
+  }
   return nullptr;
 }
 
@@ -2020,12 +2026,6 @@ bool augmentSeenTypesFromTypeSet(std::set<Type *> &SeenTypes, const TypeSet *ts,
                                  LLVMContext &C,
                                  std::set<Type *> &allTypesNoFilters) {
   auto before = SeenTypes.size();
-  // auto seenTypesWasEmpty = true;
-  // for( auto &t : SeenTypes){
-  //   seenTypesWasEmpty &= !t->isStructTy();
-  // }
-  // RATIO: if there are no struct types, it's essentially empty!
-
   for (auto &t : ts->types) {
     int levelsOfInd = std::count(t.begin(), t.end(), '*');
 
@@ -2067,7 +2067,7 @@ bool augmentSeenTypesFromTypeSet(std::set<Type *> &SeenTypes, const TypeSet *ts,
       errs() << "\t\t [FieldArmor] WARNING: could not get StructType "
                 "from name: "
              << substringWithNoAsterisk << "\n";
-      Type *tmp = fromString(t, C);
+      Type *tmp = fromString(substringWithNoAsterisk, C);
       if (tmp)
         allTypesNoFilters.insert(tmp);
       continue;
@@ -2086,6 +2086,33 @@ bool augmentSeenTypesFromTypeSet(std::set<Type *> &SeenTypes, const TypeSet *ts,
   return changed;
 } // augmentSeenTypesFromTypeSet
 
+void debugCallSitePrint(CallInst *CI, bool isnew = true) {
+  if (isnew)
+    errs() << "HANDLING CALL TO NEW: ";
+  else
+    errs() << "ALLOC SITE: ";
+  CI->print(errs());
+  errs() << "\n";
+
+  auto demangledFunctionName =
+      demangle(CI->getCalledFunction()->getName().str());
+  errs() << " FUNCTION: " << demangledFunctionName << "\n";
+  if (const DebugLoc &DL = CI->getDebugLoc()) {
+    if (DILocation *Loc = DL.get()) {
+      StringRef File = Loc->getFilename();
+      StringRef Dir = Loc->getDirectory();
+      unsigned Line = Loc->getLine();
+      unsigned Col = Loc->getColumn();
+      errs() << "    LOCATION: " << Dir << "/" << File << ":" << Line << ":"
+             << Col << "\n";
+    }
+  } else
+    errs() << "\tLOCATION: <unknown>\n";
+}
+
+// TODO: patch Frontend to make sure Structs emerge even when they are only used
+// as i8
+
 /** Analyze uses at allocation site, if a type can be reliably reconstructed,
  * then tag memory. This almost never works.*/
 void HWAddressSanitizer::TagAllocChunksBeforeUse(
@@ -2094,9 +2121,12 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
   // TODO: handle ConstExpr GEPs used as pointers in the StoreInsts
   // TODO: convert TypeSet members to IR types
   // TODO: debug arrays of pointers, everything is wrong here!!!
-  std::set<Type *>
-      allTypesNoFilters; // store ALL found type here for statistics
+
+  // store ALL found type here for statistics
+  std::set<Type *> allTypesNoFilters;
+  // store ALL STRUCT type here
   std::set<Type *> SeenTypes;
+
   auto nUses = CI->getNumUses();
   if (nUses == 0) {
     errs() << "[FieldArmor] CORNER CASE: malloc/realloc/calloc return value "
@@ -2105,20 +2135,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
     return;
   }
 
-  errs() << "\n[FieldArmor] ALLOC SITE: " << DemangledName
-         << "\n\tRET: " << *(CI)
-         << "\n\tFUNCTION: " << CI->getFunction()->getName() << "\n";
-  if (const DebugLoc &DL = CI->getDebugLoc()) {
-    if (DILocation *Loc = DL.get()) {
-      StringRef File = Loc->getFilename();
-      StringRef Dir = Loc->getDirectory();
-      unsigned Line = Loc->getLine();
-      unsigned Col = Loc->getColumn();
-      errs() << "\tLOCATION: " << Dir << "/" << File << ":" << Line << ":"
-             << Col << "\n";
-    }
-  } else
-    errs() << "\tLOCATION: <unknown>\n";
+  debugCallSitePrint(CI, false);
 
   for (auto *U : CI->users()) {
     if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
@@ -2127,8 +2144,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
       Type *tmp = GEP->getSourceElementType();
       if (tmp->isStructTy())
         SeenTypes.insert(GEP->getSourceElementType());
-
-      allTypesNoFilters.insert(GEP->getSourceElementType()); // insert anyways
+      allTypesNoFilters.insert(GEP->getSourceElementType());
     } // GEP USER
 
     else if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
@@ -2162,7 +2178,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
           std::string field =
               RetrievedTypes->helper->getDIStructField(StructTy, FieldIdx);
           bool containsPorcodio = false;
-          // errs() << "\t\t DBG DBG DBG Field name: " << field << "\n";
+
           if (field == "") {
             continue;
           } else {
@@ -2203,7 +2219,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
         if (ts)
           augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
         else
-          errs() << "\t\t <none> - TypeCopilot FAIL\n";
+          errs() << "\t\t <none> - TypeCopilot FAIL on GLOBAL VAR TYPE\n";
 
       } // STORE in GLOBAL
 
@@ -2216,7 +2232,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
         if (ts)
           augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
         else
-          errs() << "\t\t ts = <none> - TypeCopilot FAIL\n";
+          errs() << "\t\t ts = <none> - TypeCopilot FAIL on STRUCT FIELD\n";
 
       } // STORE in GEP
       else if (AllocaInst *AI = dyn_cast<AllocaInst>(underlyingObject)) {
@@ -2298,13 +2314,44 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
       }
 
       else {
-        errs() << "\t\t ts = <none> - TypeCopilot FAIL\n";
+        errs() << "\t\t ts = <none> - TypeCopilot FAIL on CALL ARG TYPE\n";
         continue;
       }
       augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
-    }
-
-    else {
+    } else if (ReturnInst *RI = dyn_cast<ReturnInst>(U)) {
+      errs() << "\t\t RET USER: " << *RI << "\n";
+      auto *functionThatIsReturning = RI->getFunction();
+      const TypeSet *ts =
+          RetrievedTypes->lookup(functionThatIsReturning, nullptr);
+      if (ts) {
+        errs() << "\t\t TypeSet from RET TYPE: ";
+        for (auto &t : ts->types) {
+          errs() << t << " ";
+        }
+        errs() << "\n";
+        augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
+      } else
+        errs() << "\t\t ts = <none> - TypeCopilot FAIL on RET TYPE, function: "
+               << *functionThatIsReturning << "\n";
+      // continue;
+    } else if (PHINode *PN = dyn_cast<PHINode>(U)) {
+      errs() << "\t\t PHI USER: " << *PN << "\n";
+      const TypeSet *ts = RetrievedTypes->lookup(PN, PN->getFunction());
+      if (ts) {
+        errs() << "\t\t TypeSet from PHI TYPE: ";
+        for (auto &t : ts->types) {
+          errs() << t << " ";
+        }
+        errs() << "\n";
+        augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
+        for (auto *user : PN->users()) {
+          errs() << "\t\t PHI USER: ";
+          user->print(errs());
+          errs() << "\n";
+        }
+      } else
+        errs() << "\t\t ts = <none> - TypeCopilot FAIL on PHI TYPE\n";
+    } else {
       errs() << "\t\t OTHER USER: ";
       U->print(errs());
       errs() << "\n";
@@ -2321,55 +2368,29 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
         errs() << "\n";
       }
     } else
-      errs() << "[FieldArmor]\tTYPE RECON: no types found at all. Bailing "
-                "out.\n";
+      errs() << "[FieldArmor]\tTYPE RECON: no types found at all. \n";
     return;
   }
 
   if (SeenTypes.size() > 1) {
-    std::vector<Type *> TypesToRemove;
+    // TODO: handle each path separately
+    // TODO: potentially handle inheritance
+    errs() << "[FieldArmor]\tAMBIGUITY. Types: \n";
     for (auto *type : SeenTypes) {
-      if (!type->isStructTy())
-        TypesToRemove.push_back(type);
-    }
-    for (auto *type : TypesToRemove) {
-      errs() << "[FieldArmor]\tRemoving non-struct type from SeenTypes: ";
+      errs() << "\t Type: ";
       type->print(errs());
       errs() << "\n";
-      SeenTypes.erase(type);
     }
-
-    if (SeenTypes.empty()) {
-      errs() << "[FieldArmor]\tTYPE RECON FAIL: NO STRUCT TYPE FOUND. \n";
-      return;
-    }
-
-    if (SeenTypes.size() > 1) {
-      // TODO: handle n paths separately, or at least try, unless they are in
-      // some loop?
-      errs() << "[FieldArmor]\tTYPE RECON FAIL: ambiguity. Bailing out.\n";
-      for (auto *type : SeenTypes) {
-        errs() << "\t Type: ";
-        type->print(errs());
-        errs() << "\n";
-      }
-      return;
-    }
-  } // more than 1 type
-
-  if (SeenTypes.empty()) {
-    errs() << "[FieldArmor]\tTYPE RECON FAIL: no struct types found. Bailing "
-              "out.\n";
     return;
-  }
+  } // AMBIGUITY
 
+  // SeenTypes contains exactly 1 struct type
   Type *type = *SeenTypes.begin();
-  // if (!type->isStructTy())
-  //   return;
+
   assert(type->isStructTy() &&
          "After filtering, only struct types should remain in SeenTypes");
 
-  errs() << "[FieldArmor]\tTYPE RECON SUCCESS! Inferred type: ";
+  errs() << "[FieldArmor]\tTYPE RECON SUCCESS! Inferred type: \n\t\t";
   type->print(errs());
   errs() << "\n";
 
@@ -2385,6 +2406,17 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
   }
 
   auto tagVector = M.getGlobalVariable(
+      srcType->getStructName().str() + ".fieldarmor.tagvec", true);
+  if (!tagVector) {
+    // try with .base suffix, in case it's a class without RTTI info
+    tagVector = M.getGlobalVariable(
+        srcType->getStructName().str() + ".base.fieldarmor.tagvec", true);
+  }
+
+  if (!tagVector) {
+    createTagVector(srcType);
+  }
+  tagVector = M.getGlobalVariable(
       srcType->getStructName().str() + ".fieldarmor.tagvec", true);
   assert(tagVector && "Tag vector for malloc'd struct type does not exist!");
 
@@ -2416,26 +2448,6 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
   SeenTypes.clear();
 } // TagAllocChunksBeforeUse
 
-void debugCallSitePrint(CallInst *CI) {
-  errs() << "HANDLING CALL TO NEW: ";
-  CI->print(errs());
-  errs() << "\n";
-  auto demangledFunctionName =
-      demangle(CI->getCalledFunction()->getName().str());
-  errs() << " FUNCTION: " << demangledFunctionName << "\n";
-  if (const DebugLoc &DL = CI->getDebugLoc()) {
-    if (DILocation *Loc = DL.get()) {
-      StringRef File = Loc->getFilename();
-      StringRef Dir = Loc->getDirectory();
-      unsigned Line = Loc->getLine();
-      unsigned Col = Loc->getColumn();
-      errs() << "\tLOCATION: " << Dir << "/" << File << ":" << Line << ":"
-             << Col << "\n";
-    }
-  } else
-    errs() << "\tLOCATION: <unknown>\n";
-}
-
 Value *retrieveTagVector(StructType *srcType, Module &M, bool try_base = true) {
   auto typeName = srcType->getStructName().str();
   bool isClass = typeName.find("class.") == 0;
@@ -2460,6 +2472,8 @@ void HWAddressSanitizer::HandleNewOperator(CallInst *CI,
                                            const std::string &DemangledName) {
   // infer type for new operator
   std::set<Type *> SeenTypes;
+  std::set<Type *> allTypesNoFilters;
+
   debugCallSitePrint(CI);
   for (auto *user : CI->users()) {
     errs() << "\t USER OF NEW OPERATOR: ";
@@ -2473,13 +2487,17 @@ void HWAddressSanitizer::HandleNewOperator(CallInst *CI,
       std::string typeName;
       raw_string_ostream rso(typeName);
       GEPType->print(rso);
+
       // NOTE: when allocating arrays of ptrs, the GEP source type is ptr
-      if (!(typeName == "ptr"))
-        SeenTypes.insert(GEPType);
-      else
-        // array of ptrs
-        errs() << "[FieldArmor]\t\tTYPE RECON: UNINTERESTING: \n";
-    }
+      if (!(typeName == "ptr")) {
+        if (GEPType->isStructTy())
+          SeenTypes.insert(GEPType);
+        allTypesNoFilters.insert(GEPType);
+      } else {
+        allTypesNoFilters.insert(GEPType);
+        errs() << "[FieldArmor]\t\tTYPE RECON: UNINTERESTING: \n\t\t";
+      }
+    } // GEP USER
 
     // H1 : if a user is a call to strlen, strcpy and similar, then it's a
     // string
@@ -2488,19 +2506,40 @@ void HWAddressSanitizer::HandleNewOperator(CallInst *CI,
 
       if (!Callee) {
         // NOTE: I think we can't do anything in this case
-        errs() << "\t\t CALL USER INDIRECT CALL: ";
+        errs() << "\t\t WARNING: IGNORING CALL USER INDIRECT CALL: ";
         CI->print(errs());
         errs() << "\n";
         continue;
       }
+
       std::string calleeName = demangle(Callee->getName().str());
       if (calleeName == "strlen" || calleeName == "strcpy" ||
           calleeName == "strcmp" || calleeName == "strcat") {
         errs()
             << "[FieldArmor]\tTYPE RECON: UNINTERESTING: called function is ";
         errs() << calleeName << "\n";
+        // allTypesNoFilters.insert(
+        //     Type::getInt8Ty(*C)); // it's a string, add char type to stats
         return; // ignore this allocation site
       }
+
+      // TODO: complete!
+      auto nArgs = Callee->arg_size();
+      for (unsigned i = 0; i < nArgs; i++) {
+        if (CI->getArgOperand(i) == user) {
+          errs() << "\t\t ARG " << i << " of call to " << calleeName << "\n";
+          const TypeSet *ts = RetrievedTypes->lookup(Callee->getArg(i), Callee);
+          if (ts) {
+            errs() << "\t\t TypeSet from CALL ARG TYPE: ";
+            for (auto &t : ts->types) {
+              errs() << t << " ";
+            }
+            errs() << "\n";
+            augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
+          } else
+            errs() << "\t\t ts = <none> - TypeCopilot FAIL on CALL ARG TYPE\n";
+        } // if arg matches
+      } // for each arg
     } // CALL INST USER
 
     // H2: handle PHI, many ptrs are null and maybe what's created has a type
@@ -2508,48 +2547,71 @@ void HWAddressSanitizer::HandleNewOperator(CallInst *CI,
       errs() << "\t\t PHI NODE USER: ";
       PN->print(errs());
       errs() << "\n";
-
-      for (unsigned i = 0; i < PN->getNumIncomingValues(); i++) {
-        Value *incoming = PN->getIncomingValue(i);
-        // if incoming is a null ptr, skip
-        if (ConstantPointerNull *CPN = dyn_cast<ConstantPointerNull>(incoming))
-          continue;
-        if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(incoming)) {
-          errs() << "\t\t GEP incoming value to PHI: ";
-          GEPI->print(errs());
-          errs() << "\n";
-          auto *GEPType = GEPI->getSourceElementType();
-          errs() << "\t\t GEP TYPE: ";
-          GEPType->print(errs());
-          errs() << "\n";
-
-          std::string typeName;
-          raw_string_ostream rso(typeName);
-          GEPType->print(rso);
-          // NOTE: when allocating arrays of ptrs, the GEP source type is ptr
-
-          if (!(typeName == "ptr"))
-            SeenTypes.insert(GEPType);
-          else {
-            // array of ptrs
-            errs() << "[FieldArmor]\t NOT ADDING TO SEENTYPES: \n";
-            GEPType->print(errs());
-            errs() << "\n";
-          }
-        } // GEP incoming value
-      } // for each incoming value
+      const TypeSet *ts = RetrievedTypes->lookup(PN, PN->getFunction());
+      if (ts) {
+        errs() << "\t\t TypeSet from PHI NODE type: ";
+        for (auto &t : ts->types) {
+          errs() << t << " ";
+        }
+        errs() << "\n";
+        augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
+      } else
+        errs() << "\t\t ts = <none> - TypeCopilot FAIL on PHI NODE TYPE\n";
+      for (auto *user : PN->users()) {
+        errs() << "\t\t PHI USER: ";
+        user->print(errs());
+        errs() << "\n";
+      }
     } // PHI NODE USER
-  }
+
+    if (StoreInst *SI = dyn_cast<StoreInst>(user)) {
+      errs() << "\t\t STORE USER: ";
+      SI->print(errs());
+      errs() << "\n";
+      Value *whatIsStored = SI->getValueOperand();
+      Value *whereToStore = SI->getPointerOperand();
+
+      if (whereToStore == CI) {
+        // is struct? Is array?
+        // TODO
+        // TODO: handle above as well!
+      }
+
+      else if (whatIsStored == CI) {
+        // TODO
+        const TypeSet *ts =
+            RetrievedTypes->lookup(whereToStore, SI->getFunction());
+        if (ts) {
+          errs() << "\t\t TypeSet from STORE destination type: ";
+          for (auto &t : ts->types) {
+            errs() << t << " ";
+          }
+          errs() << "\n";
+          augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
+        } else
+          errs() << "\t\t ts = <none> - TypeCopilot FAIL on STORE destination "
+                    "type\n";
+      }
+    } // STORE USER
+
+    if (ExtractValueInst *EVI = dyn_cast<ExtractValueInst>(user)) {
+      errs() << "\t\t EXTRACTVALUE USER: ";
+      EVI->print(errs());
+      errs() << "\n";
+      auto *EVIType = EVI->getType();
+      EVIType->print(errs());
+      errs() << "\n";
+    }
+  } // for each user
 
   auto *ts = RetrievedTypes->lookup(CI, CI->getFunction());
   if (!ts) {
-    errs() << "\t\t ts = <none> - TypeCopilot FAIL\n";
-  } else
+    errs()
+        << "\t\t ts = <none> - TypeCopilot FAIL for return type of the new\n";
+  } else {
     for (auto &t : ts->types)
-      errs() << "\t\t T: " << t << "\n";
-
-  if (SeenTypes.size() > 1) {
-    errs() << "[FieldArmor]\t WARNING: more than 1 type id\n";
+      errs() << "\t\t (new) T: " << t << "\n";
+    augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
   }
 
   std::set<StructType *> structTypes;
@@ -2560,15 +2622,32 @@ void HWAddressSanitizer::HandleNewOperator(CallInst *CI,
   }
 
   if (structTypes.size() == 0) {
-    errs() << "[FieldArmor]\t TYPE RECON: UNINTERESTING ?.\n";
-    return;
-  } else if (structTypes.size() > 1) {
-    errs() << "[FieldArmor]\t TYPE RECON: AMBIGUITY. BAILING OUT.\n";
-    // return;
+    if (!allTypesNoFilters.empty()) {
+      errs() << "[FieldArmor]\t TYPE RECON: UNINTERESTING: \n";
+      for (auto *type : SeenTypes) {
+        errs() << "\t Type: ";
+        type->print(errs());
+        errs() << "\n";
+      }
+    } else {
+      errs() << "[FieldArmor]\t TYPE RECON: no types found at all\n";
+    }
     return;
   }
+
+  else if (structTypes.size() > 1) {
+    // TODO: handle inheritance!
+    errs() << "[FieldArmor]\t TYPE RECON: AMBIGUITY. Types: \n";
+    for (auto *type : structTypes) {
+      errs() << "\t Type: ";
+      type->print(errs());
+      errs() << "\n";
+    }
+    return;
+  }
+
   auto *t = *structTypes.begin();
-  errs() << "\t\t TYPE RECON SUCCESS: ";
+  errs() << "\t\t TYPE RECON SUCCESS: Inferred type: \n\t\t";
   t->print(errs());
   errs() << "\n";
 
@@ -3458,14 +3537,14 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
       M, TagArrayType, true, GlobalVariable::PrivateLinkage, Init, TagVecName);
   NewTagVector_global->setSection("porcodiddio"); // is this necessary?
   appendToCompilerUsed(M, NewTagVector_global);
-  errs() << "[FieldArmor] Created tag vector " << TagVecName << "\n";
+  // errs() << "[FieldArmor] Created tag vector " << TagVecName << "\n";
   NumDefinedTagVectors++;
 }
 
 void HWAddressSanitizer::createTagVectors() {
   auto identifiedStructTypes = M.getIdentifiedStructTypes();
-  for (auto t : identifiedStructTypes)
-    errs() << "[FieldArmor] Identified StructType: " << *t << "\n";
+  // for (auto t : identifiedStructTypes)
+  //   errs() << "[FieldArmor] Identified StructType: " << *t << "\n";
 
   for (auto t : identifiedStructTypes) {
     StructType *ty = dyn_cast<StructType>(t);
