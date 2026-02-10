@@ -694,7 +694,7 @@ public:
         }
       }
     }
-    // errs() << "[TypeCopilot] Function initialization...\n";
+    
     for (auto &func : *module) {
       Value *funcValue = dyn_cast<Value>(&func);
 
@@ -713,8 +713,10 @@ public:
         // TODO: how can some functions not have a type array?
         // process return type
         auto di_type_name = getDITypeName(typearray[0]);
-        errs() << "[TypeCopilot] Function: " << func.getName() << ", return type: "
-               << di_type_name << ", di_to_ir_type: " << di_to_ir_type(di_type_name) << "\n";
+        // errs() << "[TypeCopilot] Function: " << func.getName() << ", return
+        // type: "
+        //        << di_type_name << ", di_to_ir_type: " <<
+        //        di_to_ir_type(di_type_name) << "\n";
         tg->put(nullptr, funcValue, di_to_ir_type(di_type_name), true);
         // errs()<< "HERE" << "\n";
         // process parameters
@@ -880,9 +882,26 @@ public:
       auto *subroutine = dyn_cast<DISubroutineType>(ditype);
       name = subroutine->getName();
     } break;
-    case dwarf::DW_TAG_class_type:
-      name = "class " + ditype->getName().str();
-      break;
+    case dwarf::DW_TAG_class_type: {
+      
+      std::string ns = "";
+      auto scope = ditype->getScope();
+      if (scope) {
+        auto *discope = dyn_cast<DIScope>(scope);
+        if (discope) {
+          auto porcodio = discope->getName();
+          // if (porcodio != nullptr) {
+          std::string ns_name = porcodio.str();
+          if (!ns_name.empty())
+            ns = ns_name + "::";
+        }
+      }
+
+      name = "class " + ns + ditype->getName().str();
+      // name = ns + ditype->getName().str();
+      errs() << "[TypeCopilot] Found class " << name << " with SCOPE ns: " << ns
+             << "\n";
+    } break;
     case dwarf::DW_TAG_reference_type: {
       // TODO: this is AI bullshit, look into it
       auto *derived = dyn_cast<DIDerivedType>(ditype);
@@ -996,7 +1015,7 @@ public:
         worklist->push_user(r);
     }
   }
-  
+
   void processSelect(Function *scope, SelectInst &select) {
     bool r_updated = false;
     Value *r = dyn_cast<Value>(&select);
@@ -1058,10 +1077,6 @@ public:
             // if baseType is op, divert to DIType
             if (tyHelper->isOpaque(typeName) && i == gep.getNumOperands() - 1) {
               typeName = diHelper->getDIStructField(structType, index);
-              // errs() << "[DBG] FIELD TYPE: " << typeName << " IDX: " << index
-              //        << " BASE TYPE: "; // FOR LATER
-              // structType->dump();
-              // errs() << "\n";
             }
           }
         } else if (auto *arrayType = dyn_cast<ArrayType>(baseType)) {
@@ -1331,20 +1346,21 @@ public:
         alias->processCall(call->getFunction(), *call);
       } else if (auto *select = dyn_cast<SelectInst>(inst)) {
         alias->processSelect(select->getFunction(), *select);
-      } 
+      }
       // else if(auto* extractvalue = dyn_cast<ExtractValueInst>(inst)) {
-      //   alias->processExtractValue(extractvalue->getFunction(), *extractvalue);
+      //   alias->processExtractValue(extractvalue->getFunction(),
+      //   *extractvalue);
       // } else if(auto* insertvalue = dyn_cast<InsertValueInst>(inst)) {
       //   alias->processInsertValue(insertvalue->getFunction(), *insertvalue);
-      // } 
+      // }
       else {
         UnhandledOpcodes.insert(inst->getOpcodeName());
       }
       // allocas, ret, invoke, call, br, extractvalue etc.
       // NOTE: allocas are handled elsewhere, it's fine
-      // TODO: what about extractvalue?
+      // TODO: potentially handle extractvalue and insertvalue
     } // while
-    
+
     for (auto *t : UnhandledOpcodes) {
       errs() << "[DBG] Unhandled Inst Opcode: ";
       errs() << t;

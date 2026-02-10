@@ -1804,7 +1804,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       }
 
       else if (demangledName.find("operator new") != std::string::npos) {
-        CallsToNew.push_back(std::make_pair(CI, demangledName));
+        CallsToAllocator.push_back(std::make_pair(CI, demangledName));
       }
     }
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(&Inst)) {
@@ -1845,9 +1845,10 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     TagAllocChunksBeforeUse(PAIR.first, PAIR.second);
   }
 
-  for (auto &PAIR : CallsToNew) {
-    HandleNewOperator(PAIR.first, PAIR.second);
-  }
+  // for (auto &PAIR : CallsToNew) {
+  //   // HandleNewOperator(PAIR.first, PAIR.second);
+  //   TagAllocChunksBeforeUse(PAIR.first, PAIR.second);
+  // }
 
   if (!SInfo.AllocasToInstrument.empty()) {
     const DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
@@ -1965,7 +1966,6 @@ Value *HWAddressSanitizer::GetArraySize(CallInst *CI, StructType *t,
     return 0;
   }
 
-  // errs() << "[FieldArmor] SIZE RECON for: " << demangledName << "\n";
   uint64_t typeSize = M.getDataLayout().getTypeAllocSize(t);
 
   if (typeSize == 0) {
@@ -1989,15 +1989,24 @@ Value *HWAddressSanitizer::GetArraySize(CallInst *CI, StructType *t,
     return IRB.CreateUDiv(ReallocSizeValue, TypeSizeValue);
   } else if (demangledName == "reallocarray") {
     return IRB.CreateZExt(CI->getArgOperand(1), Int64Ty);
+  } else if (demangledName.find("operator new") != std::string::npos) {
+    bool isArrayNew = (demangledName.find("new[]") != std::string::npos);
+    Value *NewSizeValue = IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
+    if (isArrayNew) {
+      return IRB.CreateUDiv(NewSizeValue, TypeSizeValue);
+    } else {
+      return ConstantInt::get(Int64Ty, 1);
+    }
   }
-  // TODO: handle the rest of allocators
+
   errs() << "[FieldArmor] WARNING: allocator not handled for size "
             "reconstruction: "
          << demangledName << "\n";
   return nullptr;
 }
+
 Type *fromString(std::string S, LLVMContext &C) {
-  // TODO: complete
+  // TODO: complete for classes
   if (S == "i1")
     return Type::getInt1Ty(C);
   if (S == "i8" || S == "i8*")
@@ -2019,25 +2028,40 @@ Type *fromString(std::string S, LLVMContext &C) {
     // struct. is a literal struct -> TODO: handle later ...
     return Type::getVoidTy(C);
   }
+  if (S.find("class.") != std::string::npos ||
+      S.find("union.") != std::string::npos)
+    // TODO: refine
+    return Type::getVoidTy(C);
   return nullptr;
 }
 
-bool augmentSeenTypesFromTypeSet(std::set<Type *> &SeenTypes, const TypeSet *ts,
-                                 LLVMContext &C,
-                                 std::set<Type *> &allTypesNoFilters) {
-  auto before = SeenTypes.size();
+// returns if TS is ambiguous
+bool augmentstructTypesFromTypeSet(std::set<Type *> &structTypes,
+                                   const TypeSet *ts, LLVMContext &C,
+                                   std::set<Type *> &seenTypes) {
+  auto before = structTypes.size();
+  int count = 0;
+  for (auto &t : ts->types)
+    if (t.find("class.") != std::string::npos ||
+        t.find("struct.") != std::string::npos)
+      count++;
+  if (count > 1) {
+    errs() << "\t\t [FieldArmor] WARNING amb: TypeSet contains multiple "
+              "struct/class types, skipping TypeSet.\n";
+    for (auto &t : ts->types){
+      errs() << "\t\t\t TypeSet type: " << t << "\n";
+    }
+    return true;
+  }
   for (auto &t : ts->types) {
     int levelsOfInd = std::count(t.begin(), t.end(), '*');
 
     if (levelsOfInd > 2) {
       errs() << "\t\t [FieldArmor] WARNING: skipping array of pointers: " << t
              << "\n";
-      // I assume I can tag chunks as their pointers are created and
-      // they are allocated and store here
-      // TODO: this could be a corner case
       Type *tmp = fromString(t, C);
       if (tmp)
-        allTypesNoFilters.insert(tmp);
+        seenTypes.insert(tmp);
       return false;
     }
     bool containsPorcodio = (t.find('%') != std::string::npos);
@@ -2049,53 +2073,51 @@ bool augmentSeenTypesFromTypeSet(std::set<Type *> &SeenTypes, const TypeSet *ts,
 
     StructType *ST = StructType::getTypeByName(C, substringWithNoAsterisk);
     if (!ST) {
-
-      // try again, maybe it's a union
+      // try again, maybe it's a union and TypeCopilot puts spaces
       std::string maybeUnionName = substringWithNoAsterisk;
       std::replace(maybeUnionName.begin(), maybeUnionName.end(), ' ', '.');
-
       ST = StructType::getTypeByName(C, maybeUnionName);
       if (ST) {
-        errs() << "\t\t Retrieved StructType (union?) from name: " << t
+        errs() << "\t\t Retrieved StructType from name: " << t
                << " levels of indirection: " << levelsOfInd << "\n";
         ST->print(errs());
         errs() << "\n";
-        SeenTypes.insert(ST);
-        allTypesNoFilters.insert(ST);
+        structTypes.insert(ST);
+        seenTypes.insert(ST);
         continue;
+      } else {
+        errs() << "\t\t [FieldArmor] WARNING: could not get StructType "
+                  "from name: "
+               << substringWithNoAsterisk << "\n";
       }
-      errs() << "\t\t [FieldArmor] WARNING: could not get StructType "
-                "from name: "
-             << substringWithNoAsterisk << "\n";
+
+      // classes names only make sense inside a namespace
+      // TODO: handle this
       Type *tmp = fromString(substringWithNoAsterisk, C);
       if (tmp)
-        allTypesNoFilters.insert(tmp);
+        seenTypes.insert(tmp);
       continue;
     } else
       errs() << "\t\t Retrieved StructType from name: " << t
              << " levels of indirection: " << levelsOfInd << "\n";
     ST->print(errs());
     errs() << "\n";
-    SeenTypes.insert(ST);
-    allTypesNoFilters.insert(ST);
+    structTypes.insert(ST);
+    seenTypes.insert(ST);
   }
-  bool changed = (SeenTypes.size() - before) > 0;
-  if (changed)
-    errs() << "\t\t [FieldArmor] INTERESTING INFO: populated SeenTypes from "
-              "TypeSet.\n";
-  return changed;
-} // augmentSeenTypesFromTypeSet
+  // bool changed = (structTypes.size() - before) > 0;
+  // if (changed)
+  //   errs() << "\t\t [FieldArmor] INTERESTING INFO: populated structTypes from "
+  //             "TypeSet.\n";
+  return false;
+} // augmentstructTypesFromTypeSet
 
-void debugCallSitePrint(CallInst *CI, bool isnew = true) {
-  if (isnew)
-    errs() << "HANDLING CALL TO NEW: ";
-  else
-    errs() << "ALLOC SITE: ";
+void debugCallSitePrint(CallInst *CI,
+                        const std::string &demangledFunctionName) {
+  errs() << "ALLOC SITE: ";
   CI->print(errs());
   errs() << "\n";
 
-  auto demangledFunctionName =
-      demangle(CI->getCalledFunction()->getName().str());
   errs() << " FUNCTION: " << demangledFunctionName << "\n";
   if (const DebugLoc &DL = CI->getDebugLoc()) {
     if (DILocation *Loc = DL.get()) {
@@ -2110,54 +2132,84 @@ void debugCallSitePrint(CallInst *CI, bool isnew = true) {
     errs() << "\tLOCATION: <unknown>\n";
 }
 
+Value *retrieveTagVector(StructType *srcType, Module &M, bool try_base = true) {
+  auto typeName = srcType->getStructName().str();
+  // bool isClass = typeName.find("class.") == 0;
+  bool isBase = typeName.find(".base") != std::string::npos;
+  //isClass && 
+
+  std::string lookupName = typeName;
+  if (!isBase && try_base)
+    lookupName = typeName + ".base";
+
+  auto tagVector = M.getGlobalVariable(lookupName + ".fieldarmor.tagvec", true);
+  if (!tagVector) {
+    errs() << "[FieldArmor] LOOKUP ERROR: Tag vector for struct type: ";
+    srcType->print(errs());
+    errs() << "lookup type: " << lookupName;
+    errs() << "\n";
+    return nullptr;
+  }
+
+  errs() << "[FieldArmor] LOOKUP OK: Retrieved tag vector for LOOKUP NAME: "
+         << lookupName << ", type name: " << typeName << "\n";
+  return tagVector;
+}
+
 // TODO: patch Frontend to make sure Structs emerge even when they are only used
 // as i8
+
+// TODO: handle xmalloc and xcalloc, these wrappers are simple
+// TODO: handle ConstExpr GEPs used as pointers in the StoreInsts
+// TODO: convert TypeSet members to IR types
+// TODO: debug arrays of pointers, everything is wrong here!!!
 
 /** Analyze uses at allocation site, if a type can be reliably reconstructed,
  * then tag memory. This almost never works.*/
 void HWAddressSanitizer::TagAllocChunksBeforeUse(
     CallInst *CI, const std::string &DemangledName) {
-  // TODO: handle xmalloc and xcalloc, these wrappers are simple
-  // TODO: handle ConstExpr GEPs used as pointers in the StoreInsts
-  // TODO: convert TypeSet members to IR types
-  // TODO: debug arrays of pointers, everything is wrong here!!!
-
-  // store ALL found type here for statistics
-  std::set<Type *> allTypesNoFilters;
-  // store ALL STRUCT type here
-  std::set<Type *> SeenTypes;
+  std::set<Type *> seenTypes;
+  std::set<Type *> structTypes;
+  debugCallSitePrint(CI, DemangledName);
 
   auto nUses = CI->getNumUses();
   if (nUses == 0) {
+    // TODO: this is weird, but it happens in some benchmarks.
     errs() << "[FieldArmor] CORNER CASE: malloc/realloc/calloc return value "
               "not used: "
            << *CI << "\n";
     return;
   }
-
-  debugCallSitePrint(CI, false);
-
+  bool ambiguous = false;
   for (auto *U : CI->users()) {
+
     if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
       if (GEP->getOperand(0) != CI)
         continue;
       Type *tmp = GEP->getSourceElementType();
-      if (tmp->isStructTy())
-        SeenTypes.insert(GEP->getSourceElementType());
-      allTypesNoFilters.insert(GEP->getSourceElementType());
+      std::string typeName;
+      raw_string_ostream rso(typeName);
+      tmp->print(rso);
+
+      if (tmp->isStructTy() && typeName != "ptr")
+        structTypes.insert(tmp);
+      seenTypes.insert(tmp);
     } // GEP USER
 
     else if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-      // process stores OF the malloc'd pointer
-      auto whatIsStored = SI->getValueOperand();
-      if (whatIsStored != CI)
-        continue;
-      auto whereToStore = SI->getPointerOperand();
-      auto underlyingObject = getUnderlyingObject(whereToStore);
+      auto valueOperand = SI->getValueOperand();
 
-      if (ConstantExpr *CR = dyn_cast<ConstantExpr>(whereToStore)) {
-        // GEPs into GV are CEs
+      if (valueOperand != CI)
+        continue; // TODO
+
+      auto ptrOperand = SI->getPointerOperand();
+      auto underlyingObject = getUnderlyingObject(ptrOperand);
+
+      if (ConstantExpr *CR = dyn_cast<ConstantExpr>(ptrOperand)) {
+        // Storing the ptr inside a field of a GV struct
+
         if (CR->getOpcode() == Instruction::GetElementPtr) {
+          // TODO: extend this case to handle arrays!
           GlobalVariable *GV = dyn_cast<GlobalVariable>(underlyingObject);
           if (!GV || !GV->getValueType()->isStructTy())
             continue;
@@ -2165,6 +2217,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
           errs() << "\t\t STORE IN CONSTEXPR GEP: " << *CR << "\n";
           errs() << "\t\t Underlying object of CE GEP: ";
           underlyingObject->print(errs());
+
           auto *GEP = dyn_cast<GEPOperator>(CR);
           auto *offset = GEP->getOperand(1);
           auto *ConstOffset = dyn_cast<ConstantInt>(offset);
@@ -2180,10 +2233,16 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
           bool containsPorcodio = false;
 
           if (field == "") {
+            errs()
+                << "\t\t [FieldArmor] WARNING: could not get field name from "
+                   "debug info for struct: ";
+            StructTy->print(errs());
+            errs() << " field index: " << FieldIdx << "\n";
             continue;
           } else {
             containsPorcodio = (field.find("%") != std::string::npos);
           }
+
           auto subStringSize =
               field.find_first_of('*') -
               (containsPorcodio ? field.find_first_of('%') + 1 : 0);
@@ -2193,7 +2252,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
 
           StructType *FieldType = StructType::getTypeByName(*C, clean_name);
           if (FieldType) {
-            SeenTypes.insert(FieldType);
+            structTypes.insert(FieldType);
             errs() << "\t\t Retrieved StructType from field name: " << field
                    << "\n";
             FieldType->print(errs());
@@ -2206,48 +2265,94 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
           // STATISTICS
           Type *tmp = fromString(clean_name, *C);
           if (tmp)
-            allTypesNoFilters.insert(tmp);
+            seenTypes.insert(tmp);
           // STATISTICS
+        } // STORE in CONSTEXPR GEP
+        else {
+          errs() << "\t\t [FieldArmor] WARNING: STORE in UNKNOWN CONSTEXPR "
+                 << *CR << "\n";
         }
       } // STORE in FIELD of GLOBAL via CONSTEXPR GEP
 
       else if (GlobalVariable *GV =
                    dyn_cast<GlobalVariable>(underlyingObject)) {
+        // storing in a global pointer
         errs() << "\t\t STORE IN GLOBAL: " << *GV << "\n";
-        auto F = SI->getFunction();
-        const TypeSet *ts = RetrievedTypes->lookup(GV, F);
+
+        // auto F = SI->getFunction();
+        const TypeSet *ts = RetrievedTypes->lookup(GV, nullptr);
+
         if (ts)
-          augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
+          ambiguous =
+              augmentstructTypesFromTypeSet(structTypes, ts, *C, seenTypes);
         else
           errs() << "\t\t <none> - TypeCopilot FAIL on GLOBAL VAR TYPE\n";
-
       } // STORE in GLOBAL
 
-      else if (GetElementPtrInst *GEP_where_stored =
-                   dyn_cast<GetElementPtrInst>(whereToStore)) {
-        errs() << "\t\t STORE IN STRUCT FIELD   " << *GEP_where_stored << "\n";
+      else if (GetElementPtrInst *GEP_ptrOperand =
+                   dyn_cast<GetElementPtrInst>(ptrOperand)) {
+        errs() << "\t\t STORE IN STRUCT FIELD   " << *GEP_ptrOperand << "\n";
+        // TODO: extend this case to handle arrays!
+        bool isTwoOpGEP = GEP_ptrOperand->getNumOperands() == 2; // access to an array of something
+        if(isTwoOpGEP){
+          std::string op_name = GEP_ptrOperand->getOperand(0)->getName().str();
+          errs() << "\t\t Two-op GEP detected, name: " << op_name << "\n";
+          if(!op_name.empty() && op_name.find("invariant.") != std::string::npos){
+            // 100% mistaken if you use this
+            errs() << "\t\t [FieldArmor] WARNING: skipping invariant GEP: " << *GEP_ptrOperand << "\n";
+            continue;
+          }
+          auto * GEPType = GEP_ptrOperand->getSourceElementType();
+          seenTypes.insert(GEPType); // this might insert i8 on GEP structs? TODO
+          if(GEPType->isStructTy()){
+            structTypes.insert(GEPType);
+            errs() << "\t\t Retrieved StructType from 2-op GEP: ";
+            GEPType->print(errs());
+            errs() << "\n";
+            continue;
+          }
 
+        }
         const TypeSet *ts =
-            RetrievedTypes->lookup(GEP_where_stored, SI->getFunction());
+            RetrievedTypes->lookup(GEP_ptrOperand, SI->getFunction());
         if (ts)
-          augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
+          ambiguous =
+              augmentstructTypesFromTypeSet(structTypes, ts, *C, seenTypes);
         else
           errs() << "\t\t ts = <none> - TypeCopilot FAIL on STRUCT FIELD\n";
-
+        
       } // STORE in GEP
+
       else if (AllocaInst *AI = dyn_cast<AllocaInst>(underlyingObject)) {
-        errs() << "\t\t STORE IN ALLOCA: TODO " << *AI << "\n";
+        errs() << "\t\t STORE IN ALLOCA: " << *AI << "\n";
+        const TypeSet *ts = RetrievedTypes->lookup(AI, SI->getFunction());
+        if (ts)
+          ambiguous =
+              augmentstructTypesFromTypeSet(structTypes, ts, *C, seenTypes);
+        else
+          errs() << "\t\t ts = <none> - TypeCopilot FAIL on ALLOCA\n";
+        auto *type = AI->getAllocatedType();
+        if (type->isStructTy()) {
+          structTypes.insert(type);
+          errs() << "\t\t Retrieved StructType from alloca: ";
+          type->print(errs());
+          errs() << "\n";
+        }
+        seenTypes.insert(type);
         continue;
       } // STORE in ALLOCA
+
       else if (PHINode *PN = dyn_cast<PHINode>(underlyingObject)) {
         errs() << "\t\t STORE IN PHI NODE: TODO " << *PN << "\n";
+        // processPHI(PN, seenTypes, structTypes); // TODO
         continue;
       } // STORE in PHI
       else {
+        // TODO:
         errs() << "\t\t [FieldArmor] WARNING: STORE in UNKNOWN ptr TODO: ";
-        whereToStore->print(errs());
+        ptrOperand->print(errs());
         errs() << "\n";
-        auto underlyingObject = getUnderlyingObject(whereToStore);
+        auto underlyingObject = getUnderlyingObject(ptrOperand);
         errs() << "\t\t Underlying object: ";
         underlyingObject->print(errs());
         errs() << "\n";
@@ -2256,9 +2361,9 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
     } // STORE USER
 
     else if (CallInst *CII = dyn_cast<CallInst>(U)) {
-
       Type *typeOfArg = nullptr;
       Function *Callee = CII->getCalledFunction();
+
       if (!Callee) {
         // NOTE: I think we can't do anything in this case
         errs() << "\t\t CALL USER INDIRECT CALL: ";
@@ -2282,26 +2387,34 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
         errs() << "\n";
         continue;
       }
+
+
+      std::string calleeName = demangle(Callee->getName().str());
+      if (calleeName == "strlen" || calleeName == "strcpy" ||
+          calleeName == "strcmp" || calleeName == "strcat") {
+        errs()
+            << "[FieldArmor]\tTYPE RECON: UNINTERESTING: called function is ";
+        errs() << calleeName << "\n";
+        return; // ignore this allocation site
+      }
+
+      if(calleeName.find("operator delete") != std::string::npos) {
+        errs() << "\t\t CALL USER (operator delete): ";
+        CII->print(errs());
+        errs() << ", IGNORING \n";
+        continue;
+      }
+
       errs() << "\t CALL USER: ";
       CII->print(errs());
       errs() << "\n";
 
       int idx = -1;
-
-      for (unsigned i = 0; i < Callee->arg_size(); i++) {
-        if (CII->getArgOperand(i) == CI) {
+      for (unsigned i = 0; i < Callee->arg_size(); i++)
+        if (CII->getArgOperand(i) == CI)
           idx = i;
-        } // if
-      } // for
-
-      if (idx == -1) {
-        errs() << "\t\t CALL USER but could not find arg matching malloc BUG "
-                  "BUG BUG "
-                  "return value: ";
-        CII->print(errs());
-        errs() << "\n";
-        continue;
-      }
+      assert(idx != -1 && "malloc/realloc/calloc/new return value should be an "
+                          "argument of the call user");
 
       const TypeSet *ts = RetrievedTypes->lookup(Callee->getArg(idx), Callee);
 
@@ -2311,14 +2424,17 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
           errs() << t << " ";
         }
         errs() << "\n";
+        ambiguous =
+            augmentstructTypesFromTypeSet(structTypes, ts, *C, seenTypes);
       }
 
       else {
         errs() << "\t\t ts = <none> - TypeCopilot FAIL on CALL ARG TYPE\n";
         continue;
       }
-      augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
-    } else if (ReturnInst *RI = dyn_cast<ReturnInst>(U)) {
+    } // CALL USER
+
+    else if (ReturnInst *RI = dyn_cast<ReturnInst>(U)) {
       errs() << "\t\t RET USER: " << *RI << "\n";
       auto *functionThatIsReturning = RI->getFunction();
       const TypeSet *ts =
@@ -2329,12 +2445,15 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
           errs() << t << " ";
         }
         errs() << "\n";
-        augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
+        ambiguous =
+            augmentstructTypesFromTypeSet(structTypes, ts, *C, seenTypes);
       } else
         errs() << "\t\t ts = <none> - TypeCopilot FAIL on RET TYPE, function: "
                << *functionThatIsReturning << "\n";
       // continue;
-    } else if (PHINode *PN = dyn_cast<PHINode>(U)) {
+    } // RET USER
+
+    else if (PHINode *PN = dyn_cast<PHINode>(U)) {
       errs() << "\t\t PHI USER: " << *PN << "\n";
       const TypeSet *ts = RetrievedTypes->lookup(PN, PN->getFunction());
       if (ts) {
@@ -2343,40 +2462,48 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
           errs() << t << " ";
         }
         errs() << "\n";
-        augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
+        ambiguous =
+            augmentstructTypesFromTypeSet(structTypes, ts, *C, seenTypes);
         for (auto *user : PN->users()) {
-          errs() << "\t\t PHI USER: ";
+          errs() << "\t\t USER of PHI NODE: ";
           user->print(errs());
           errs() << "\n";
         }
       } else
         errs() << "\t\t ts = <none> - TypeCopilot FAIL on PHI TYPE\n";
-    } else {
+    } // PHI USER
+
+    else {
       errs() << "\t\t OTHER USER: ";
       U->print(errs());
       errs() << "\n";
     } // OTHER USER
-
   } // for each user
+  if(ambiguous) {
+    errs() << "[FieldArmor] AMBIGUITY: at least one TypeSet was ambiguous, cannot infer type.\n";
+    return;
+  }
 
-  if (SeenTypes.empty()) {
-    if (!allTypesNoFilters.empty()) {
-      errs() << "[FieldArmor]\tTYPE RECON: UNINTERESTING: \n";
-      for (auto *type : allTypesNoFilters) {
+  if (structTypes.empty()) {
+    if (!seenTypes.empty()) {
+      errs() << "[FieldArmor]\tTYPE RECON: UNINTERESTING: struct typeset empty\n";
+      for (auto *type : seenTypes) {
         errs() << "\t Type: ";
         type->print(errs());
         errs() << "\n";
       }
+      // very uncertain about this
+      errs() << "[FieldArmor]\tTYPE RECON: CONDITIONAL SUCCESS\n";
     } else
       errs() << "[FieldArmor]\tTYPE RECON: no types found at all. \n";
     return;
   }
 
-  if (SeenTypes.size() > 1) {
+  if (structTypes.size() > 1) {
     // TODO: handle each path separately
     // TODO: potentially handle inheritance
     errs() << "[FieldArmor]\tAMBIGUITY. Types: \n";
-    for (auto *type : SeenTypes) {
+    for (auto *type : structTypes) {
       errs() << "\t Type: ";
       type->print(errs());
       errs() << "\n";
@@ -2384,42 +2511,76 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
     return;
   } // AMBIGUITY
 
-  // SeenTypes contains exactly 1 struct type
-  Type *type = *SeenTypes.begin();
-
+  // structTypes contains exactly 1 struct type
+  Type *type = *structTypes.begin();
   assert(type->isStructTy() &&
-         "After filtering, only struct types should remain in SeenTypes");
+         "only struct types should remain in structTypes");
 
+  // this does not imply tagging success, yet!
   errs() << "[FieldArmor]\tTYPE RECON SUCCESS! Inferred type: \n\t\t";
   type->print(errs());
   errs() << "\n";
 
-  IRBuilder<> IRB(CI->getNextNonDebugInstruction());
-  // NOTE: this is safe even if before ICMP null because of how the runtime
-  // tagging function is written
   auto srcType = dyn_cast<StructType>(type);
 
   if (srcType->isLiteral() || srcType->getName().str().find("union.") == 0) {
-    errs()
-        << "[FieldArmor]\tTYPE RECON: union type not supported. Bailing out.\n";
+    errs() << "[FieldArmor]\t\tTYPE NOT SUPPORTED: " << *srcType << "\n";
     return;
   }
-
-  auto tagVector = M.getGlobalVariable(
-      srcType->getStructName().str() + ".fieldarmor.tagvec", true);
-  if (!tagVector) {
-    // try with .base suffix, in case it's a class without RTTI info
-    tagVector = M.getGlobalVariable(
-        srcType->getStructName().str() + ".base.fieldarmor.tagvec", true);
-  }
-
-  if (!tagVector) {
-    createTagVector(srcType);
-  }
-  tagVector = M.getGlobalVariable(
-      srcType->getStructName().str() + ".fieldarmor.tagvec", true);
-  assert(tagVector && "Tag vector for malloc'd struct type does not exist!");
-
+  
+  std::string typeName = srcType->getStructName().str();
+  bool isBase = typeName.find(".base") != std::string::npos;
+  Value* tagVector = nullptr;
+  if(isBase){
+    tagVector = retrieveTagVector(srcType, M, true);
+    if(!tagVector){
+      createTagVector(srcType);
+      tagVector = retrieveTagVector(srcType, M, true);
+      if(!tagVector){
+        errs() << "[FieldArmor] ERROR: could not CREATE & RETRIEVE tag vector for BASE type: ";
+        srcType->print(errs());
+        errs() << "\n";
+        return;
+      }
+    }
+  }// isBase
+  else{
+    // does the base type exist?
+    std::string baseTypeName = srcType->getStructName().str() + ".base";
+    auto* baseType = StructType::getTypeByName(*C, baseTypeName);
+    if(baseType){
+      tagVector = retrieveTagVector(srcType, M, true);
+      if(!tagVector){
+        createTagVector(srcType);
+        tagVector = retrieveTagVector(srcType, M, true);
+        if(!tagVector){
+          errs() << "[FieldArmor] ERROR: could not CREATE & RETRIEVE tag vector for BASE type: ";
+          srcType->print(errs());
+          errs() << "\n";
+          return;
+        }
+      }
+    }
+    else{
+      tagVector = retrieveTagVector(srcType, M, false);
+      if(!tagVector){
+        createTagVector(srcType);
+        tagVector = retrieveTagVector(srcType, M, false);
+        if(!tagVector){
+          errs() << "[FieldArmor] ERROR: could not CREATE & RETRIEVE tag vector for type: ";
+          srcType->print(errs());
+          errs() << "\n";
+          return;
+        }
+      }
+    }
+  } // NOT base
+  
+  // at this point, it can be a class or a struct
+  IRBuilder<> IRB(CI->getNextNonDebugInstruction());
+  // NOTE: this is safe even if before ICMP null because of how the runtime
+  // tagging function is written
+  
   // TODO: this must be put AFTER the CMP null that checks malloc result
   FunctionCallee fieldarmor_tag_memory =
       M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy,
@@ -2445,274 +2606,248 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
                   IRB.CreatePointerCast(tagVector, PtrTy),
                   ConstantInt::get(Int64Ty, typeSize), ArraySizeValue});
 
-  SeenTypes.clear();
+  structTypes.clear();
 } // TagAllocChunksBeforeUse
 
-Value *retrieveTagVector(StructType *srcType, Module &M, bool try_base = true) {
-  auto typeName = srcType->getStructName().str();
-  bool isClass = typeName.find("class.") == 0;
-  std::string lookupName = typeName;
-  if (isClass && typeName.find(".base") == std::string::npos && try_base) {
-    lookupName = typeName + ".base";
-  }
-  auto tagVector = M.getGlobalVariable(lookupName + ".fieldarmor.tagvec", true);
-  if (!tagVector) {
-    errs() << "[FieldArmor] LOOKUP ERROR: Tag vector for struct type: ";
-    srcType->print(errs());
-    errs() << "lookup type: " << lookupName;
-    errs() << "\n";
-    return nullptr;
-  }
-  errs() << "[FieldArmor] LOOKUP OK: Retrieved tag vector for LOOKUP NAME: "
-         << lookupName << ", type name: " << typeName << "\n";
-  return tagVector;
-}
+// void HWAddressSanitizer::HandleNewOperator(CallInst *CI,
+//                                            const std::string &DemangledName) {
+//   // infer type for new operator
+//   std::set<Type *> structTypes;
+//   std::set<Type *> seenTypes;
 
-void HWAddressSanitizer::HandleNewOperator(CallInst *CI,
-                                           const std::string &DemangledName) {
-  // infer type for new operator
-  std::set<Type *> SeenTypes;
-  std::set<Type *> allTypesNoFilters;
+//   // debugCallSitePrint(CI);
+//   for (auto *user : CI->users()) {
+//     errs() << "\t USER OF NEW OPERATOR: ";
+//     user->print(errs());
+//     errs() << "\n";
+//     if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(user)) {
+//       errs() << "\t\t GEP user";
+//       GEPI->print(errs());
+//       errs() << "\n";
+//       auto *GEPType = GEPI->getSourceElementType();
+//       std::string typeName;
+//       raw_string_ostream rso(typeName);
+//       GEPType->print(rso);
 
-  debugCallSitePrint(CI);
-  for (auto *user : CI->users()) {
-    errs() << "\t USER OF NEW OPERATOR: ";
-    user->print(errs());
-    errs() << "\n";
-    if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(user)) {
-      errs() << "\t\t GEP user";
-      GEPI->print(errs());
-      errs() << "\n";
-      auto *GEPType = GEPI->getSourceElementType();
-      std::string typeName;
-      raw_string_ostream rso(typeName);
-      GEPType->print(rso);
+//       // NOTE: when allocating arrays of ptrs, the GEP source type is ptr
+//       if (!(typeName == "ptr")) {
+//         if (GEPType->isStructTy())
+//           structTypes.insert(GEPType);
+//         seenTypes.insert(GEPType);
+//       } else {
+//         seenTypes.insert(GEPType);
+//         // errs() << "[FieldArmor]\t\tTYPE RECON: UNINTERESTING: \n\t\t";
+//       }
+//     } // GEP USER
 
-      // NOTE: when allocating arrays of ptrs, the GEP source type is ptr
-      if (!(typeName == "ptr")) {
-        if (GEPType->isStructTy())
-          SeenTypes.insert(GEPType);
-        allTypesNoFilters.insert(GEPType);
-      } else {
-        allTypesNoFilters.insert(GEPType);
-        errs() << "[FieldArmor]\t\tTYPE RECON: UNINTERESTING: \n\t\t";
-      }
-    } // GEP USER
+//     // H1 : if a user is a call to strlen, strcpy and similar, then it's a
+//     // string
+//     if (CallInst *CI = dyn_cast<CallInst>(user)) {
+//       Function *Callee = CI->getCalledFunction();
 
-    // H1 : if a user is a call to strlen, strcpy and similar, then it's a
-    // string
-    if (CallInst *CI = dyn_cast<CallInst>(user)) {
-      Function *Callee = CI->getCalledFunction();
+//       if (!Callee) {
+//         // NOTE: I think we can't do anything in this case
+//         errs() << "\t\t WARNING: IGNORING CALL USER INDIRECT CALL: ";
+//         CI->print(errs());
+//         errs() << "\n";
+//         continue;
+//       }
 
-      if (!Callee) {
-        // NOTE: I think we can't do anything in this case
-        errs() << "\t\t WARNING: IGNORING CALL USER INDIRECT CALL: ";
-        CI->print(errs());
-        errs() << "\n";
-        continue;
-      }
+//       std::string calleeName = demangle(Callee->getName().str());
+//       if (calleeName == "strlen" || calleeName == "strcpy" ||
+//           calleeName == "strcmp" || calleeName == "strcat") {
+//         errs()
+//             << "[FieldArmor]\tTYPE RECON: UNINTERESTING: called function is ";
+//         errs() << calleeName << "\n";
+//         // seenTypes.insert(
+//         //     Type::getInt8Ty(*C)); // it's a string, add char type to stats
+//         return; // ignore this allocation site
+//       }
 
-      std::string calleeName = demangle(Callee->getName().str());
-      if (calleeName == "strlen" || calleeName == "strcpy" ||
-          calleeName == "strcmp" || calleeName == "strcat") {
-        errs()
-            << "[FieldArmor]\tTYPE RECON: UNINTERESTING: called function is ";
-        errs() << calleeName << "\n";
-        // allTypesNoFilters.insert(
-        //     Type::getInt8Ty(*C)); // it's a string, add char type to stats
-        return; // ignore this allocation site
-      }
+//       // TODO: complete!
+//       auto nArgs = Callee->arg_size();
+//       for (unsigned i = 0; i < nArgs; i++) {
+//         if (CI->getArgOperand(i) == user) {
+//           errs() << "\t\t ARG " << i << " of call to " << calleeName << "\n";
+//           const TypeSet *ts = RetrievedTypes->lookup(Callee->getArg(i), Callee);
+//           if (ts) {
+//             errs() << "\t\t TypeSet from CALL ARG TYPE: ";
+//             for (auto &t : ts->types) {
+//               errs() << t << " ";
+//             }
+//             errs() << "\n";
+//             augmentstructTypesFromTypeSet(structTypes, ts, *C, seenTypes);
+//           } else
+//             errs() << "\t\t ts = <none> - TypeCopilot FAIL on CALL ARG TYPE\n";
+//         } // if arg matches
+//       } // for each arg
+//     } // CALL INST USER
 
-      // TODO: complete!
-      auto nArgs = Callee->arg_size();
-      for (unsigned i = 0; i < nArgs; i++) {
-        if (CI->getArgOperand(i) == user) {
-          errs() << "\t\t ARG " << i << " of call to " << calleeName << "\n";
-          const TypeSet *ts = RetrievedTypes->lookup(Callee->getArg(i), Callee);
-          if (ts) {
-            errs() << "\t\t TypeSet from CALL ARG TYPE: ";
-            for (auto &t : ts->types) {
-              errs() << t << " ";
-            }
-            errs() << "\n";
-            augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
-          } else
-            errs() << "\t\t ts = <none> - TypeCopilot FAIL on CALL ARG TYPE\n";
-        } // if arg matches
-      } // for each arg
-    } // CALL INST USER
+//     // H2: handle PHI, many ptrs are null and maybe what's created has a type
+//     if (PHINode *PN = dyn_cast<PHINode>(user)) {
+//       errs() << "\t\t PHI NODE USER: ";
+//       PN->print(errs());
+//       errs() << "\n";
+//       const TypeSet *ts = RetrievedTypes->lookup(PN, PN->getFunction());
+//       if (ts) {
+//         errs() << "\t\t TypeSet from PHI NODE type: ";
+//         for (auto &t : ts->types) {
+//           errs() << t << " ";
+//         }
+//         errs() << "\n";
+//         augmentstructTypesFromTypeSet(structTypes, ts, *C, seenTypes);
+//       } else
+//         errs() << "\t\t ts = <none> - TypeCopilot FAIL on PHI NODE TYPE\n";
+//       for (auto *user : PN->users()) {
+//         errs() << "\t\t PHI USER: ";
+//         user->print(errs());
+//         errs() << "\n";
+//       }
+//     } // PHI NODE USER
 
-    // H2: handle PHI, many ptrs are null and maybe what's created has a type
-    if (PHINode *PN = dyn_cast<PHINode>(user)) {
-      errs() << "\t\t PHI NODE USER: ";
-      PN->print(errs());
-      errs() << "\n";
-      const TypeSet *ts = RetrievedTypes->lookup(PN, PN->getFunction());
-      if (ts) {
-        errs() << "\t\t TypeSet from PHI NODE type: ";
-        for (auto &t : ts->types) {
-          errs() << t << " ";
-        }
-        errs() << "\n";
-        augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
-      } else
-        errs() << "\t\t ts = <none> - TypeCopilot FAIL on PHI NODE TYPE\n";
-      for (auto *user : PN->users()) {
-        errs() << "\t\t PHI USER: ";
-        user->print(errs());
-        errs() << "\n";
-      }
-    } // PHI NODE USER
+//     if (StoreInst *SI = dyn_cast<StoreInst>(user)) {
+//       errs() << "\t\t STORE USER: ";
+//       SI->print(errs());
+//       errs() << "\n";
+//       Value *valueOperand = SI->getValueOperand();
+//       Value *ptrOperand = SI->getPointerOperand();
 
-    if (StoreInst *SI = dyn_cast<StoreInst>(user)) {
-      errs() << "\t\t STORE USER: ";
-      SI->print(errs());
-      errs() << "\n";
-      Value *whatIsStored = SI->getValueOperand();
-      Value *whereToStore = SI->getPointerOperand();
+//       if (ptrOperand == CI) {
+//         errs() << "\t\t STORE to the NEW OPERATOR ITSELF? TODO: ";
+//         // is struct? Is array?
+//         // TODO
+//         // TODO: handle above as well!
+//       }
 
-      if (whereToStore == CI) {
-        // is struct? Is array?
-        // TODO
-        // TODO: handle above as well!
-      }
+//       else if (valueOperand == CI) {
+//         // TODO
+//         const TypeSet *ts =
+//             RetrievedTypes->lookup(ptrOperand, SI->getFunction());
+//         if (ts) {
+//           errs() << "\t\t TypeSet from STORE destination type: ";
+//           for (auto &t : ts->types) {
+//             errs() << t << " ";
+//           }
+//           errs() << "\n";
+//           augmentstructTypesFromTypeSet(structTypes, ts, *C, seenTypes);
+//         } else
+//           errs() << "\t\t ts = <none> - TypeCopilot FAIL on STORE destination "
+//                     "type\n";
+//       }
+//     } // STORE USER
 
-      else if (whatIsStored == CI) {
-        // TODO
-        const TypeSet *ts =
-            RetrievedTypes->lookup(whereToStore, SI->getFunction());
-        if (ts) {
-          errs() << "\t\t TypeSet from STORE destination type: ";
-          for (auto &t : ts->types) {
-            errs() << t << " ";
-          }
-          errs() << "\n";
-          augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
-        } else
-          errs() << "\t\t ts = <none> - TypeCopilot FAIL on STORE destination "
-                    "type\n";
-      }
-    } // STORE USER
+//     if (ExtractValueInst *EVI = dyn_cast<ExtractValueInst>(user)) {
+//       errs() << "\t\t EXTRACTVALUE USER: ";
+//       EVI->print(errs());
+//       errs() << "\n";
+//       auto *EVIType = EVI->getType();
+//       EVIType->print(errs());
+//       errs() << "\n";
+//     }
+//   } // for each user
 
-    if (ExtractValueInst *EVI = dyn_cast<ExtractValueInst>(user)) {
-      errs() << "\t\t EXTRACTVALUE USER: ";
-      EVI->print(errs());
-      errs() << "\n";
-      auto *EVIType = EVI->getType();
-      EVIType->print(errs());
-      errs() << "\n";
-    }
-  } // for each user
+//   auto *ts = RetrievedTypes->lookup(CI, CI->getFunction());
+//   if (!ts) {
+//     errs()
+//         << "\t\t ts = <none> - TypeCopilot FAIL for return type of the new\n";
+//   } else {
+//     for (auto &t : ts->types)
+//       errs() << "\t\t (new) T: " << t << "\n";
+//     augmentstructTypesFromTypeSet(structTypes, ts, *C, seenTypes);
+//   }
 
-  auto *ts = RetrievedTypes->lookup(CI, CI->getFunction());
-  if (!ts) {
-    errs()
-        << "\t\t ts = <none> - TypeCopilot FAIL for return type of the new\n";
-  } else {
-    for (auto &t : ts->types)
-      errs() << "\t\t (new) T: " << t << "\n";
-    augmentSeenTypesFromTypeSet(SeenTypes, ts, *C, allTypesNoFilters);
-  }
+//   if (structTypes.size() == 0) {
+//     if (!seenTypes.empty()) {
+//       errs() << "[FieldArmor]\t TYPE RECON: UNINTERESTING: \n";
+//       for (auto *type : seenTypes) {
+//         errs() << "\t Type: ";
+//         type->print(errs());
+//         errs() << "\n";
+//       }
+//     } else {
+//       errs() << "[FieldArmor]\t TYPE RECON: no types found at all\n";
+//     }
+//     return;
+//   }
 
-  std::set<StructType *> structTypes;
-  for (auto *t : SeenTypes) {
-    if (t->isStructTy()) {
-      structTypes.insert(dyn_cast<StructType>(t));
-    }
-  }
+//   else if (structTypes.size() > 1) {
+//     // TODO: handle inheritance!
+//     errs() << "[FieldArmor]\t TYPE RECON: AMBIGUITY. Id'ed struct types: \n";
+//     for (auto *type : structTypes) {
+//       errs() << "\t Type: ";
+//       type->print(errs());
+//       errs() << "\n";
+//     }
+//     return;
+//   }
 
-  if (structTypes.size() == 0) {
-    if (!allTypesNoFilters.empty()) {
-      errs() << "[FieldArmor]\t TYPE RECON: UNINTERESTING: \n";
-      for (auto *type : SeenTypes) {
-        errs() << "\t Type: ";
-        type->print(errs());
-        errs() << "\n";
-      }
-    } else {
-      errs() << "[FieldArmor]\t TYPE RECON: no types found at all\n";
-    }
-    return;
-  }
+//   auto *t = *structTypes.begin();
+//   errs() << "\t\t TYPE RECON SUCCESS: Inferred type: \n\t\t";
+//   t->print(errs());
+//   errs() << "\n";
 
-  else if (structTypes.size() > 1) {
-    // TODO: handle inheritance!
-    errs() << "[FieldArmor]\t TYPE RECON: AMBIGUITY. Types: \n";
-    for (auto *type : structTypes) {
-      errs() << "\t Type: ";
-      type->print(errs());
-      errs() << "\n";
-    }
-    return;
-  }
+//   StructType *srcType = dyn_cast<StructType>(t);
+//   IRBuilder<> IRB(CI->getNextNonDebugInstruction());
+//   // NOTE: this is safe even if before ICMP null because of how the runtime
+//   // tagging function is written
+//   if (srcType->isLiteral() || srcType->getName().str().find("union.") == 0) {
+//     errs()
+//         << "[FieldArmor]\tTYPE RECON: union type not supported. Bailing out.\n";
+//     return;
+//   }
 
-  auto *t = *structTypes.begin();
-  errs() << "\t\t TYPE RECON SUCCESS: Inferred type: \n\t\t";
-  t->print(errs());
-  errs() << "\n";
+//   auto baseSrcType = StructType::getTypeByName(
+//       M.getContext(), srcType->getStructName().str() + ".base");
+//   if (!baseSrcType) {
+//     errs() << "[FieldArmor] NO BASE TYPE? : ";
+//     srcType->print(errs());
+//     errs() << "\n";
+//     baseSrcType = srcType;
+//   }
 
-  StructType *srcType = dyn_cast<StructType>(t);
-  IRBuilder<> IRB(CI->getNextNonDebugInstruction());
-  // NOTE: this is safe even if before ICMP null because of how the runtime
-  // tagging function is written
-  if (srcType->isLiteral() || srcType->getName().str().find("union.") == 0) {
-    errs()
-        << "[FieldArmor]\tTYPE RECON: union type not supported. Bailing out.\n";
-    return;
-  }
+//   auto tagVector = retrieveTagVector(baseSrcType, M, false);
+//   if (!tagVector) {
+//     errs() << "[FieldArmor] TV not there -> trying to create TB for TYPE: ";
+//     baseSrcType->print(errs());
+//     errs() << "\n";
 
-  auto baseSrcType = StructType::getTypeByName(
-      M.getContext(), srcType->getStructName().str() + ".base");
-  if (!baseSrcType) {
-    errs() << "[FieldArmor] NO BASE TYPE? : ";
-    srcType->print(errs());
-    errs() << "\n";
-    baseSrcType = srcType;
-  }
+//     createTagVector(baseSrcType);
+//     tagVector = retrieveTagVector(baseSrcType, M, false);
+//     if (!tagVector) {
+//       errs()
+//           << "[FieldArmor] Could not find or create tag vector for BASE type: ";
+//       baseSrcType->print(errs());
+//       errs() << "\n";
+//     }
+//   }
 
-  auto tagVector = retrieveTagVector(baseSrcType, M, false);
-  if (!tagVector) {
-    errs() << "[FieldArmor] TV not there -> trying to create TB for TYPE: ";
-    baseSrcType->print(errs());
-    errs() << "\n";
+//   // TODO: insert only if creation went fine!!
+//   FunctionCallee fieldarmor_tag_memory =
+//       M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy,
+//                             PtrTy, PtrTy, Int64Ty, Int64Ty);
 
-    createTagVector(baseSrcType);
-    tagVector = retrieveTagVector(baseSrcType, M, false);
-    if (!tagVector) {
-      errs()
-          << "[FieldArmor] Could not find or create tag vector for BASE type: ";
-      baseSrcType->print(errs());
-      errs() << "\n";
-    }
-  }
+//   auto TypeSize = M.getDataLayout().getTypeAllocSize(srcType);
+//   Value *ArraySizeValue =
+//       IRB.CreateUDiv(CI->getArgOperand(0), ConstantInt::get(Int64Ty, TypeSize));
 
-  // TODO: insert only if creation went fine!!
-  FunctionCallee fieldarmor_tag_memory =
-      M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy,
-                            PtrTy, PtrTy, Int64Ty, Int64Ty);
+//   if (!ArraySizeValue) {
+//     errs() << "[FieldArmor] ERROR SIZE RECON FOR ALLOC CALL: ";
+//     CI->print(errs());
+//     errs() << "\tARG 0: ";
+//     CI->getArgOperand(0)->print(errs());
+//     errs() << "\n";
+//     return;
+//   }
+//   errs() << "[FieldArmor]\t\tDYNAMIC TAGGING ON NEW SUCCESS: "
+//          << srcType->getStructName() << ", array size: " << *ArraySizeValue
+//          << ", tagvec: " << *tagVector << "\n\n";
+//   IRB.CreateCall(fieldarmor_tag_memory,
+//                  {IRB.CreatePointerCast(CI, PtrTy),
+//                   IRB.CreatePointerCast(tagVector, PtrTy),
+//                   ConstantInt::get(Int64Ty, TypeSize), ArraySizeValue});
 
-  auto TypeSize = M.getDataLayout().getTypeAllocSize(srcType);
-  Value *ArraySizeValue =
-      IRB.CreateUDiv(CI->getArgOperand(0), ConstantInt::get(Int64Ty, TypeSize));
-
-  if (!ArraySizeValue) {
-    errs() << "[FieldArmor] ERROR SIZE RECON FOR ALLOC CALL: ";
-    CI->print(errs());
-    errs() << "\tARG 0: ";
-    CI->getArgOperand(0)->print(errs());
-    errs() << "\n";
-    return;
-  }
-  errs() << "[FieldArmor]\t\tDYNAMIC TAGGING ON NEW SUCCESS: "
-         << srcType->getStructName() << ", array size: " << *ArraySizeValue
-         << ", tagvec: " << *tagVector << "\n\n";
-  IRB.CreateCall(fieldarmor_tag_memory,
-                 {IRB.CreatePointerCast(CI, PtrTy),
-                  IRB.CreatePointerCast(tagVector, PtrTy),
-                  ConstantInt::get(Int64Ty, TypeSize), ArraySizeValue});
-
-  SeenTypes.clear();
-} // HandleNewOperator
+//   structTypes.clear();
+// } // HandleNewOperator
 
 void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   // auto GEPResultType = GEPI->getResultElementType();
