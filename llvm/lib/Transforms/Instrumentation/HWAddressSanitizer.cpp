@@ -2605,7 +2605,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
                  {IRB.CreatePointerCast(CI, PtrTy),
                   IRB.CreatePointerCast(tagVector, PtrTy),
                   ConstantInt::get(Int64Ty, typeSize), ArraySizeValue});
-
+  CI->setName(CI->getName() + ".fieldarmor.tagged");
   structTypes.clear();
 } // TagAllocChunksBeforeUse
 

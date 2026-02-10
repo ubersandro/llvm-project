@@ -577,9 +577,6 @@ public:
   virtual ~LLVMHelper() {}
 };
 
-cl::opt<std::string> TypeSrc("type-src", cl::desc("Type source"),
-                             cl::value_desc("type source"), cl::init("di"));
-
 class DebugInfoHelper : public LLVMHelper {
 private:
   const bool RESOLVE_TYPEDEF = true;
@@ -694,7 +691,7 @@ public:
         }
       }
     }
-    
+
     for (auto &func : *module) {
       Value *funcValue = dyn_cast<Value>(&func);
 
@@ -744,8 +741,142 @@ public:
         }
       }
     } // for function
+    return; // super messy, cut out for now 
 
+    // TODO
+    // TBAA PART
+    for (auto &func : *module) {
+      for (auto &basic_block : func) {
+        for (auto &inst : basic_block) {
+          // handle TBAA
+          auto aamd = inst.getAAMetadata();
+          // errs() << "[TypeCopilot] Processing instruction: " << inst << " TBAA: " << aamd.TBAA << "\n";
+          if (aamd && aamd.TBAA) {
+            // get tbaa type name
+            auto tbaa_type = getTBAAType(aamd.TBAA, func, inst);
+            // errs() << "[TypeCopilot] Instruction: " << inst
+            //        << ", TBAA type: " << tbaa_type << "\n";
+            // skip empty type
+            if (tbaa_type.empty()) {
+              continue;
+            }
+
+            Value *ld_st_ptr = nullptr; // tbaa annotated pointer
+
+            // bond to load or store instruction
+            if (LoadInst *load = dyn_cast<LoadInst>(&inst)) {
+              ld_st_ptr = load->getPointerOperand();
+            } else if (StoreInst *store = dyn_cast<StoreInst>(&inst)) {
+              ld_st_ptr = store->getPointerOperand();
+            }
+
+            if (ld_st_ptr) {
+              if (tbaa_type != "any pointer" && !isScalarType(tbaa_type)) {
+                tbaa_type = "%struct." + tbaa_type;
+              }
+
+              // if is scalar type
+              // errs() << "[TypeCopilot] TBAA type: " << tbaa_type << ", instruction: "
+              //        << inst << "\n";
+              if (isScalarType(tbaa_type)) {
+                tg->put(&func, ld_st_ptr, tbaa_type);
+              } else if (GlobalValue *gv = dyn_cast<GlobalValue>(ld_st_ptr)) {
+                tg->put(nullptr, gv, tbaa_type);
+              } else if (GetElementPtrInst *gep =
+                             dyn_cast<GetElementPtrInst>(ld_st_ptr)) {
+                tg->put(&func, gep->getPointerOperand(), tbaa_type);
+              } else if (LoadInst *load = dyn_cast<LoadInst>(ld_st_ptr)) {
+                tg->put(&func, load->getPointerOperand(), tbaa_type);
+              } else if (StoreInst *store = dyn_cast<StoreInst>(ld_st_ptr)) {
+                tg->put(&func, store->getPointerOperand(), tbaa_type);
+              }
+            }
+          }
+          
+          // ???? 
+          // if (aamd && aamd.TBAA) {
+          //     auto *tbaa = aamd.TBAA;
+          //     auto tbaaTypeName = parseTypeName(tbaa);
+
+          //     if (tbaaTypeName.empty())
+          //         continue;
+
+          //     auto trans_type_name = di_to_ir_type(tbaaTypeName);
+          //     // handle store ptr
+          //     if (auto *store = dyn_cast<StoreInst>(&inst)) {
+          //         auto *ptr = store->getPointerOperand();
+          //         tg->put(&func, ptr, trans_type_name);
+          //     } else if (auto *load = dyn_cast<LoadInst>(&inst)) {
+          //         auto *ptr = load->getPointerOperand();
+          //         tg->put(&func, ptr, trans_type_name);
+          //     }
+          // }
+        }
+      }
+    }// TBAA PART
   } // initialize
+
+  std::string getTypeName(MDNode *tbaaType) {
+    auto *baseTyName = dyn_cast<MDString>(tbaaType->getOperand(0));
+
+    // if accessTy is an omnipotent char
+    auto *accessTy = dyn_cast<MDNode>(tbaaType->getOperand(1));
+    if (isOmnipotentChar(accessTy)) {
+      return baseTyName->getString().str();
+    }
+
+    return getTypeName(accessTy);
+  }
+
+  // parse TBAA type name
+  std::string parseTypeName(MDNode *tbaa) {
+
+    auto *baseTy = dyn_cast<MDNode>(tbaa->getOperand(0));
+    auto *accessTy = dyn_cast<MDNode>(tbaa->getOperand(1));
+
+    if (isOmnipotentChar(accessTy))
+      return "";
+
+    auto name = getTypeName(accessTy);
+    if (name == "any pointer")
+      return "";
+
+    return name + "*";
+  }// parseTypeName
+
+  bool isOmnipotentChar(MDNode *tbaa) {
+    auto *accessTyName = dyn_cast<MDString>(tbaa->getOperand(0));
+    return accessTyName->getString() == "omnipotent char";
+  }
+
+  bool isScalarType(std::string &type) {
+    return type == "i1" || type == "i8" || type == "i16" || type == "i32" ||
+           type == "i64" || type == "float" || type == "double";
+  }
+
+  std::string getTBAAType(MDNode *tbaa, Function &func, Instruction &inst) {
+    // get first field
+    auto *baseTy = dyn_cast<MDNode>(tbaa->getOperand(0));
+
+    // get baseTy's type name
+    if (!baseTy) {
+      return "";
+    }
+
+    auto *baseTyName = dyn_cast<MDString>(baseTy->getOperand(0));
+    if (!baseTyName) {
+      return "";
+    }
+
+    auto baseTypeName = baseTyName->getString().str();
+
+    if (baseTypeName.empty() || baseTypeName == "omnipotent char" ||
+        baseTypeName == "any pointer") {
+      return "";
+    }
+
+    return di_to_ir_type(baseTypeName);
+  }
 
   void parseDILocalVar(
       Instruction &inst,
@@ -883,7 +1014,7 @@ public:
       name = subroutine->getName();
     } break;
     case dwarf::DW_TAG_class_type: {
-      
+
       std::string ns = "";
       auto scope = ditype->getScope();
       if (scope) {
