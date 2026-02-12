@@ -50,7 +50,7 @@ std::map<std::string, std::string> type_trans_map = {
 
 std::string di_to_ir_type(const std::string &di_type) {
   std::string ir_type = di_type;
-  // trim the ending multiple *
+
   int ptr_level = 0;
   while (ir_type.size() > 0 && ir_type.back() == '*') {
     ir_type.pop_back();
@@ -58,7 +58,10 @@ std::string di_to_ir_type(const std::string &di_type) {
   }
 
   if (ir_type.empty()) {
-    return "unk"; // pure AI guess, TODO: look into this
+    errs() << "[TypeCopilot] WARNING: empty DI type after trimming pointers, "
+              "returning 'void'. Original DI type: "
+           << di_type << "\n";
+    return "void*"; // should be the easiest option
   }
 
   // general types, in the table
@@ -66,7 +69,6 @@ std::string di_to_ir_type(const std::string &di_type) {
   if (iter != type_trans_map.end()) {
     ir_type = iter->second;
   } else {
-    // di_type starts with "struct"
     if (ir_type.find("struct") == 0) {
       ir_type = "\%struct." + ir_type.substr(7);
     } else if (ir_type.find("enum") == 0) {
@@ -80,12 +82,6 @@ std::string di_to_ir_type(const std::string &di_type) {
 
   ir_type += std::string(ptr_level, '*');
   return ir_type;
-}
-
-// trim suffixing digits from ir types
-std::string trim_ir_suffix(std::string &ir_type) {
-  std::regex pattern(R"((%struct\.[a-zA-Z_]\w*)\.\d+(\*?))");
-  return std::regex_replace(ir_type, pattern, "$1$2");
 }
 
 // this class must be iterable to iterate on the types TODO
@@ -309,23 +305,6 @@ private:
   bool isNotPtrOpaque(std::set<std::string> typeset) {
     return !typeset.empty() && !typeset.count("ptr");
   }
-
-  // bool isInternal(Value *v) {
-  //   auto name = v->getName();
-  //   if (name.starts_with("."))
-  //     return true;
-  //   if (name.count(".") > 1)
-  //     return true;
-  //   if (name.count(".") == 1) {
-  //     auto subname = name.split(".").second;
-  //     for (auto ch : subname) {
-  //       if (!isDigit(ch))
-  //         return true;
-  //     }
-  //   }
-
-  //   return false;
-  // }
 
 public:
   TypeMap globalMap;
@@ -601,46 +580,71 @@ public:
     finder.processModule(*module);
 
     for (auto s : module->getIdentifiedStructTypes()) {
-      // NOTE: literal structs are skipped. TODO: make sure they no longer
-      // exist.
       if (!s->hasName())
         continue;
       auto isClass = s->getName().find("class.") != StringRef::npos;
-      auto structName = s->getName();
+      StringRef structName = s->getName();
+      if (structName.find("union.") == 0)
+        continue;
 
       if (!isClass) {
         structName.consume_front("struct.");
-
       } // is not class
       else {
-        // TODO: investigate this, it does not produce anything useful now
-        // errs() << "[TypeCopilot] Found class: " << structName << "\n";
         structName.consume_front("class.");
       } // CLASS CASE
+      std::string lookupName = structName.str();
+      // NOTE: dbg info does not encode indexes that describe which version of a
+      // class is being used (expected)
 
       for (auto type : finder.types()) {
         // typedef
-        if (auto *derived = dyn_cast<DIDerivedType>(type)) {
+        if (DIDerivedType *derived = dyn_cast<DIDerivedType>(type)) {
+          // This includes qualified types, pointers, references, friends,
+          // typedefs, and class members (from docs)
           if (derived->getTag() == dwarf::DW_TAG_typedef) {
-            if (derived->getName() == structName) {
-              structMap.insert({s, derived->getBaseType()});
+            if (derived->getName() == lookupName) {
+              auto *baseType = derived->getBaseType();
+              structMap.insert({s, baseType});
               break;
             }
-          } // is TypeDef
+          }
+          // for now I dont care about other tags
         }
         // struct
         else if (auto *composite = dyn_cast<DICompositeType>(type)) {
-          if (composite->getTag() == dwarf::DW_TAG_structure_type) {
-            if (composite->getName() == structName) {
-              // empty elements, skip
-              if (composite->getElements().empty())
-                continue;
+          auto tag = composite->getTag();
+          switch (tag) {
 
+          case dwarf::DW_TAG_structure_type:
+          case dwarf::DW_TAG_class_type: {
+            bool hasScope = true;
+            std::string classNameDbgInfo = composite->getName().str();
+            auto cur = composite->getScope();
+
+            do {
+              hasScope = cur != nullptr;
+              auto namespaceDbgInfo = cur ? cur->getName() : "";
+
+              if (!namespaceDbgInfo.empty()) {
+                classNameDbgInfo =
+                    namespaceDbgInfo.str() + "::" + classNameDbgInfo;
+                cur = cur->getScope();
+              } else
+                hasScope = false;
+
+            } while (hasScope);
+
+            if (classNameDbgInfo == structName) {
+              if (composite->getElements().empty())
+                break;
               structMap.insert({s, composite});
-              break;
-            } // is struct
-          } // is struct
+            }
+            break;
+          } // cases
+          } // switch
         } // is composite
+
       } // for types
     } // for struct types
 
@@ -655,7 +659,8 @@ public:
       for (auto di_global_exp : di_global_exps) {
         auto di_global = di_global_exp->getVariable();
         auto di_type_name = getDITypeName(di_global->getType()) + "*";
-        tg->put(nullptr, &global, di_to_ir_type(di_type_name));
+        auto typestr = di_to_ir_type(di_type_name);
+        tg->put(nullptr, &global, typestr);
       }
     }
 
@@ -710,10 +715,7 @@ public:
         // TODO: how can some functions not have a type array?
         // process return type
         auto di_type_name = getDITypeName(typearray[0]);
-        // errs() << "[TypeCopilot] Function: " << func.getName() << ", return
-        // type: "
-        //        << di_type_name << ", di_to_ir_type: " <<
-        //        di_to_ir_type(di_type_name) << "\n";
+
         tg->put(nullptr, funcValue, di_to_ir_type(di_type_name), true);
         // errs()<< "HERE" << "\n";
         // process parameters
@@ -741,7 +743,7 @@ public:
         }
       }
     } // for function
-    return; // super messy, cut out for now 
+    return; // super messy, cut out for now
 
     // TODO
     // TBAA PART
@@ -750,7 +752,8 @@ public:
         for (auto &inst : basic_block) {
           // handle TBAA
           auto aamd = inst.getAAMetadata();
-          // errs() << "[TypeCopilot] Processing instruction: " << inst << " TBAA: " << aamd.TBAA << "\n";
+          // errs() << "[TypeCopilot] Processing instruction: " <<
+          // inst << " TBAA: " << aamd.TBAA << "\n";
           if (aamd && aamd.TBAA) {
             // get tbaa type name
             auto tbaa_type = getTBAAType(aamd.TBAA, func, inst);
@@ -776,7 +779,8 @@ public:
               }
 
               // if is scalar type
-              // errs() << "[TypeCopilot] TBAA type: " << tbaa_type << ", instruction: "
+              // errs() << "[TypeCopilot] TBAA type: " << tbaa_type <<
+              // ", instruction: "
               //        << inst << "\n";
               if (isScalarType(tbaa_type)) {
                 tg->put(&func, ld_st_ptr, tbaa_type);
@@ -792,8 +796,8 @@ public:
               }
             }
           }
-          
-          // ???? 
+
+          // TBAA stuff: TODO: can I reuse this?
           // if (aamd && aamd.TBAA) {
           //     auto *tbaa = aamd.TBAA;
           //     auto tbaaTypeName = parseTypeName(tbaa);
@@ -813,7 +817,7 @@ public:
           // }
         }
       }
-    }// TBAA PART
+    } // TBAA PART
   } // initialize
 
   std::string getTypeName(MDNode *tbaaType) {
@@ -842,7 +846,7 @@ public:
       return "";
 
     return name + "*";
-  }// parseTypeName
+  } // parseTypeName
 
   bool isOmnipotentChar(MDNode *tbaa) {
     auto *accessTyName = dyn_cast<MDString>(tbaa->getOperand(0));
@@ -937,6 +941,28 @@ public:
     return "";
   }
 
+  std::string getStructField(StructType *structType, uint64_t index) {
+    if (structType->isOpaque()) {
+      return "";
+    }
+    Type *elemType = structType->getElementType(index);
+    return tyHelper.getTypeName(elemType);
+  }
+
+  std::string getFullNameWithScope(DIType *ditype) {
+    std::string name = ditype->getName().str();
+    auto curScope = ditype->getScope();
+    while (curScope) {
+      auto scopeName = curScope->getName();
+      if (scopeName.empty())
+        break;
+      name = scopeName.str() + "::" + name;
+      curScope = curScope->getScope();
+    }
+    return name;
+  }
+
+  // NOTE: this can return ""
   std::string getDITypeName(DIType *ditype) {
     if (!ditype)
       return "void";
@@ -965,21 +991,18 @@ public:
         if (dyn_cast<DISubrange>(element))
           subrangeCount++;
       }
-      name =
-          basename + std::string(subrangeCount, '*'); // multi-dimensional array
+      name = basename + std::string(subrangeCount,
+                                    '*'); // multi-dimensional array
     } break;
     case dwarf::DW_TAG_pointer_type: {
       auto *derived = dyn_cast<DIDerivedType>(ditype);
       auto basename = derived->getBaseType() != nullptr
                           ? getDITypeName(derived->getBaseType())
                           : "void";
-      // if (basename == "void")
-      //     name = "ptr";
-      // else
       name = basename + "*";
     } break;
     case dwarf::DW_TAG_structure_type:
-      name = "struct " + ditype->getName().str();
+      name = "struct " + getFullNameWithScope(ditype);
       break;
     case dwarf::DW_TAG_typedef:
       if (RESOLVE_TYPEDEF) {
@@ -1007,73 +1030,47 @@ public:
       name = basename;
     } break;
     case dwarf::DW_TAG_union_type: {
-      name = "union " + ditype->getName().str();
+      name = "union " + getFullNameWithScope(ditype);
     } break;
     case dwarf::DW_TAG_subroutine_type: {
       auto *subroutine = dyn_cast<DISubroutineType>(ditype);
-      name = subroutine->getName();
+      name = getFullNameWithScope(ditype); // idk TODO
     } break;
     case dwarf::DW_TAG_class_type: {
-
-      std::string ns = "";
-      auto scope = ditype->getScope();
-      if (scope) {
-        auto *discope = dyn_cast<DIScope>(scope);
-        if (discope) {
-          auto porcodio = discope->getName();
-          // if (porcodio != nullptr) {
-          std::string ns_name = porcodio.str();
-          if (!ns_name.empty())
-            ns = ns_name + "::";
-        }
-      }
-
-      name = "class " + ns + ditype->getName().str();
-      // name = ns + ditype->getName().str();
-      errs() << "[TypeCopilot] Found class " << name << " with SCOPE ns: " << ns
-             << "\n";
+      name = "class " + getFullNameWithScope(ditype);
     } break;
     case dwarf::DW_TAG_reference_type: {
-      // TODO: this is AI bullshit, look into it
       auto *derived = dyn_cast<DIDerivedType>(ditype);
       auto basename = derived->getBaseType() != nullptr
                           ? getDITypeName(derived->getBaseType())
                           : "void";
-      name = basename + "&";
+      // name = basename + "&"; // TODO: should I treat this as a REF or just
+      // the type itself?
+      // TODO: Debug this shit -> THIS IS TRICKY
+      name = basename; // no AMP
+      // errs() << "[TypeCopilot] getDITypeName: reference type, base type: " <<
+      // basename
+      //        << "\n";
     } break;
 
-    case dwarf::DW_TAG_ptr_to_member_type: {
-      // TODO
-      errs() << "[TypeCopilot] ptr to member DIType: ";
-      ditype->print(errs());
-      errs() << ", ";
-
-      auto *derived = dyn_cast<DIDerivedType>(ditype);
-      if (!derived) {
-        errs() << "[TypeCopilot] Failed to cast to DIDerivedType\n";
-        return "";
-      }
-
-      derived->getBaseType()->print(errs());
-      errs() << "\n";
-      auto *subroutine = dyn_cast<DISubroutineType>(derived->getBaseType());
-      if (subroutine) {
-        auto typearray = subroutine->getTypeArray();
-        if (typearray.size() > 0) {
-          auto ret_type = getDITypeName(typearray[0]);
-          errs() << "[TypeCopilot] ptr to member function return type: "
-                 << ret_type << "\n";
-        }
-      }
-      // TODO: how should I use this?
-    } break;
+      // NOTE: not useful, just a pointer to the location where this member is
+      // defined... case dwarf::DW_TAG_ptr_to_member_type: {
+      // // handle like a pointer, but I also want the full scope?
+      // auto *derived = dyn_cast<DIDerivedType>(ditype);
+      // auto basename = derived->getBaseType() != nullptr
+      //                     ? getDITypeName(derived->getBaseType())
+      //                     : "void";
+      // name = basename + "*";
+      // errs() << "[TypeCopilot] getDITypeName: ptr to member type, base type:
+      // " << basename
+      //        << "\n";
+      // } break;
 
     default:
-      errs() << "[TypeCopilot] HANDLE DWARF TAG -> " << tag << "\n";
+      errs() << "[TypeCopilot] WARNING: HANDLE DWARF TAG -> " << tag << "\n";
       break;
     }
-    // errs() << "[TypeCopilot] getDITypeName RET " << name << ", tag: " << tag
-    // << "\n";
+
     return name;
   }
 }; // class DebugInfoHelper
@@ -1176,13 +1173,14 @@ public:
   }
 
   void processFieldOf(Function *scope, GetElementPtrInst &gep) {
-    // TODO: this cannot work
-    // errs() << "[TypeCopilot] processFieldOf: " << gep
-    //        << ", noperands: " << gep.getNumOperands() << "\n";
+    return; // this is FP prone for some reason
+    // TODO: debug this, sometimes this causes the wrong type to be used.
+    // the original implementation was broken for our GEPs that are not conventional. 
+    // After changing something performance of Type Recon got worse and a FP was introduced, somehow. 
+    // Maybe, this is not worth it.
     Value *base = gep.getPointerOperand();
     Type *baseType = gep.getSourceElementType();
 
-    // base type
     auto baseName = tyHelper->getTypeName(baseType);
     if (tg->isOpaque(scope, base) && tyHelper->isNotPtrOpaque(baseName)) {
       if (tg->put(scope, base, tyHelper->getReference(baseName)))
@@ -1193,70 +1191,47 @@ public:
     std::string typeName;
     Value *lhs = dyn_cast<Value>(&gep);
 
-    // start from 2, skip the first index
-    for (unsigned int i = 2; i < gep.getNumOperands(); ++i) {
-      Value *index = gep.getOperand(i);
-      if (auto *constIndex = dyn_cast<ConstantInt>(index)) {
-        // if the index is a constant, adjust the type
-        uint64_t index = constIndex->getZExtValue();
-
-        if (auto *structType = dyn_cast<StructType>(baseType)) {
-          if (index < structType->getNumElements()) {
-            baseType = structType->getElementType(index);
-            typeName = tyHelper->getTypeName(baseType);
-
-            // if baseType is op, divert to DIType
-            if (tyHelper->isOpaque(typeName) && i == gep.getNumOperands() - 1) {
-              typeName = diHelper->getDIStructField(structType, index);
-            }
-          }
-        } else if (auto *arrayType = dyn_cast<ArrayType>(baseType)) {
-          baseType = arrayType->getElementType();
-        } else if (auto *vectorType = dyn_cast<VectorType>(baseType)) {
-          baseType = vectorType->getElementType();
-        } else {
-          // should not reach here
-          errs() << "[ERR] unknown type: ";
-          baseType->dump();
+    if (auto *arrayType = dyn_cast<ArrayType>(baseType)) {
+      baseType = arrayType->getElementType();
+      typeName = tyHelper->getTypeName(baseType);
+    } else if (auto *vectorType = dyn_cast<VectorType>(baseType)) {
+      baseType = vectorType->getElementType();
+      typeName = tyHelper->getTypeName(baseType);
+    } else if (StructType *ST = dyn_cast<StructType>(baseType)) {
+      auto nIdx = gep.getNumIndices();
+      if (nIdx == 1) {
+        // access to array of structs -> lhs is a pointer to the struct type
+        baseType = ST;
+        typeName = tyHelper->getTypeName(baseType);
+      } else if (nIdx == 2) {
+        // access to struct field -> reconstruct
+        auto idx = gep.getOperand(2);
+        if (auto constIdx = dyn_cast<ConstantInt>(idx)) {
+          uint64_t fieldIdx = constIdx->getZExtValue();
+          typeName = diHelper->getDIStructField(ST, fieldIdx);
+          // if (typeName.empty()) {
+          // TODO: put some more engineering in this if needed
+          //   typeName = diHelper->getStructField(ST, fieldIdx);
+          // }
         }
-      } else {
-        if (auto *arrayType = dyn_cast<ArrayType>(baseType)) {
-          baseType = arrayType->getElementType();
-        } else if (auto *vectorType = dyn_cast<VectorType>(baseType)) {
-          baseType = vectorType->getElementType();
-        } else {
-          // should not reach here
-          errs() << "[ERR] unknown index: ";
-          index->dump();
-          assert(false && "GEP index is not constant");
-          // exit(1);
-        }
-      }
+      } else
+        errs() << "[TypeCopilot] WARNING: Unsupported GEP with " << nIdx
+               << " indices: " << gep << "\n";
+    }
+    // expected when idxs are NOT constant. But are there other cases? PTRs,
+    // sometimes
+    if (typeName.empty()) {
+      return;
     }
 
-    if (tyHelper->isNotPtrOpaque(
-            typeName)) { // tg->isOpaque(scope, lhs) &&  REMOVED vaffanculo
+    if (tyHelper->isNotPtrOpaque(typeName)) { // tg->isOpaque(scope, lhs) &&
       if (tg->put(scope, lhs, tyHelper->getReference(typeName))) {
-        // errs() << "[DBG] GEP update LHS" << *lhs << " to " << typeName
-        //        << " isOpaque? " << tg->isOpaque(scope, lhs) << "
-        //        isNotPtrOpaque? "
-        //        << tyHelper->isNotPtrOpaque(typeName) << "\n";
         worklist->push_user(lhs);
-
-      } // NOTE: there could be no update due to how the put is implemented,
-        // there's more to it
-
-      // TODO: debug the following, it's not over yet
-      // else
-      //   errs() << "[DBG] GEP NO update LHS" << *lhs << " to " << typeName
-      //          << " isOpaque? " << tg->isOpaque(scope, lhs) << "
-      //          isNotPtrOpaque? "
-      //          << tyHelper->isNotPtrOpaque(typeName) << "\n";
+      }
     }
   }
 
   void processCast(Function *scope, CastInst &cast) {
-    // Value* src = cast.getOperand(0);
     Value *dst = dyn_cast<Value>(&cast);
     auto dstType = tyHelper->getTypeName(cast.getDestTy());
 
@@ -1310,17 +1285,19 @@ public:
           if (tg->put(calledFunc, paramValue, argType))
             worklist->push_user(paramValue);
       }
-    } else {
-      // TODO: indirect call
-      // Value *calledValue = call.getCalledOperand();
-      // errs() << "[DBG] Indirect call found: ";
-      // auto xx = calledValue->stripPointerCasts();
-      // errs() << *xx << "\n";
-      // Function *f =
-      // dyn_cast<Function>(calledValue->stripPointerCasts()); if (f) {
-      //     errs() << "[DBG] Indirect call to " << f->getName() << "\n";
-      // }
     }
+    // else {
+    //   // TODO: indirect call
+    //   // Value *calledValue = call.getCalledOperand();
+    //   // errs() << "[DBG] Indirect call found: ";
+    //   // auto xx = calledValue->stripPointerCasts();
+    //   // errs() << *xx << "\n";
+    //   // Function *f =
+    //   // dyn_cast<Function>(calledValue->stripPointerCasts()); if (f) {
+    //   //     errs() << "[DBG] Indirect call to " << f->getName() <<
+    //   //     "\n";
+    //   // }
+    // }
 
     // process return value
     Value *dst = dyn_cast<Value>(&call);
@@ -1332,6 +1309,11 @@ public:
 
   void processLoad(Function *scope, LoadInst &load) {
     Value *src = load.getPointerOperand();
+    // TODO
+    // ConstantExpr *constSrc = dyn_cast<ConstantExpr>(src);
+    // if (constSrc) {
+    //   errs() << "[TypeCopilot] LOAD ON CNST SRC: " << load << "\n";
+    // }
     Value *dst = dyn_cast<Value>(&load);
 
     auto deref = tg->dereference(scope, src);
@@ -1349,6 +1331,33 @@ public:
 
   void processStore(Function *scope, StoreInst &store) {
     Value *src = store.getValueOperand();
+    // TODO
+    // ConstantExpr *constSrc = dyn_cast<ConstantExpr>(src);
+    // if (constSrc) {
+    //   if (constSrc->getOpcode() == Instruction::GetElementPtr) {
+    //     auto *gep = dyn_cast<GetElementPtrInst>(constSrc); // this cannot work!
+    //     if (gep) {
+
+    //       auto *gepOperand = gep->getPointerOperand();
+    //       auto *GV = dyn_cast<GlobalValue>(gepOperand);
+    //       if (GV) {
+    //         std::string opName = GV->getName().str();
+    //         if (opName.find("vtable") != std::string::npos ||
+    //             opName.find("VTT") != std::string::npos) {
+    //           errs() << "[TypeCopilot] WARNING: Store to a vtable: " << store
+    //                  << "\n";
+    //           // what could possibly go wrong when storing to a VTABLE?
+    //         } else {
+    //           // store to a global that is not a store to a vtable
+    //           errs() << "[TypeCopilot] WARNING: Store to a global that is not "
+    //                     "a vtable: "
+    //                  << store << "\n";
+    //         }
+    //       }
+    //     }
+    //   }// if ConstGEP
+    // }
+
     Value *dst = store.getPointerOperand();
 
     auto ref = tg->reference(scope, src);
@@ -1391,8 +1400,6 @@ public:
   }
 
   void processCmp(Function *scope, CmpInst &cmp) {
-    // TODO: can this be improved?
-    // get value a and b
     Value *a = cmp.getOperand(0);
     Value *b = cmp.getOperand(1);
 
@@ -1420,7 +1427,8 @@ public:
   } // lookup
 };
 
-// from LLVM Docs: If you require interprocedural analysis, it should be a Pass.
+// from LLVM Docs: If you require interprocedural analysis, it should be
+// a Pass.
 
 class TypeReconstructionAnalysis
     : public AnalysisInfoMixin<TypeReconstructionAnalysis> {
@@ -1442,18 +1450,19 @@ public:
   explicit TypeReconstructionAnalysis() {}
 
   TypeCopilotResult run(Module &M, ModuleAnalysisManager &MAM) {
-    // TODO: debug cases in which the name of some vars of functions is "". This
-    // can break and put rogue data inside the graph. There are many occurrences
-    // of just "*" without any further information.
+    // TODO: spurious names and empty names, or "*" should not be
+    // allowed
     DebugInfoHelper *diHelper = new DebugInfoHelper();
     tg = new TypeGraph();
     diHelper->initialize(&M, tg);
+
     worklist = new WorkList(&M);
     alias = new TypeAlias(&M, tg, worklist, diHelper);
     std::set<const char *> UnhandledOpcodes;
     if (!diHelper->hasDebugInfo(M)) {
       errs() << "[TypeCopilot] WARNING: " << M.getName()
-             << " has no debug info! Type reconstruction will not happen.\n";
+             << " has no debug info! Type reconstruction will not "
+                "happen.\n";
       return nullptr;
     }
 
@@ -1477,26 +1486,45 @@ public:
         alias->processCall(call->getFunction(), *call);
       } else if (auto *select = dyn_cast<SelectInst>(inst)) {
         alias->processSelect(select->getFunction(), *select);
+      } else if (ConstantExpr *constExpr = dyn_cast<ConstantExpr>(inst)) {
+        if (constExpr->getOpcode() == Instruction::GetElementPtr) {
+          // TODO -> store operands should end up here, but they don't
+          errs() << "[TypeCopilot] CONST EXPR GEP: " << *constExpr << "\n";
+          auto *gep =
+              dyn_cast<GetElementPtrInst>(constExpr->getAsInstruction());
+          if (!gep) {
+            errs() << "[TypeCopilot] WARNING: Unsupported ConstantExpr opcode: "
+                   << constExpr->getOpcodeName() << "\n";
+            UnhandledOpcodes.insert(constExpr->getOpcodeName());
+            continue;
+          }
+          alias->processFieldOf(gep->getFunction(), *gep);
+          delete gep; // clean up the instruction created by ConstantExpr
+        } else {
+          UnhandledOpcodes.insert(constExpr->getOpcodeName());
+        }
       }
-      // else if(auto* extractvalue = dyn_cast<ExtractValueInst>(inst)) {
+      // TODO
+      // else if(auto* extractvalue = dyn_cast<ExtractValueInst>(inst))
+      // {
       //   alias->processExtractValue(extractvalue->getFunction(),
       //   *extractvalue);
-      // } else if(auto* insertvalue = dyn_cast<InsertValueInst>(inst)) {
-      //   alias->processInsertValue(insertvalue->getFunction(), *insertvalue);
+      // } else if(auto* insertvalue = dyn_cast<InsertValueInst>(inst))
+      // {
+      //   alias->processInsertValue(insertvalue->getFunction(),
+      //   *insertvalue);
       // }
       else {
         UnhandledOpcodes.insert(inst->getOpcodeName());
       }
-      // allocas, ret, invoke, call, br, extractvalue etc.
       // NOTE: allocas are handled elsewhere, it's fine
-      // TODO: potentially handle extractvalue and insertvalue
     } // while
 
-    for (auto *t : UnhandledOpcodes) {
-      errs() << "[DBG] Unhandled Inst Opcode: ";
-      errs() << t;
-      errs() << "\n";
-    }
+    // for (auto *t : UnhandledOpcodes) {
+    //   errs() << "[DBG] Unhandled Inst Opcode: ";
+    //   errs() << t;
+    //   errs() << "\n";
+    // }
     Ret = std::make_unique<TypeCopilotResult>(tg, diHelper);
     return *Ret;
   }
