@@ -36,6 +36,7 @@
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/Support/SaveAndRestore.h"
 #include <optional>
+#include "fsan.h"
 
 using namespace clang;
 using namespace CodeGen;
@@ -1728,8 +1729,25 @@ void CodeGenFunction::EmitDeclStmt(const DeclStmt &S) {
   if (HaveInsertPoint())
     EmitStopPoint(&S);
 
-  for (const auto *I : S.decls())
+  for (const auto *I : S.decls()){
+    if (const auto *VD = dyn_cast<VarDecl>(I)) {
+      if (VD->hasInit()) {
+        const Expr *Init = VD->getInit()->IgnoreParenImpCasts();
+        if (const auto *Call = dyn_cast<CallExpr>(Init)) {
+          if (FSAN::isAllocCall(Call)) {
+            llvm::errs() << "EmitDeclStmt:- ALLOC SITE FOUND " << VD->getName() << ", SRC LOC: " << VD->getLocation().printToString(getContext().getSourceManager()) << "\n";
+            // VD->getType() is your LHS type -- right here, no parent walk
+            QualType LHSTy = VD->getType();
+            // Stash it so EmitCallExpr can pick it up
+            FSanPendingAllocType = LHSTy;
+            // TODO: complete later when emitting the call
+          }
+        }
+      }
+    }
     EmitDecl(*I, /*EvaluateConditionDecl=*/true);
+  }
+    
 }
 
 void CodeGenFunction::EmitBreakStmt(const BreakStmt &S) {

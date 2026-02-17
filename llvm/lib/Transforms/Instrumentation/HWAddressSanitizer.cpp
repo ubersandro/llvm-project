@@ -214,7 +214,8 @@ static cl::opt<int> ClHotPercentileCutoff("hwasan-percentile-cutoff-hot",
 STATISTIC(NumTotalFuncs, "Number of total funcs");
 STATISTIC(NumInstrumentedFuncs, "Number of instrumented funcs");
 STATISTIC(NumNoProfileSummaryFuncs, "Number of funcs without PS");
-
+STATISTIC(LiteralStructs,
+          "Number of literal structs encountered, doubly counted though");
 // STATISTIC(NumTotalGEPs, "Number of total GEP instructions");
 STATISTIC(
     NumUntaggedGEPResults,
@@ -354,8 +355,11 @@ private:
   void InstrumentStoreOfFunctionArg(StoreInst *SI);
   Type *figureOutInheritance(const std::set<Type *> &structTypes);
 
-  void TagAllocChunksBeforeUse(CallInst *CI,
-                               const std::string &DemangledName); // FieldArmor
+  void
+  ReconstructAllocTypeAndTag(CallInst *CI,
+                             const std::string &DemangledName); // FieldArmor
+  void InstrumentAllocWithType(CallInst *CI, StructType *AllocType,
+                               Value *ArraySize);
   void HandleNewOperator(CallInst *CI,
                          const std::string &DemangledName); // FieldArmor
   Value *GetArraySize(CallInst *CI, StructType *t,
@@ -369,10 +373,11 @@ private:
   Value *ApplyRLT(IRBuilder<> &IRB, Instruction *AI, Type *rootType,
                   const DataLayout &DL); // TODO: refactor remove DL
 
-  u_int8_t *computeTags(StructType *t);           // FieldArmor
-  void createTagVectors();                        // FieldArmor
-  void createTagVector(StructType *t);            // FieldArmor
-  bool potentiallyBlacklistFunction(Function &F); // FieldArmor
+  u_int8_t *computeTags(StructType *t);             // FieldArmor
+  void createTagVectors();                          // FieldArmor
+  void createTagVector(StructType *t);              // FieldArmor
+  Value *RetrieveOrCreateTagVector(StructType *Ty); // FieldArmor
+  bool potentiallyBlacklistFunction(Function &F);   // FieldArmor
   // END FieldArmor
 
   bool selectiveInstrumentationShouldSkip(Function &F,
@@ -547,7 +552,8 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
   MAM.registerPass([&] {
     return TypeReconstructionAnalysis();
   }); // TODO: this does not go here!
-  RetrievedTypes = &MAM.getResult<TypeReconstructionAnalysis>(M);
+  RetrievedTypes =
+      &MAM.getResult<TypeReconstructionAnalysis>(M); // TODO: remove
   const Triple &TargetTriple = M.getTargetTriple();
   // TODO: investigate this, what if it hides UB?
   if (shouldUseStackSafetyAnalysis(TargetTriple, Options.DisableOptimization))
@@ -1503,39 +1509,43 @@ bool HWAddressSanitizer::instrumentLandingPads(
   return true;
 }
 
-// the recall of the following methods is bad, but at least SPEC does not crash!
-/** Filter out GEPs on structs based on the type of the struct. */
-bool shouldBlocklistGEP(GetElementPtrInst *GEPI) {
-  auto fatherType = GEPI->getSourceElementType();
-  if (fatherType->isStructTy()) {
-    StructType *ST = dyn_cast<StructType>(fatherType);
-    if (!ST->isLiteral())
-      // return (ST->getName().str().find("union.") != std::string::npos) ||
-      //        (ST->getName().str().find("std::") != std::string::npos);
-      // NOTE: the above introduces FPs in some benchmarks while fixing others
-      return (ST->getName().str().find("class.std::") != std::string::npos ||
-              ST->getName().str().find("struct.std::") != std::string::npos);
-    // NOTE: assuming std types are safe just because are in the std lib is bad.
-    // They are (mis)used all over SPEC benchmarks.
-  }
-  return false;
-}
+// // the recall of the following methods is bad, but at least SPEC does not
+// crash!
+// /** Filter out GEPs on structs based on the type of the struct. */
+// bool shouldBlocklistGEP(GetElementPtrInst *GEPI) {
+//   auto fatherType = GEPI->getSourceElementType();
+//   if (fatherType->isStructTy()) {
+//     StructType *ST = dyn_cast<StructType>(fatherType);
+//     if (!ST->isLiteral())
+//       // return (ST->getName().str().find("union.") != std::string::npos) ||
+//       //        (ST->getName().str().find("std::") != std::string::npos);
+//       // NOTE: the above introduces FPs in some benchmarks while fixing
+//       others return (ST->getName().str().find("class.std::") !=
+//       std::string::npos ||
+//               ST->getName().str().find("struct.std::") != std::string::npos);
+//     // NOTE: assuming std types are safe just because are in the std lib is
+//     bad.
+//     // They are (mis)used all over SPEC benchmarks.
+//   }
+//   return false;
+// }
 
-bool shouldSkipAlloca(Type *t) {
-  if (t->isStructTy()) {
+// bool shouldSkipAlloca(Type *t) {
+//   if (t->isStructTy()) {
 
-    StructType *ST = dyn_cast<StructType>(t);
-    if (!ST->isLiteral())
-      // return (ST->getName().str().find("union.") != std::string::npos) ||
-      //        (ST->getName().str().find("std::") != std::string::npos) ||
-      //        (ST->getName().str().find("int2type") != std::string::npos) ||
-      //        (ST->getName().str().find("std::_List_iterator") !=
-      //         std::string::npos);
-      return (ST->getName().str().find("union.") != std::string::npos) ||
-             (ST->getName().str().find("std::") != std::string::npos);
-  }
-  return false;
-}
+//     StructType *ST = dyn_cast<StructType>(t);
+//     if (!ST->isLiteral())
+//       // return (ST->getName().str().find("union.") != std::string::npos) ||
+//       //        (ST->getName().str().find("std::") != std::string::npos) ||
+//       //        (ST->getName().str().find("int2type") != std::string::npos)
+//       ||
+//       //        (ST->getName().str().find("std::_List_iterator") !=
+//       //         std::string::npos);
+//       return (ST->getName().str().find("union.") != std::string::npos) ||
+//              (ST->getName().str().find("std::") != std::string::npos);
+//   }
+//   return false;
+// }
 // __attribute__((noinline))
 bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
                                          const DominatorTree &DT,
@@ -1557,8 +1567,11 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
         auto elementType = allocatedType->getArrayElementType();
         if (elementType->isStructTy()) {
           StructType *ST_internal = dyn_cast<StructType>(elementType);
-          if (ST_internal->isLiteral())
+          if (ST_internal->isLiteral()) {
+            LiteralStructs++;
             continue;
+          }
+
           else if (ST_internal->getName().str().find("union.") == 0) {
             continue;
           }
@@ -1569,8 +1582,11 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
           auto innerElementType = elementType->getArrayElementType();
           if (innerElementType->isStructTy()) {
             StructType *ST_internal_l2 = dyn_cast<StructType>(innerElementType);
-            if (ST_internal_l2->isLiteral())
+            if (ST_internal_l2->isLiteral()) {
+              LiteralStructs++;
               continue;
+            }
+
             else if (ST_internal_l2->getName().str().find("union.") == 0) {
               continue;
             }
@@ -1591,9 +1607,10 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
         continue;
       } else {
         StructType *ST = dyn_cast<StructType>(allocatedType);
-        if (ST->isLiteral())
+        if (ST->isLiteral()) {
+          LiteralStructs++;
           continue;
-        else if (ST->getName().str().find("union.") == 0) {
+        } else if (ST->getName().str().find("union.") == 0) {
           continue;
         }
       } // rules out allocas of not safe structs
@@ -1753,7 +1770,9 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   SmallVector<CmpInst *, 40> CMPsToInstrument;
   SmallVector<ConstantExpr *, 40> ConstGEPsToInstrument;
   SmallVector<StoreInst *, 40> StoresToInstrument;
-  SmallVector<std::pair<CallInst *, std::string>, 40> CallsToAllocator;
+  // SmallVector<std::pair<CallInst *, std::string>, 40> CallsToAllocator;
+  // this should be a MAP
+  DenseMap<CallInst *, std::string> CallsToAllocator;
   SmallVector<std::pair<CallInst *, std::string>, 40> CallsToNew;
   // FieldArmor
 
@@ -1802,18 +1821,23 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
           demangledName == "memalign" || demangledName == "aligned_alloc" ||
           demangledName == "posix_memalign" || demangledName == "valloc" ||
           demangledName == "pvalloc") {
-        CallsToAllocator.push_back(std::make_pair(CI, demangledName));
+        // CallsToAllocator.push_back(std::make_pair(CI, demangledName));
+        CallsToAllocator[CI] = demangledName;
       }
 
-      else if (demangledName.find("operator new") != std::string::npos) {
-        CallsToAllocator.push_back(std::make_pair(CI, demangledName));
-      }
+      // TODO
+      // else if (demangledName.find("operator new") != std::string::npos) {
+      //   // CallsToAllocator.push_back(std::make_pair(CI, demangledName));
+      //   CallsToAllocator[CI] = demangledName;
+      // }
     }
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(&Inst)) {
       if (CE->getOpcode() == Instruction::GetElementPtr) {
         ConstGEPsToInstrument.push_back(CE);
       }
     }
+    // TODO: introduce extra logic for "heapallocsite" collection for statistics
+    // and debug
   }
 
   memtag::StackInfo &SInfo = SIB.get();
@@ -1844,13 +1868,89 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   //                  !SInfo.AllocasToInstrument.empty());
 
   for (auto &PAIR : CallsToAllocator) {
-    TagAllocChunksBeforeUse(PAIR.first, PAIR.second);
-  }
+    CallInst *CI = PAIR.first;
 
-  // for (auto &PAIR : CallsToNew) {
-  //   // HandleNewOperator(PAIR.first, PAIR.second);
-  //   TagAllocChunksBeforeUse(PAIR.first, PAIR.second);
-  // }
+    if (MDNode *MD_fsan = CI->getMetadata("fsan.alloc")) {
+      if (Metadata *MOp = MD_fsan->getOperand(1)) {
+        // STRING
+        if (auto *MDStringOp = dyn_cast<MDString>(MOp)) {
+          std::string AllocType = MDStringOp->getString().str();
+          auto *Type = StructType::getTypeByName(CI->getModule()->getContext(),
+                                                 AllocType);
+          if (Type) {
+            errs() << "STRUCT TYPE ID: ";
+            errs() << " -> ";
+            Type->print(errs());
+            int64_t ArraySize = 0;
+            { // GET ARRAY SIZE
+              if (Metadata *MOp2 = MD_fsan->getOperand(2)) {
+                if (Metadata *MOp2 = MD_fsan->getOperand(2)) {
+
+                  if (auto *CAM = dyn_cast<ConstantAsMetadata>(MOp2)) {
+                    if (auto *CIconst =
+                            dyn_cast<ConstantInt>(CAM->getValue())) {
+                      ArraySize = CIconst->getZExtValue();
+                      errs() << "\t\tARRAY SIZE: " << ArraySize << "\n";
+                    } else {
+                      errs()
+                          << "\t\t[FieldArmor] fsan.alloc operand 2 is not a "
+                             "ConstantInt (wrapped by ConstantAsMetadata)\n";
+                    }
+                  } else if (auto *VAM = dyn_cast<ValueAsMetadata>(MOp2)) {
+                    if (auto *CIconst =
+                            dyn_cast<ConstantInt>(VAM->getValue())) {
+                      ArraySize = CIconst->getZExtValue();
+                      errs() << "\t\tARRAY SIZE: " << ArraySize << "\n";
+                    } else {
+                      errs()
+                          << "\t\t[FieldArmor] fsan.alloc operand 2 is not a "
+                             "ConstantInt (wrapped by ValueAsMetadata)\n";
+                    }
+                  } else if (auto *MDS = dyn_cast<MDString>(MOp2)) {
+                    StringRef S = MDS->getString();
+                    ArraySize = 0;
+                    if (!S.getAsInteger(10, ArraySize)) {
+                      errs() << "\t\tARRAY SIZE (from string): " << ArraySize
+                             << "\n";
+                    } else {
+                      errs() << "\t\t[FieldArmor] fsan.alloc operand 2 is an "
+                                "MDString but not a number: "
+                             << S << "\n";
+                    }
+                  } else {
+                    errs() << "\t\t[FieldArmor] fsan.alloc operand 2 has an "
+                              "unexpected metadata kind\n";
+                  }
+                } // get arraysize mnop2
+              }
+            } // GET ARRAY SIZE
+            if (ArraySize == 0) {
+              errs() << "\t\t[FieldArmor] ERROR: array size is 0, skipping "
+                        "instrumentation for this call\n";
+              return;
+            }
+
+            InstrumentAllocWithType(CI, Type,
+                                    ConstantInt::get(Int64Ty, ArraySize));
+          } // if you found a struct type
+          errs() << "Alloc type: " << AllocType << " -> " << *CI
+                 << ", SRC LOCATION: ";
+          if (DILocation *Loc = CI->getDebugLoc()) {
+            errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
+                   << Loc->getColumn() << "\n";
+          }
+        }
+      }
+    } else {
+      errs() << "No fsan.alloc metadata found for call: " << *CI
+             << " SRC LOCATION: ";
+      if (DILocation *Loc = CI->getDebugLoc()) {
+        errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
+               << Loc->getColumn() << "\n";
+      }
+    }
+    // ReconstructAllocTypeAndTag(PAIR.first, PAIR.second);
+  } // for call
 
   if (!SInfo.AllocasToInstrument.empty()) {
     const DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
@@ -2117,19 +2217,18 @@ bool augmentstructTypesFromTypeSet(std::set<Type *> &structTypes,
 
 void debugCallSitePrint(CallInst *CI,
                         const std::string &demangledFunctionName) {
-  errs() << "ALLOC SITE: ";
-  CI->print(errs());
-  errs() << "\n";
 
-  errs() << " FUNCTION: " << demangledFunctionName << "\n";
   if (const DebugLoc &DL = CI->getDebugLoc()) {
     if (DILocation *Loc = DL.get()) {
       StringRef File = Loc->getFilename();
       StringRef Dir = Loc->getDirectory();
       unsigned Line = Loc->getLine();
       unsigned Col = Loc->getColumn();
-      errs() << "    LOCATION: " << Dir << "/" << File << ":" << Line << ":"
-             << Col << "\n";
+      // errs() << "    (IR)ALLOCATION SITE: " << Dir << "/" << File << ":" <<
+      // Line << ":"
+      //        << Col << ", FUNCTION: " << demangledFunctionName << "\n";
+      errs() << "    (IR)ALLOCATION SITE: " << File << ":" << Line << ":" << Col
+             << ", FUNCTION: " << demangledFunctionName << "\n";
     }
   } else
     errs() << "\tLOCATION: <unknown>\n";
@@ -2137,9 +2236,7 @@ void debugCallSitePrint(CallInst *CI,
 
 Value *retrieveTagVector(StructType *srcType, Module &M, bool try_base = true) {
   auto typeName = srcType->getStructName().str();
-  // bool isClass = typeName.find("class.") == 0;
   bool isBase = typeName.find(".base") != std::string::npos;
-  // isClass &&
 
   std::string lookupName = typeName;
   if (!isBase && try_base)
@@ -2252,9 +2349,61 @@ std::pair<bool, bool> getAllocationMetadata(Function *F) {
   return {false, false};
 } // getAllocationMetadata
 
+Value *HWAddressSanitizer::RetrieveOrCreateTagVector(StructType *t) {
+
+  auto TagVector = M.getGlobalVariable(
+      t->getStructName().str() + ".fieldarmor.tagvec", true);
+  if (!TagVector) {
+    createTagVector(t);
+    TagVector = M.getGlobalVariable(
+        t->getStructName().str() + ".fieldarmor.tagvec", true);
+    return TagVector;
+  }
+  return TagVector;
+}
+
+void HWAddressSanitizer::InstrumentAllocWithType(CallInst *CI, StructType *t,
+                                                 Value *ArraySize) {
+  ConstantInt *ArraySizeConst = dyn_cast<ConstantInt>(ArraySize);
+  int64_t ArraySizeInt = 0;
+
+  if (ArraySizeConst)
+    ArraySizeInt = ArraySizeConst->getZExtValue();
+  else
+    assert(false &&
+           "ArraySize should not be null if it's not a constant integer");
+
+  IRBuilder<> IRB(CI->getNextNonDebugInstruction());
+  if (ArraySizeInt == -1)
+    ArraySize = GetArraySize(CI, t, IRB);
+
+  Value *TagVector = RetrieveOrCreateTagVector(t);
+  if (!TagVector) {
+    errs() << "[FieldArmor] ERROR: TagVector not created/retrieved. Maybe Type "
+              "is not available? TYPE: ";
+    t->print(errs());
+    errs() << "\n";
+    return;
+  }
+
+  auto TypeSize = M.getDataLayout().getTypeAllocSize(t);
+  FunctionCallee fieldarmor_tag_memory =
+      M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy,
+                            PtrTy, PtrTy, Int64Ty, Int64Ty);
+  llvm::errs() << "[FieldArmor] DYNAMIC TAGGING SUCCESS:\n\t" << *CI
+               << "\n\t\tstruct type: " << t->getStructName()
+               << "\n\t\tARRAY SIZE: " << *ArraySize << "\n";
+  IRB.CreateCall(fieldarmor_tag_memory,
+                 {IRB.CreatePointerCast(CI, PtrTy),
+                  IRB.CreatePointerCast(TagVector, PtrTy),
+                  ConstantInt::get(Int64Ty, TypeSize), ArraySize});
+  CI->setName(CI->getName() + ".fieldarmor.tagged");
+
+} // InstrumentAllocWithType
+
 /** Analyze uses at allocation site, if a type can be reliably reconstructed,
  * then tag memory. This almost never works.*/
-void HWAddressSanitizer::TagAllocChunksBeforeUse(
+void HWAddressSanitizer::ReconstructAllocTypeAndTag(
     CallInst *CI, const std::string &DemangledName) {
   std::set<Type *> seenTypes;
   std::set<Type *> structTypes;
@@ -2262,11 +2411,18 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
   bool ambiguous = false;
   auto nUses = CI->getNumUses();
   debugCallSitePrint(CI, DemangledName);
+  if (nUses == 0) {
+    errs() << "\t\t [FieldArmor] WARNING: allocation site has no uses, "
+              "skipping type "
+              "reconstruction.\n";
+    return;
+  }
+  // most malloc/callocs get dropped at some point, out of the ones in IR, how
+  // many are tagged?
+  // return; // DEBUG
 
   // NOTE: this is weird, but it happens in some benchmarks. These calls will
   // probably be dropped.
-  if (nUses == 0)
-    return;
 
   for (auto *U : CI->users()) {
     if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
@@ -2296,8 +2452,8 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
         continue; // TODO
 
       auto ptrOperand = SI->getPointerOperand();
-      // TODO: does getUnderlyingObject retrieve the object underlying a GEP on
-      // a struct field?
+      // TODO: does getUnderlyingObject retrieve the object underlying a GEP
+      // on a struct field?
       auto underlyingObject = getUnderlyingObject(ptrOperand);
 
       if (ConstantExpr *CR = dyn_cast<ConstantExpr>(ptrOperand)) {
@@ -2585,8 +2741,8 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
 
   if (structTypes.empty()) {
     if (!seenTypes.empty()) {
-      errs()
-          << "[FieldArmor]\tTYPE RECON: UNINTERESTING: struct typeset empty\n";
+      errs() << "[FieldArmor]\tTYPE RECON: UNINTERESTING: struct typeset "
+                "empty\n";
       for (auto *type : seenTypes) {
         errs() << "\t Type: ";
         type->print(errs());
@@ -2718,7 +2874,7 @@ void HWAddressSanitizer::TagAllocChunksBeforeUse(
                   ConstantInt::get(Int64Ty, typeSize), ArraySizeValue});
   CI->setName(CI->getName() + ".fieldarmor.tagged");
   structTypes.clear();
-} // TagAllocChunksBeforeUse
+} // ReconstructAllocTypeAndTag
 
 void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
   // auto GEPResultType = GEPI->getResultElementType();
@@ -2783,8 +2939,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       IRB.CreateIntToPtr(untaggedResLong, GEPI->getType());
 
   // Value *fullFatherTag = IRB.CreateLShr(
-  //     IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x7FLu << 56Lu)),
-  //     PointerTagShift);
+  //     IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x7FLu <<
+  //     56Lu)), PointerTagShift);
 
   // Value *fatherT = IRB.CreateAnd(fullFatherTag, T_Mask_value);
 
@@ -3160,6 +3316,7 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   if (type->isStructTy()) {
     StructType *ST = dyn_cast<StructType>(type);
     if (ST->isLiteral()) {
+      LiteralStructs++;
       return;
     }
     isUnion = ST->getName().str().find("union.") != std::string::npos;
@@ -3169,8 +3326,10 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   if (isArrayOfStructs) {
     Type *elementType = type->getArrayElementType();
     StructType *STA = dyn_cast<StructType>(elementType);
-    if (STA->isLiteral())
+    if (STA->isLiteral()) {
+      LiteralStructs++;
       return;
+    }
     isUnion = STA->getName().str().find("union.") != std::string::npos;
     struct_name = STA->getName().str();
   }
@@ -3179,8 +3338,10 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     Type *elementType = dyn_cast<ArrayType>(type)->getElementType();
     Type *structType = dyn_cast<ArrayType>(elementType)->getElementType();
     StructType *STM = dyn_cast<StructType>(structType);
-    if (STM->isLiteral())
+    if (STM->isLiteral()) {
+      LiteralStructs++;
       return;
+    }
     isUnion = STM->getName().str().find("union.") != std::string::npos;
     struct_name = STM->getName().str();
   }
@@ -3376,6 +3537,8 @@ void HWAddressSanitizer::instrumentGlobals() {
         else if (elemArrayType->getElementType()->isStructTy()) {
           bool isLiteral = dyn_cast<StructType>(elemArrayType->getElementType())
                                ->isLiteral();
+          if (isLiteral)
+            LiteralStructs++;
           bool isUnion =
               isLiteral ? true
                         : dyn_cast<StructType>(elemArrayType->getElementType())
@@ -3519,6 +3682,8 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
 
   u_int8_t *tags = nullptr;
   bool isLiteral = t->isLiteral();
+  if (isLiteral)
+    LiteralStructs++;
   bool isUnion =
       !isLiteral && t->getName().str().find("union.") != std::string::npos;
 
@@ -3611,13 +3776,15 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
 
     auto ST_son = dyn_cast<StructType>(sonType);
     auto isLitStr = ST_son && ST_son->isLiteral();
+    if (isLitStr)
+      LiteralStructs++;
     auto isUnion =
         ST_son && !isLitStr && (ST_son->getName().find("union.") == 0);
     // auto isClass = ST_son && !isLitStr && !isUnion &&
     //                (ST_son->getName().find("class.") == 0);
-    // TODO: if a class is embedded in a struct and the class has padding in the
-    // end, that is treated as an extra field and can lead to FPs? This has
-    // never happened till now.
+    // TODO: if a class is embedded in a struct and the class has padding in
+    // the end, that is treated as an extra field and can lead to FPs? This
+    // has never happened till now.
     if (ST_son && !isLitStr && !isUnion) {
       u_int8_t newBaseTag = 0; // FLAT scheme introduced here
       uint8_t count = 0;
@@ -3643,6 +3810,7 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
         // case : ARRAY of STRUCTS embedded in a struct
         if (StructType *structType = dyn_cast<StructType>(elementType)) {
           if (structType->isLiteral()) {
+            LiteralStructs++;
             // dont tag literal structs arrays for now
             continue;
           } else if (structType->getName().str().find("union.") == 0) {
@@ -3690,6 +3858,7 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
           auto structType = cast<StructType>(innerElementType);
           if (structType->isLiteral()) {
             // dont tag literal struct matrices for now
+            LiteralStructs++;
             continue;
           } else if (structType->getName().str().find("union.") == 0) {
             // dont tag union matrices for now
@@ -3697,8 +3866,8 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
           }
 
           // TODO: handle arrays of C++ classes. What happens if the wrong tag
-          // vector is used? E.g. base vs non-base? Using struct size should be
-          // fine though.
+          // vector is used? E.g. base vs non-base? Using struct size should
+          // be fine though.
 
           auto structName = structType->getStructName().str();
           auto tagVectorGlobal =

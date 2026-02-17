@@ -198,6 +198,9 @@ void CodeGenFunction::EmitDecl(const Decl &D, bool EvaluateConditionDecl) {
 /// EmitVarDecl - This method handles emission of any variable declaration
 /// inside a function, including static vars etc.
 void CodeGenFunction::EmitVarDecl(const VarDecl &D) {
+  {
+
+  }
   if (D.hasExternalStorage())
     // Don't emit it now, allow it to be emitted lazily on its first use.
     return;

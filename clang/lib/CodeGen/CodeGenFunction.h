@@ -253,6 +253,7 @@ class CodeGenFunction : public CodeGenTypeCache {
 public:
   /// A jump destination is an abstract label, branching to which may
   /// require a jump out through normal cleanups.
+  QualType FSanPendingAllocType; 
   struct JumpDest {
     JumpDest() : Block(nullptr), Index(0) {}
     JumpDest(llvm::BasicBlock *Block, EHScopeStack::stable_iterator Depth,
