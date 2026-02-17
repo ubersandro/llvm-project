@@ -1,11 +1,8 @@
 /** HEADER for FSAN utils */
 #ifndef FSAN_H
 #define FSAN_H
-// using namespace clang;
-// using namespace llvm;
-// #include "CodeGenFunction.h"
 #include "clang/AST/ParentMapContext.h"
-// #include "llvm/IR/LLVMContext.h"
+#include "clang/Basic/SourceManager.h"
 
 namespace FSAN {
 
@@ -13,15 +10,6 @@ inline std::set<std::string> allocFunctions = {
     "malloc",        "realloc",        "calloc", "reallocarray", "memalign",
     "aligned_alloc", "posix_memalign", "valloc", "pvalloc"};
 
-// TODO: write DBG method to print src locations of expressions easily
-
-// inline bool isAllocCall(const clang::CallExpr *Call) {
-//   // TODO: write this correctly
-//   if (const auto *Callee = Call->getDirectCallee()) {
-
-//   }
-//   return false;
-// }
 inline void printExprLocation(const clang::Expr *E, clang::SourceManager &SM) {
   auto SL = E->getExprLoc();
   // auto &SM = CGF.getContext().getSourceManager();
@@ -30,13 +18,8 @@ inline void printExprLocation(const clang::Expr *E, clang::SourceManager &SM) {
     if (P.isInvalid())
       P = SM.getPresumedLoc(SM.getSpellingLoc(SL));
     if (!P.isInvalid())
-      llvm::errs() << "VisitBinAssign:- ALLOC SITE FOUND, SRC LOC: "
-                   << P.getFilename() << ":" << P.getLine() << ":"
-                   << P.getColumn() << "\n";
-    else
-      llvm::errs() << "VisitBinAssign:- ALLOC SITE FOUND, SRC LOC: <invalid>\n";
-  } else {
-    llvm::errs() << "VisitBinAssign:- ALLOC SITE FOUND, SRC LOC: <none>\n";
+      llvm::errs() << "[DBG]:- EXPRESSION DUMP, SRC LOC: " << P.getFilename()
+                   << ":" << P.getLine() << ":" << P.getColumn() << "\n";
   }
 }
 
@@ -67,6 +50,7 @@ inline bool isAllocCall(const clang::CallExpr *Call) {
   }
 
   // Case 3: __builtin_malloc etc.
+  // TODO: debug this case eventually
   // if (const auto *CE = dyn_cast<clang::ImplicitCastExpr>(Call->getCallee()))
   // {
   //   if (const auto *DRE = dyn_cast<clang::DeclRefExpr>(CE->getSubExpr())) {
@@ -360,7 +344,7 @@ inline void TagFromCallSite(const clang::CallExpr *E,
     else {
       // apply pending type
       clang::QualType PendingTy = CGF.FSanPendingAllocType;
-      if (!PendingTy.isNull()){
+      if (!PendingTy.isNull()) {
         llvm::errs() << "\t\t[FrontEnd] Applying pending type: "
                      << PendingTy.getAsString() << "\n";
         clang::QualType PointeeTy = PendingTy->getPointeeType();

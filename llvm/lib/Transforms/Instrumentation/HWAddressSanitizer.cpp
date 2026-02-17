@@ -360,8 +360,8 @@ private:
                              const std::string &DemangledName); // FieldArmor
   void InstrumentAllocWithType(CallInst *CI, StructType *AllocType,
                                Value *ArraySize);
-  void HandleNewOperator(CallInst *CI,
-                         const std::string &DemangledName); // FieldArmor
+  // void HandleNewOperator(CallInst *CI,
+  //                        const std::string &DemangledName); // FieldArmor
   Value *GetArraySize(CallInst *CI, StructType *t,
                       IRBuilder<> &IRB); // FieldArmor
   void handleGEP2operands(GetElementPtrInst *GEPI);
@@ -378,6 +378,8 @@ private:
   void createTagVector(StructType *t);              // FieldArmor
   Value *RetrieveOrCreateTagVector(StructType *Ty); // FieldArmor
   bool potentiallyBlacklistFunction(Function &F);   // FieldArmor
+  void HandleMallocLikeCall(CallInst *CI);
+  void HandleNewCall(CallInst *CI);
   // END FieldArmor
 
   bool selectiveInstrumentationShouldSkip(Function &F,
@@ -1706,27 +1708,190 @@ bool HWAddressSanitizer::selectiveInstrumentationShouldSkip(
   return Skip;
 }
 
-/** Blocklist C++ templates because they are broken with my instumentation.*/
+// BS
 bool HWAddressSanitizer::potentiallyBlacklistFunction(Function &F) {
-  // std::string demangledName = demangle(F.getName().str());
-
-  // // blocking functions that start with std:: (enforce starts with)
-  // if ((demangledName.find("std::") != std::string::npos &&
-  //      demangledName.find("std::") == 0) ||
-  //     demangledName.find("llvm::") != std::string::npos) {
-  //   // errs() << "[++] Blocklisting function: " << demangledName << "\n";
-  //   return true;
-  // }
-
-  // if (demangledName.find("Perl_Slab") != std::string::npos) {
-  //   errs() << "[++] Blocklisting function: " << demangledName << "\n";
-  //   return true;
-  //   // TODO: solve bugs in there because of PTR arithmetics.
-  //   // PtrToInt instrumentation was solving the mess there, so it must be
-  //   easy
-  //   // to figure bugs out. Only two functions are blocklisted.
-  // }
   return false;
+}
+
+void HWAddressSanitizer::HandleMallocLikeCall(CallInst *CI) {
+  errs() << "(IR) Handling malloc-like call: " << *CI << " SRC LOCATION: ";
+  { // DBG
+    if (DILocation *Loc = CI->getDebugLoc()) {
+      errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
+             << Loc->getColumn() << "\n";
+    }
+  } // DBG
+  if (MDNode *MD_fsan = CI->getMetadata("fsan.alloc")) {
+    if (Metadata *MOp = MD_fsan->getOperand(1)) {
+      // STRING
+      if (auto *MDStringOp = dyn_cast<MDString>(MOp)) {
+        std::string AllocType = MDStringOp->getString().str();
+        auto *Type =
+            StructType::getTypeByName(CI->getModule()->getContext(), AllocType);
+        if (Type) {
+          // TODO: REMOVE UNIONS!!!!
+          errs() << "STRUCT TYPE ID: ";
+          errs() << " -> ";
+          Type->print(errs());
+          int64_t ArraySize = 0;
+          { // GET ARRAY SIZE
+            if (Metadata *MOp2 = MD_fsan->getOperand(2)) {
+              if (Metadata *MOp2 = MD_fsan->getOperand(2)) {
+
+                if (auto *CAM = dyn_cast<ConstantAsMetadata>(MOp2)) {
+                  if (auto *CIconst = dyn_cast<ConstantInt>(CAM->getValue())) {
+                    ArraySize = CIconst->getZExtValue();
+                    errs() << "\t\tARRAY SIZE: " << ArraySize << "\n";
+                  } else {
+                    errs() << "\t\t[FieldArmor] fsan.alloc operand 2 is not a "
+                              "ConstantInt (wrapped by ConstantAsMetadata)\n";
+                  }
+                } else if (auto *VAM = dyn_cast<ValueAsMetadata>(MOp2)) {
+                  if (auto *CIconst = dyn_cast<ConstantInt>(VAM->getValue())) {
+                    ArraySize = CIconst->getZExtValue();
+                    errs() << "\t\tARRAY SIZE: " << ArraySize << "\n";
+                  } else {
+                    errs() << "\t\t[FieldArmor] fsan.alloc operand 2 is not a "
+                              "ConstantInt (wrapped by ValueAsMetadata)\n";
+                  }
+                } else if (auto *MDS = dyn_cast<MDString>(MOp2)) {
+                  StringRef S = MDS->getString();
+                  ArraySize = 0;
+                  if (!S.getAsInteger(10, ArraySize)) {
+                    errs() << "\t\tARRAY SIZE (from string): " << ArraySize
+                           << "\n";
+                  } else {
+                    errs() << "\t\t[FieldArmor] fsan.alloc operand 2 is an "
+                              "MDString but not a number: "
+                           << S << "\n";
+                  }
+                } else {
+                  errs() << "\t\t[FieldArmor] fsan.alloc operand 2 has an "
+                            "unexpected metadata kind\n";
+                }
+              } // get arraysize mnop2
+            }
+          } // GET ARRAY SIZE
+          if (ArraySize == 0) {
+            errs() << "\t\t[FieldArmor] ERROR: array size is 0, skipping "
+                      "instrumentation for this call\n";
+            return;
+          }
+
+          InstrumentAllocWithType(CI, Type,
+                                  ConstantInt::get(Int64Ty, ArraySize));
+        } // if you found a struct type
+        errs() << "Alloc type: " << AllocType << " -> " << *CI
+               << ", SRC LOCATION: ";
+        if (DILocation *Loc = CI->getDebugLoc()) {
+          errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
+                 << Loc->getColumn() << "\n";
+        }
+      }
+    }
+  } else {
+    errs() << "No fsan.alloc metadata found for call: " << *CI
+           << " SRC LOCATION: ";
+    if (DILocation *Loc = CI->getDebugLoc()) {
+      errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
+             << Loc->getColumn() << "\n";
+    }
+  }
+} // HandleMallocLikeCall
+
+void HWAddressSanitizer::HandleNewCall(CallInst *CI) {
+  errs() << "[IR] Handling new call: " << *CI << " SRC LOCATION: ";
+  { // DBG
+    if (DILocation *Loc = CI->getDebugLoc()) {
+      errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
+             << Loc->getColumn() << "\n";
+    }
+  } // DBG
+
+  if (MDNode *MD_fsan = CI->getMetadata("fsan.new")) {
+    errs() << "(IR) Found fsan.new metadata for call: " << *CI
+           << " SRC LOCATION: ";
+    if (DILocation *Loc = CI->getDebugLoc()) {
+      errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
+             << Loc->getColumn() << "\n";
+    }
+    // handle here
+    if (Metadata *MOp = MD_fsan->getOperand(1)) {
+      if (auto *MDStringOp = dyn_cast<MDString>(MOp)) {
+        std::string AllocType = MDStringOp->getString().str();
+        auto *Type =
+            StructType::getTypeByName(CI->getModule()->getContext(), AllocType);
+        if (Type) {
+          // TODO: REMOVE UNIONS!!!!
+          errs() << "CLASS/STRUCT TYPE ID: ";
+          errs() << " -> ";
+          Type->print(errs());
+          int64_t ArraySize = 0;
+          { // GET ARRAY SIZE
+            if (Metadata *MOp2 = MD_fsan->getOperand(2)) {
+              if (Metadata *MOp2 = MD_fsan->getOperand(2)) {
+
+                if (auto *CAM = dyn_cast<ConstantAsMetadata>(MOp2)) {
+                  if (auto *CIconst = dyn_cast<ConstantInt>(CAM->getValue())) {
+                    ArraySize = CIconst->getZExtValue();
+                    errs() << "\t\tARRAY SIZE: " << ArraySize << "\n";
+                  } else {
+                    errs() << "\t\t[FieldArmor] fsan.alloc operand 2 is not a "
+                              "ConstantInt (wrapped by ConstantAsMetadata)\n";
+                  }
+                } else if (auto *VAM = dyn_cast<ValueAsMetadata>(MOp2)) {
+                  if (auto *CIconst = dyn_cast<ConstantInt>(VAM->getValue())) {
+                    ArraySize = CIconst->getZExtValue();
+                    errs() << "\t\tARRAY SIZE: " << ArraySize << "\n";
+                  } else {
+                    errs() << "\t\t[FieldArmor] fsan.alloc operand 2 is not a "
+                              "ConstantInt (wrapped by ValueAsMetadata)\n";
+                  }
+                } else if (auto *MDS = dyn_cast<MDString>(MOp2)) {
+                  StringRef S = MDS->getString();
+                  ArraySize = 0;
+                  if (!S.getAsInteger(10, ArraySize)) {
+                    errs() << "\t\tARRAY SIZE (from string): " << ArraySize
+                           << "\n";
+                  } else {
+                    errs() << "\t\t[FieldArmor] fsan.alloc operand 2 is an "
+                              "MDString but not a number: "
+                           << S << "\n";
+                  }
+                } else {
+                  errs() << "\t\t[FieldArmor] fsan.alloc operand 2 has an "
+                            "unexpected metadata kind\n";
+                }
+              } // get arraysize mnop2
+            }
+          } // GET ARRAY SIZE
+          if (ArraySize == 0) {
+            errs() << "\t\t[FieldArmor] ERROR: array size is 0, skipping "
+                      "instrumentation for this call\n";
+            return;
+          }
+
+          InstrumentAllocWithType(CI, Type,
+                                  ConstantInt::get(Int64Ty, ArraySize));
+        } // if you found a struct type
+        errs() << "Alloc type: " << AllocType << " -> " << *CI
+               << ", SRC LOCATION: ";
+        if (DILocation *Loc = CI->getDebugLoc()) {
+          errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
+                 << Loc->getColumn() << "\n";
+        }
+      }
+    }
+  }
+
+  else {
+    errs() << "(IR) fsan.new METADATA NOT FOUND for call: " << *CI
+           << " SRC LOCATION: ";
+    if (DILocation *Loc = CI->getDebugLoc()) {
+      errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
+             << Loc->getColumn() << "\n";
+    }
+  }
 }
 
 // TODO: handle extractvalue
@@ -1826,10 +1991,10 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       }
 
       // TODO
-      // else if (demangledName.find("operator new") != std::string::npos) {
-      //   // CallsToAllocator.push_back(std::make_pair(CI, demangledName));
-      //   CallsToAllocator[CI] = demangledName;
-      // }
+      else if (demangledName.find("operator new") != std::string::npos) {
+        // CallsToAllocator.push_back(std::make_pair(CI, demangledName));
+        CallsToAllocator[CI] = demangledName;
+      }
     }
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(&Inst)) {
       if (CE->getOpcode() == Instruction::GetElementPtr) {
@@ -1869,85 +2034,10 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   for (auto &PAIR : CallsToAllocator) {
     CallInst *CI = PAIR.first;
-
-    if (MDNode *MD_fsan = CI->getMetadata("fsan.alloc")) {
-      if (Metadata *MOp = MD_fsan->getOperand(1)) {
-        // STRING
-        if (auto *MDStringOp = dyn_cast<MDString>(MOp)) {
-          std::string AllocType = MDStringOp->getString().str();
-          auto *Type = StructType::getTypeByName(CI->getModule()->getContext(),
-                                                 AllocType);
-          if (Type) {
-            errs() << "STRUCT TYPE ID: ";
-            errs() << " -> ";
-            Type->print(errs());
-            int64_t ArraySize = 0;
-            { // GET ARRAY SIZE
-              if (Metadata *MOp2 = MD_fsan->getOperand(2)) {
-                if (Metadata *MOp2 = MD_fsan->getOperand(2)) {
-
-                  if (auto *CAM = dyn_cast<ConstantAsMetadata>(MOp2)) {
-                    if (auto *CIconst =
-                            dyn_cast<ConstantInt>(CAM->getValue())) {
-                      ArraySize = CIconst->getZExtValue();
-                      errs() << "\t\tARRAY SIZE: " << ArraySize << "\n";
-                    } else {
-                      errs()
-                          << "\t\t[FieldArmor] fsan.alloc operand 2 is not a "
-                             "ConstantInt (wrapped by ConstantAsMetadata)\n";
-                    }
-                  } else if (auto *VAM = dyn_cast<ValueAsMetadata>(MOp2)) {
-                    if (auto *CIconst =
-                            dyn_cast<ConstantInt>(VAM->getValue())) {
-                      ArraySize = CIconst->getZExtValue();
-                      errs() << "\t\tARRAY SIZE: " << ArraySize << "\n";
-                    } else {
-                      errs()
-                          << "\t\t[FieldArmor] fsan.alloc operand 2 is not a "
-                             "ConstantInt (wrapped by ValueAsMetadata)\n";
-                    }
-                  } else if (auto *MDS = dyn_cast<MDString>(MOp2)) {
-                    StringRef S = MDS->getString();
-                    ArraySize = 0;
-                    if (!S.getAsInteger(10, ArraySize)) {
-                      errs() << "\t\tARRAY SIZE (from string): " << ArraySize
-                             << "\n";
-                    } else {
-                      errs() << "\t\t[FieldArmor] fsan.alloc operand 2 is an "
-                                "MDString but not a number: "
-                             << S << "\n";
-                    }
-                  } else {
-                    errs() << "\t\t[FieldArmor] fsan.alloc operand 2 has an "
-                              "unexpected metadata kind\n";
-                  }
-                } // get arraysize mnop2
-              }
-            } // GET ARRAY SIZE
-            if (ArraySize == 0) {
-              errs() << "\t\t[FieldArmor] ERROR: array size is 0, skipping "
-                        "instrumentation for this call\n";
-              return;
-            }
-
-            InstrumentAllocWithType(CI, Type,
-                                    ConstantInt::get(Int64Ty, ArraySize));
-          } // if you found a struct type
-          errs() << "Alloc type: " << AllocType << " -> " << *CI
-                 << ", SRC LOCATION: ";
-          if (DILocation *Loc = CI->getDebugLoc()) {
-            errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
-                   << Loc->getColumn() << "\n";
-          }
-        }
-      }
+    if (PAIR.second.find("operator new") != std::string::npos) {
+      HandleNewCall(CI);
     } else {
-      errs() << "No fsan.alloc metadata found for call: " << *CI
-             << " SRC LOCATION: ";
-      if (DILocation *Loc = CI->getDebugLoc()) {
-        errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
-               << Loc->getColumn() << "\n";
-      }
+      HandleMallocLikeCall(CI);
     }
     // ReconstructAllocTypeAndTag(PAIR.first, PAIR.second);
   } // for call

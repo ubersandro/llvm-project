@@ -4248,7 +4248,7 @@ namespace {
       SafeToInline = E->getOperatorDelete()->hasAttr<DLLImportAttr>();
       return SafeToInline;
     }
-
+;
     bool VisitCXXNewExpr(CXXNewExpr *E) {
       SafeToInline = E->getOperatorNew()->hasAttr<DLLImportAttr>();
       return SafeToInline;
