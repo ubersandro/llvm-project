@@ -1800,16 +1800,26 @@ void HWAddressSanitizer::HandleMallocLikeCall(CallInst *CI) {
 } // HandleMallocLikeCall
 
 void HWAddressSanitizer::HandleNewCall(CallInst *CI) {
+
   errs() << "[IR] Handling new call: " << *CI << " SRC LOCATION: ";
-  { // DBG
-    if (DILocation *Loc = CI->getDebugLoc()) {
-      errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
-             << Loc->getColumn() << "\n";
+  if (DILocation *Loc = CI->getDebugLoc())
+    errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
+           << Loc->getColumn() << "\n";
+
+  bool hasVolatileLoadUser = false;
+  auto uses = CI->uses();
+  for (auto &U : uses) {
+    if (auto *SI = dyn_cast<LoadInst>(U.getUser())) {
+      if (SI->isVolatile()) {
+        errs() << "[IR] VOLATILE LOAD USER: " << *SI << " SRC LOCATION: ";
+        hasVolatileLoadUser = true;
+      }
     }
-  } // DBG
-  bool MD_are_there = false;
+  }
+
+  bool hasMDNode = false;
   if (MDNode *MD_fsan = CI->getMetadata("fsan.new")) {
-    MD_are_there = true;
+    hasMDNode = true;
     errs() << "(IR) Found fsan.new metadata for call: " << *CI
            << " SRC LOCATION: ";
     if (DILocation *Loc = CI->getDebugLoc()) {
@@ -1888,10 +1898,9 @@ void HWAddressSanitizer::HandleNewCall(CallInst *CI) {
   else {
     errs() << "(IR) fsan.new METADATA NOT FOUND for call: " << *CI
            << " SRC LOCATION: ";
-    if (DILocation *Loc = CI->getDebugLoc()) {
+    if (DILocation *Loc = CI->getDebugLoc())
       errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
              << Loc->getColumn() << "\n";
-    }
   }
 
   /** PERSISTING WITH INSTRUCTIONS */
@@ -1921,17 +1930,15 @@ void HWAddressSanitizer::HandleNewCall(CallInst *CI) {
             }
           }
         }
-  if (arraySize && typeStrPtr) {
-    if (!MD_are_there)
-      errs() << "[DBG] MD LOOKUP WITH STORE AUGMENTS: " << *typeStrPtr
-             << " and arraySize: " << *arraySize << " for call: " << *CI
-             << "\n";
-  } else {
-    errs() << "[DBG] MD LOOKUP WITH STORE FAILED: " << *CI << "\n";
-  }
-}
+  if (!hasMDNode && (typeStrPtr == nullptr || arraySize == nullptr) &&
+      !hasVolatileLoadUser) {
+    errs() << "[DBG] UNTAGGABLE w/ MD, Load, Store: " << *CI << ", SRC LOCATION: ";
+    if (DILocation *Loc = CI->getDebugLoc())
+      errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
+             << Loc->getColumn() << "\n";
+    }
+}// HandleNewCall
 
-// TODO: handle extractvalue
 void HWAddressSanitizer::sanitizeFunction(Function &F,
                                           FunctionAnalysisManager &FAM) {
   if (&F == HwasanCtorFunction)

@@ -1637,6 +1637,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   CallArgList allocatorArgs;
   RValue TypeIdentityArg;
   if (allocator->isReservedGlobalPlacementOperator()) {
+    // NOTE: we want to skip placement new, it's CMA and fuck them
     assert(E->getNumPlacementArgs() == 1);
     const Expr *arg = *E->placement_arguments().begin();
 
@@ -1701,6 +1702,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     }
 
     // FIXME: Why do we not pass a CalleeDecl here?
+    // this dies if naively adding one more arg
     EmitCallArgs(allocatorArgs, allocatorType, E->placement_arguments(),
                  /*AC*/ AbstractCallee(), /*ParamsToSkip*/ ParamsToSkip);
 
@@ -1801,8 +1803,9 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
   EmitNewInitializer(*this, E, allocType, elementTy, result, numElements,
                      allocSizeWithoutCookie);
+  // emit store of a string to this resultPtr, make it non volatile
+  // FSAN::persistWithStore(Builder, result, IRTypeName, ArraySize, *this, CGM);
   llvm::Value *resultPtr = result.emitRawPointer(*this);
-
   llvm::LLVMContext &LLVMCtx = getLLVMContext();
 
   if (numElements) {
@@ -1826,43 +1829,9 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
   if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(resultPtr))
     I->setMetadata("fsan.new", FSanMD);
-  FSAN::persistInGlobalVar(Builder, resultPtr, IRTypeName, ArraySize, *this, CGM); 
-  // llvm::FunctionType *MarkerTy = llvm::FunctionType::get(
-  //     llvm::Type::getVoidTy(getLLVMContext()),
-  //     {resultPtr->getType(), llvm::PointerType::getUnqual(getLLVMContext()),
-  //      llvm::Type::getInt64Ty(getLLVMContext())}, // this is tricky
-  //     false);
-
-  // llvm::FunctionCallee Marker =
-  //     CGM.getModule().getOrInsertFunction("__fsan_alloc_marker", MarkerTy);
-  // if (auto *F = dyn_cast<llvm::Function>(Marker.getCallee())) {
-  //   F->setLinkage(llvm::GlobalValue::InternalLinkage); // Don't export
-  //   F->setDoesNotThrow();
-  //   F->addFnAttr(llvm::Attribute::NoUnwind);
-  //   F->addFnAttr(llvm::Attribute::WillReturn);
-  //   F->addFnAttr(llvm::Attribute::NoFree);
-  //   F->addFnAttr(llvm::Attribute::AlwaysInline);
-
-  //   // Give it an empty body so it's not an undefined reference
-  //   if (F->empty()) {
-  //     llvm::BasicBlock *BB =
-  //         llvm::BasicBlock::Create(getLLVMContext(), "entry", F);
-  //     llvm::IRBuilder<> B(BB);
-  //     B.CreateRetVoid();
-  //   }
-  // }
-
-  // // Build the type string as a global
-  // std::string AnnotStr =
-  //     "fsan.alloc:" + IRTypeName + ":" + std::to_string(ArraySize);
-  // llvm::Constant *TypeStrGlobal =
-  //     Builder.CreateGlobalString(AnnotStr, ".fsan.type.str");
-
-  // // Builder.CreateCall(Marker, {resultPtr, TypeStrGlobal, ArraySize});
-  // Builder.CreateCall(
-  //     Marker, {resultPtr, TypeStrGlobal,
-  //              llvm::ConstantInt::get(llvm::Type::getInt64Ty(getLLVMContext()),
-  //                                     ArraySize)});
+  // THis does not do much
+  // FSAN::persistInGlobalVar(Builder, resultPtr, IRTypeName, ArraySize, *this,
+  //                          CGM);
 
   // Deactivate the 'operator delete' cleanup if we finished
   // initialization.

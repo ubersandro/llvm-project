@@ -69,6 +69,60 @@ inline bool isAllocCall(const clang::CallExpr *Call) {
   return false;
 }
 
+// NOTE: this does not work because you cannot persist ptrs inside global!
+inline __attribute__((weak)) void
+persistWithSideEffect(clang::CodeGen::CGBuilderTy &Builder,
+                      llvm::Value *resultPtr, const std::string &IRTypeName,
+                      int64_t ArraySize, clang::CodeGen::CodeGenFunction &CGF,
+                      clang::CodeGen::CodeGenModule &CGM) {
+  // In EmitCXXNewExpr:
+  llvm::Function *SideEffectFn = llvm::Intrinsic::getDeclaration(
+      &CGM.getModule(), llvm::Intrinsic::sideeffect);
+
+  std::string TypeStr = IRTypeName + ":" + std::to_string(ArraySize);
+  llvm::Constant *TypeStrGlobal =
+      Builder.CreateGlobalString(TypeStr, ".fsan.typestr");
+
+  // Emit the sideeffect intrinsic
+  llvm::CallInst *SideEffect = Builder.CreateCall(SideEffectFn);
+
+  // Attach metadata carrying all the info
+  llvm::MDNode *AllocMD = llvm::MDNode::get(
+      CGF.getLLVMContext(),
+      {llvm::MDString::get(CGF.getLLVMContext(), "fsan.porcodio"),
+       llvm::ValueAsMetadata::get(resultPtr),     // the allocated pointer
+       llvm::ValueAsMetadata::get(TypeStrGlobal), // type string global
+       llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+           llvm::Type::getInt64Ty(CGF.getLLVMContext()), ArraySize))});
+
+  SideEffect->setMetadata("fsan.alloc", AllocMD);
+}
+
+inline __attribute__((weak)) void
+persistWithStore(clang::CodeGen::CGBuilderTy &Builder, clang::CodeGen::Address resultAddr,
+                   const std::string &IRTypeName, int64_t ArraySize,
+                   clang::CodeGen::CodeGenFunction &CGF,
+                   clang::CodeGen::CodeGenModule &CGM) {
+  
+  // auto String = Builder.CreateGlobalString(IRTypeName + ":" + std::to_string(ArraySize), ".fsan.typestr");
+  // String->setName(IRTypeName + ":" + std::to_string(ArraySize));
+  // Builder.CreateStore(String, resultAddr, /*isVolatile=*/true);
+  // llvm::Constant *NullValue = llvm::Constant::getNullValue(resultAddr.getType());
+  // NullValue->setName(IRTypeName + ":" + std::to_string(ArraySize));
+  // llvm::Constant *setToZero = llvm::ConstantInt::get(llvm::Type::getInt64Ty(CGF.getLLVMContext()), 0);
+  // setToZero->setName(IRTypeName + ":" + std::to_string(ArraySize));
+  // Builder.CreateStore(setToZero, resultAddr, /*isVolatile=*/true);
+  {
+    // llvm::LLVMContext &Ctx = CGF.getLLVMContext();
+    // llvm::Type *I8Ty = llvm::Type::getInt8Ty(Ctx);
+    // // bitcast the address pointer to i8*
+    // llvm::Value *BytePtr =
+    //     Builder.CreateBitCast(resultAddr.getPointer(), I8Ty->getPointerTo());
+    // // load a single byte and name the load with IRTypeName
+    Builder.CreateLoad(resultAddr, true, IRTypeName);
+  }
+}
+
 inline __attribute__((weak)) void
 persistInGlobalVar(clang::CodeGen::CGBuilderTy &Builder, llvm::Value *resultPtr,
                    const std::string &IRTypeName, int64_t ArraySize,
