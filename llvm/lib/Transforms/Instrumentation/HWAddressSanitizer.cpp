@@ -1751,8 +1751,8 @@ void HWAddressSanitizer::HandleMallocLikeCall(CallInst *CI) {
                     ArraySize = CIconst->getZExtValue();
                     errs() << "\t\tARRAY SIZE: " << ArraySize << "\n";
                   } else {
-                    errs() << "\t\t[FieldArmor] fsan.alloc operand 2 is not a "
-                              "ConstantInt (wrapped by ValueAsMetadata)\n";
+                    errs() << "\t\t[FieldArmor] fsan.alloc operand 2 is a "
+                              "ValueAsMetadata but not a ConstantInt\n";
                   }
                 } else if (auto *MDS = dyn_cast<MDString>(MOp2)) {
                   StringRef S = MDS->getString();
@@ -1807,8 +1807,9 @@ void HWAddressSanitizer::HandleNewCall(CallInst *CI) {
              << Loc->getColumn() << "\n";
     }
   } // DBG
-
+  bool MD_are_there = false;
   if (MDNode *MD_fsan = CI->getMetadata("fsan.new")) {
+    MD_are_there = true;
     errs() << "(IR) Found fsan.new metadata for call: " << *CI
            << " SRC LOCATION: ";
     if (DILocation *Loc = CI->getDebugLoc()) {
@@ -1891,6 +1892,42 @@ void HWAddressSanitizer::HandleNewCall(CallInst *CI) {
       errs() << Loc->getFilename() << ":" << Loc->getLine() << ":"
              << Loc->getColumn() << "\n";
     }
+  }
+
+  /** PERSISTING WITH INSTRUCTIONS */
+  Value *typeStrPtr = nullptr;
+  Value *arraySize = nullptr;
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *II = dyn_cast<InsertValueInst>(&I)) {
+          if (II->getInsertedValueOperand() == CI) {
+            auto uses = II->users();
+            for (auto *user : uses) {
+              if (auto *II2 = dyn_cast<InsertValueInst>(user)) {
+                if (II2->getAggregateOperand() == II) {
+                  typeStrPtr = II2->getInsertedValueOperand();
+                  auto uses2 = II2->users();
+                  for (auto *user2 : uses2) {
+                    if (InsertValueInst *II3 =
+                            dyn_cast<InsertValueInst>(user2)) {
+                      if (II3->getAggregateOperand() == II2) {
+                        arraySize = II3->getInsertedValueOperand();
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+  if (arraySize && typeStrPtr) {
+    if (!MD_are_there)
+      errs() << "[DBG] MD LOOKUP WITH STORE AUGMENTS: " << *typeStrPtr
+             << " and arraySize: " << *arraySize << " for call: " << *CI
+             << "\n";
+  } else {
+    errs() << "[DBG] MD LOOKUP WITH STORE FAILED: " << *CI << "\n";
   }
 }
 

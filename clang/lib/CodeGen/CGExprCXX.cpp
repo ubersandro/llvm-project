@@ -1593,9 +1593,9 @@ static void EnterNewDeleteCleanup(CodeGenFunction &CGF, const CXXNewExpr *E,
 
 llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   // The element type being allocated.
-  llvm::errs() << "[FE] EmitCXXNewExpr: SRC LOC: " << E->getExprLoc().printToString(getContext().getSourceManager())
-               << " AllocType: " << E->getAllocatedType().getAsString()
-               << "\n";
+  llvm::errs() << "[FE] EmitCXXNewExpr: SRC LOC: "
+               << E->getExprLoc().printToString(getContext().getSourceManager())
+               << " AllocType: " << E->getAllocatedType().getAsString() << "\n";
   QualType allocType = getContext().getBaseElementType(E->getAllocatedType());
   auto IRType = ConvertTypeForMem(allocType);
   std::string IRTypeName = IRType->isStructTy() ? IRType->getStructName().str()
@@ -1802,7 +1802,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   EmitNewInitializer(*this, E, allocType, elementTy, result, numElements,
                      allocSizeWithoutCookie);
   llvm::Value *resultPtr = result.emitRawPointer(*this);
-  
+
   llvm::LLVMContext &LLVMCtx = getLLVMContext();
 
   if (numElements) {
@@ -1820,16 +1820,49 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
   llvm::errs() << "FSanMD for new-expression: ";
   FSanMD->print(llvm::errs());
-  llvm::errs() << ", SRC LOC OF NEW: "; 
+  llvm::errs() << ", SRC LOC OF NEW: ";
   E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
   llvm::errs() << "\n";
 
   if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(resultPtr))
     I->setMetadata("fsan.new", FSanMD);
-  else {
-    // why didn't this cast work?
-    llvm::errs() << "resultPtr is not an instruction: " << *resultPtr << "\n";
-  }
+  FSAN::persistInGlobalVar(Builder, resultPtr, IRTypeName, ArraySize, *this, CGM); 
+  // llvm::FunctionType *MarkerTy = llvm::FunctionType::get(
+  //     llvm::Type::getVoidTy(getLLVMContext()),
+  //     {resultPtr->getType(), llvm::PointerType::getUnqual(getLLVMContext()),
+  //      llvm::Type::getInt64Ty(getLLVMContext())}, // this is tricky
+  //     false);
+
+  // llvm::FunctionCallee Marker =
+  //     CGM.getModule().getOrInsertFunction("__fsan_alloc_marker", MarkerTy);
+  // if (auto *F = dyn_cast<llvm::Function>(Marker.getCallee())) {
+  //   F->setLinkage(llvm::GlobalValue::InternalLinkage); // Don't export
+  //   F->setDoesNotThrow();
+  //   F->addFnAttr(llvm::Attribute::NoUnwind);
+  //   F->addFnAttr(llvm::Attribute::WillReturn);
+  //   F->addFnAttr(llvm::Attribute::NoFree);
+  //   F->addFnAttr(llvm::Attribute::AlwaysInline);
+
+  //   // Give it an empty body so it's not an undefined reference
+  //   if (F->empty()) {
+  //     llvm::BasicBlock *BB =
+  //         llvm::BasicBlock::Create(getLLVMContext(), "entry", F);
+  //     llvm::IRBuilder<> B(BB);
+  //     B.CreateRetVoid();
+  //   }
+  // }
+
+  // // Build the type string as a global
+  // std::string AnnotStr =
+  //     "fsan.alloc:" + IRTypeName + ":" + std::to_string(ArraySize);
+  // llvm::Constant *TypeStrGlobal =
+  //     Builder.CreateGlobalString(AnnotStr, ".fsan.type.str");
+
+  // // Builder.CreateCall(Marker, {resultPtr, TypeStrGlobal, ArraySize});
+  // Builder.CreateCall(
+  //     Marker, {resultPtr, TypeStrGlobal,
+  //              llvm::ConstantInt::get(llvm::Type::getInt64Ty(getLLVMContext()),
+  //                                     ArraySize)});
 
   // Deactivate the 'operator delete' cleanup if we finished
   // initialization.
@@ -1855,8 +1888,10 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
     resultPtr = PHI;
   }
+  // FSAN
   if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(resultPtr))
-    I->setMetadata("fsan.new", FSanMD);// TODO: not sure about his...
+    I->setMetadata("fsan.new", FSanMD); // TODO: not sure about his...
+  // FSAN
   return resultPtr;
 }
 

@@ -70,6 +70,64 @@ inline bool isAllocCall(const clang::CallExpr *Call) {
 }
 
 inline __attribute__((weak)) void
+persistInGlobalVar(clang::CodeGen::CGBuilderTy &Builder, llvm::Value *resultPtr,
+                   const std::string &IRTypeName, int64_t ArraySize,
+                   clang::CodeGen::CodeGenFunction &CGF,
+                   clang::CodeGen::CodeGenModule &CGM) {
+  // In EmitCXXNewExpr after getting the allocation pointer:
+
+  llvm::Module &M = CGM.getModule();
+  llvm::LLVMContext &Ctx = CGF.getLLVMContext();
+
+  // Get or create the global registry array
+  // This is a global that holds [ptr, type_string_ptr, size] tuples
+
+  /** ONE  ERRORL Global is external, but doesn't have external or weak linkage!
+ptr @__fsan_alloc_registry  */
+
+  llvm::GlobalVariable *Registry =
+      M.getGlobalVariable("__fsan_alloc_registry", true);
+
+  if (!Registry) {
+    // Create array type: { ptr, ptr, i64 }
+    llvm::StructType *EntryTy = llvm::StructType::create(
+        Ctx,
+        {
+            llvm::PointerType::getUnqual(Ctx), // allocated pointer
+            llvm::PointerType::getUnqual(Ctx), // type string
+            llvm::Type::getInt64Ty(Ctx)        // array size
+        },
+        "fsan_alloc_entry");
+
+    llvm::ArrayType *RegistryTy = llvm::ArrayType::get(EntryTy, 1); // unsized
+
+    Registry = new llvm::GlobalVariable(
+        M, RegistryTy, false, llvm::GlobalValue::InternalLinkage,
+        llvm::Constant::getNullValue(RegistryTy), "__fsan_alloc_registry");
+  }
+
+  // Create the type string as a global constant
+  std::string TypeStr = IRTypeName + ":" + std::to_string(ArraySize);
+  llvm::Constant *TypeStrGlobal =
+      Builder.CreateGlobalString(TypeStr, ".fsan.typestr");
+
+  // Build the entry struct: { resultPtr, TypeStrGlobal, ArraySize }
+  llvm::Value *Entry = llvm::UndefValue::get(llvm::StructType::get(
+      Ctx, {resultPtr->getType(), TypeStrGlobal->getType(),
+            llvm::Type::getInt64Ty(Ctx)}));
+
+  Entry = Builder.CreateInsertValue(Entry, resultPtr, 0);
+  Entry = Builder.CreateInsertValue(Entry, TypeStrGlobal, 1);
+  Entry = Builder.CreateInsertValue(
+      Entry, llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), ArraySize), 2);
+
+  clang::CodeGen::Address Addr = clang::CodeGen::Address(
+      Registry, Registry->getType(), clang::CharUnits::fromQuantity(8));
+  Builder.CreateStore(Entry, Addr, /*isVolatile=*/true);
+  // Volatile store = guaranteed not to be eliminated
+}
+
+inline __attribute__((weak)) void
 TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
                clang::CodeGen::CodeGenFunction &CGF) {
 

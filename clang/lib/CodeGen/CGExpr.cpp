@@ -24,6 +24,7 @@
 #include "CodeGenPGO.h"
 #include "ConstantEmitter.h"
 #include "TargetInfo.h"
+#include "fsan.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTLambda.h"
 #include "clang/AST/Attr.h"
@@ -52,7 +53,6 @@
 #include <numeric>
 #include <optional>
 #include <string>
-#include "fsan.h"
 
 using namespace clang;
 using namespace CodeGen;
