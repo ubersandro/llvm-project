@@ -21,6 +21,7 @@
 #include "CodeGenModule.h"
 #include "ConstantEmitter.h"
 #include "TargetInfo.h"
+#include "fsan.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/DeclObjC.h"
@@ -48,9 +49,9 @@
 #include "llvm/IR/MatrixBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/TypeSize.h"
+#include "llvm/Support/raw_ostream.h"
 #include <cstdarg>
 #include <optional>
-#include "fsan.h"
 // #include "fsan.h"
 
 using namespace clang;
@@ -2456,7 +2457,8 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
     Value *Src = Visit(E);
     llvm::Type *SrcTy = Src->getType();
     llvm::Type *DstTy = ConvertType(DestTy);
-    FSAN::TagFromBitcast(Src, DestTy, CGF);
+    FSAN::TagFromBitcast(Src, DestTy,
+                         CGF); // SECOND STEP-> this is often parsed after call
     // FIXME: this is a gross but seemingly necessary workaround for an issue
     // manifesting when a target uses a non-default AS for indirect sret args,
     // but the source HLL is generic, wherein a valid C-cast or reinterpret_cast
@@ -2611,8 +2613,8 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
       // eliminate the useless instructions emitted during translating E.
       if (Result.HasSideEffects)
         Visit(E);
-      return CGF.CGM.getNullPointer(cast<llvm::PointerType>(
-          ConvertType(DestTy)), DestTy);
+      return CGF.CGM.getNullPointer(
+          cast<llvm::PointerType>(ConvertType(DestTy)), DestTy);
     }
     // Since target may map different address spaces in AST to the same address
     // space, an address space conversion may end up as a bitcast.
@@ -2626,9 +2628,10 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
     return Visit(E);
 
   case CK_NoOp: {
-    Value *Src = CE->changesVolatileQualification() ? EmitLoadOfLValue(CE) : Visit(E);
+    Value *Src =
+        CE->changesVolatileQualification() ? EmitLoadOfLValue(CE) : Visit(E);
     FSAN::TagFromBitcast(Src, DestTy, CGF);
-    return Src; 
+    return Src;
   }
 
   case CK_BaseToDerived: {
@@ -2636,10 +2639,9 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
     assert(DerivedClassDecl && "BaseToDerived arg isn't a C++ object pointer!");
 
     Address Base = CGF.EmitPointerWithAlignment(E);
-    Address Derived =
-      CGF.GetAddressOfDerivedClass(Base, DerivedClassDecl,
-                                   CE->path_begin(), CE->path_end(),
-                                   CGF.ShouldNullCheckClassCastValue(CE));
+    Address Derived = CGF.GetAddressOfDerivedClass(
+        Base, DerivedClassDecl, CE->path_begin(), CE->path_end(),
+        CGF.ShouldNullCheckClassCastValue(CE));
 
     // C++11 [expr.static.cast]p11: Behavior is undefined if a downcast is
     // performed and the object is not of the derived type.
@@ -3402,7 +3404,6 @@ llvm::Value *ScalarExprEmitter::EmitScalarPrePostIncDec(const UnaryOperator *E,
   // updated value.
   return isPre ? value : input;
 }
-
 
 Value *ScalarExprEmitter::VisitUnaryPlus(const UnaryOperator *E,
                                          QualType PromotionType) {
@@ -5124,19 +5125,62 @@ llvm::Value *CodeGenFunction::EmitWithOriginalRHSBitfieldAssignment(
 }
 
 Value *ScalarExprEmitter::VisitBinAssign(const BinaryOperator *E) {
-    if (E->getOpcode() == BO_Assign) {
+  if (E->getOpcode() == BO_Assign) {
     const Expr *RHS = E->getRHS()->IgnoreParenImpCasts();
+    // llvm::errs() << "[DBG] VisitBinAssign: Visiting assignment, RHS:\n";
+    // RHS->dump();
+
     if (const auto *Call = dyn_cast<CallExpr>(RHS)) {
       if (FSAN::isAllocCall(Call)) {
-        // E->getLHS()->getType() is your target type
-        // Store it so EmitCallExpr can pick it up when it
-        // emits the RHS call
-        // Print a human-readable source location for the CallExpr.
-        FSAN::printExprLocation(Call, CGF.getContext().getSourceManager());
-        CGF.FSanPendingAllocType = E->getLHS()->getType();
+        auto type = E->getLHS()->getType();
+        if (!CGF.PendingTypeIsValid) {
+          llvm::errs() << "[DBG] VisitBinAssign: Setting pending alloc type: "
+                       << type.getAsString() << "\n";
+          CGF.FSanPendingAllocType = type;
+          CGF.PendingTypeIsValid = true;
+        }
       }
     }
-  }
+    // // TODO: this does not capture the complexity of sub expr, recursive visit
+    // // is needed TOOD: resolve declref and other macros
+
+    // if (const auto *Cast = dyn_cast<CastExpr>(RHS)) {
+    //   if (const auto *Call =
+    //           dyn_cast<CallExpr>(Cast->getSubExpr()->IgnoreParenImpCasts())) {
+    //     if (FSAN::isAllocCall(Call)) {
+    //       auto type = E->getLHS()->getType();
+    //       if (!CGF.PendingTypeIsValid) {
+    //         llvm::errs() << "[DBG] VisitBinAssign: ASSIGN ALLOC CAST CASE: "
+    //                      << type.getAsString() << "\n";
+    //         CGF.FSanPendingAllocType = type;
+    //         CGF.PendingTypeIsValid = true;
+    //       }
+    //     }
+    //   }
+    // }
+    // // TODO: debug 
+    // std::function<void(const Expr *)> recursiveVisit = [&](const Expr *expr) {
+    //   if (const auto *Call = dyn_cast<CallExpr>(expr)) {
+    //     if (FSAN::isAllocCall(Call)) {
+    //       auto type = E->getLHS()->getType();
+    //       if (!CGF.PendingTypeIsValid) {
+    //         llvm::errs() << "[DBG] VisitBinAssign: RECURSIVE VISIT ALLOC CASE: "
+    //                      << type.getAsString() << "\n";
+    //         CGF.FSanPendingAllocType = type;
+    //         CGF.PendingTypeIsValid = true;
+    //       }
+    //     }
+    //   }
+    //   for (const auto *child : expr->children()) {
+    //     if (const auto *childExpr = dyn_cast<Expr>(child)) {
+    //       recursiveVisit(childExpr);
+    //     }
+    //   }
+    // };
+    // recursiveVisit(RHS);
+
+  } // FSAN logic </end>
+
   ApplyAtomGroup Grp(CGF.getDebugInfo());
   bool Ignore = TestAndClearIgnoreResultAssign();
 

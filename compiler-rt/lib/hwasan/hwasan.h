@@ -33,15 +33,15 @@
 // #endif
 
 #ifndef HWASAN_WITH_INTERCEPTORS
-#define HWASAN_WITH_INTERCEPTORS 1
+#  define HWASAN_WITH_INTERCEPTORS 1
 #endif
 
 #ifndef RPTag
-#define RPTag 0x0Lu
+#  define RPTag 0x0Lu
 #endif
 
 #ifndef HWASAN_REPLACE_OPERATORS_NEW_AND_DELETE
-#define HWASAN_REPLACE_OPERATORS_NEW_AND_DELETE HWASAN_WITH_INTERCEPTORS
+#  define HWASAN_REPLACE_OPERATORS_NEW_AND_DELETE HWASAN_WITH_INTERCEPTORS
 #endif
 
 typedef u8 tag_t;
@@ -107,9 +107,8 @@ static inline uptr UntagAddr(uptr tagged_addr) {
                                        : tagged_addr;
 }
 
-static inline void *UntagPtr(const void *tagged_ptr) {
-  return reinterpret_cast<void *>(
-      UntagAddr(reinterpret_cast<uptr>(tagged_ptr)));
+static inline void* UntagPtr(const void* tagged_ptr) {
+  return reinterpret_cast<void*>(UntagAddr(reinterpret_cast<uptr>(tagged_ptr)));
 }
 
 static inline uptr AddTagToPointer(uptr p, tag_t tag) {
@@ -123,9 +122,9 @@ namespace __hwasan {
 extern int hwasan_inited;
 extern bool hwasan_init_is_running;
 extern int hwasan_report_count;
-extern __sanitizer::atomic_uint64_t checks_on_uninited_shadow; 
-extern __sanitizer::atomic_uint64_t checks_on_untagged_ptr; 
-extern __sanitizer::atomic_uint64_t total_checks; 
+extern __sanitizer::atomic_uint64_t checks_on_uninited_shadow;
+extern __sanitizer::atomic_uint64_t checks_on_untagged_ptr;
+extern __sanitizer::atomic_uint64_t total_checks;
 extern __sanitizer::atomic_uint64_t overflows;
 
 bool InitShadow();
@@ -137,41 +136,41 @@ void HwasanAllocatorInit();
 void HwasanAllocatorLock();
 void HwasanAllocatorUnlock();
 
-void *hwasan_malloc(uptr size, StackTrace *stack);
-void *hwasan_calloc(uptr nmemb, uptr size, StackTrace *stack);
-void *hwasan_realloc(void *ptr, uptr size, StackTrace *stack);
-void *hwasan_reallocarray(void *ptr, uptr nmemb, uptr size, StackTrace *stack);
-void *hwasan_valloc(uptr size, StackTrace *stack);
-void *hwasan_pvalloc(uptr size, StackTrace *stack);
-void *hwasan_aligned_alloc(uptr alignment, uptr size, StackTrace *stack);
-void *hwasan_memalign(uptr alignment, uptr size, StackTrace *stack);
-int hwasan_posix_memalign(void **memptr, uptr alignment, uptr size,
-                        StackTrace *stack);
-void hwasan_free(void *ptr, StackTrace *stack);
+void* hwasan_malloc(uptr size, StackTrace* stack);
+void* hwasan_calloc(uptr nmemb, uptr size, StackTrace* stack);
+void* hwasan_realloc(void* ptr, uptr size, StackTrace* stack);
+void* hwasan_reallocarray(void* ptr, uptr nmemb, uptr size, StackTrace* stack);
+void* hwasan_valloc(uptr size, StackTrace* stack);
+void* hwasan_pvalloc(uptr size, StackTrace* stack);
+void* hwasan_aligned_alloc(uptr alignment, uptr size, StackTrace* stack);
+void* hwasan_memalign(uptr alignment, uptr size, StackTrace* stack);
+int hwasan_posix_memalign(void** memptr, uptr alignment, uptr size,
+                          StackTrace* stack);
+void hwasan_free(void* ptr, StackTrace* stack);
 
 // fieldarmor functions
-uptr fieldarmor_tag_memory(void *ptr, uptr tags, uptr size);
+uptr fieldarmor_tag_memory(void* ptr, uptr tags, uptr size);
 // EOF fieldarmor functions
 
 void InstallAtExitHandler();
 
-#define GET_MALLOC_STACK_TRACE                                            \
-  UNINITIALIZED BufferedStackTrace stack;                                 \
-  if (hwasan_inited)                                                      \
-    stack.Unwind(StackTrace::GetCurrentPc(), GET_CURRENT_FRAME(),         \
-                 nullptr, common_flags()->fast_unwind_on_malloc,          \
-                 common_flags()->malloc_context_size)
+#define GET_MALLOC_STACK_TRACE                                           \
+  UNINITIALIZED BufferedStackTrace stack;                                \
+  if (hwasan_inited)                                                     \
+  stack.Unwind(StackTrace::GetCurrentPc(), GET_CURRENT_FRAME(), nullptr, \
+               common_flags()->fast_unwind_on_malloc,                    \
+               common_flags()->malloc_context_size)
 
-#define GET_FATAL_STACK_TRACE_PC_BP(pc, bp)              \
-  UNINITIALIZED BufferedStackTrace stack;                \
-  if (hwasan_inited)                                     \
-    stack.Unwind(pc, bp, nullptr, common_flags()->fast_unwind_on_fatal)
+#define GET_FATAL_STACK_TRACE_PC_BP(pc, bp) \
+  UNINITIALIZED BufferedStackTrace stack;   \
+  if (hwasan_inited)                        \
+  stack.Unwind(pc, bp, nullptr, common_flags()->fast_unwind_on_fatal)
 
 void HwasanTSDInit();
 void HwasanTSDThreadInit();
 void HwasanAtExit();
 
-void HwasanOnDeadlySignal(int signo, void *info, void *context);
+void HwasanOnDeadlySignal(int signo, void* info, void* context);
 
 void HwasanInstallAtForkHandler();
 
@@ -179,7 +178,7 @@ void InstallAtExitCheckLeaks();
 
 void UpdateMemoryUsage();
 
-void AppendToErrorMessageBuffer(const char *buffer);
+void AppendToErrorMessageBuffer(const char* buffer);
 
 void AndroidTestTlsSlot();
 
@@ -195,13 +194,13 @@ struct AccessInfo {
 
 // Given access info and frame information, unwind the stack and report the tag
 // mismatch.
-void HandleTagMismatch(AccessInfo ai, uptr pc, uptr frame, void *uc,
-                       uptr *registers_frame = nullptr);
+void HandleTagMismatch(AccessInfo ai, uptr pc, uptr frame, void* uc,
+                       uptr* registers_frame = nullptr);
 
 // This dispatches to HandleTagMismatch but sets up the AccessInfo, program
 // counter, and frame pointer.
 void HwasanTagMismatch(uptr addr, uptr pc, uptr frame, uptr access_info,
-                       uptr *registers_frame, size_t outsize);
+                       uptr* registers_frame, size_t outsize);
 
 }  // namespace __hwasan
 
@@ -231,10 +230,10 @@ struct __hw_jmp_buf_struct {
   //
   // We add a __magic field to our struct to catch cases where libc's setjmp
   // populated the jmp_buf instead of our interceptor.
-  __hw_register_buf __jmpbuf; // Calling environment.
+  __hw_register_buf __jmpbuf;     // Calling environment.
   unsigned __mask_was_saved : 1;  // Saved the signal mask?
-  unsigned __magic : 31;      // Used to distinguish __hw_jmp_buf from jmp_buf.
-  __hw_sigset_t __saved_mask; // Saved signal mask.
+  unsigned __magic : 31;       // Used to distinguish __hw_jmp_buf from jmp_buf.
+  __hw_sigset_t __saved_mask;  // Saved signal mask.
 };
 typedef struct __hw_jmp_buf_struct __hw_jmp_buf[1];
 typedef struct __hw_jmp_buf_struct __hw_sigjmp_buf[1];

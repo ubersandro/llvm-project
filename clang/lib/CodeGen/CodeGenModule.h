@@ -327,6 +327,8 @@ class CodeGenModule : public CodeGenTypeCache {
   void operator=(const CodeGenModule &) = delete;
 
 public:
+  llvm::Function *typedAllocFun;
+  llvm::Function *typedNewFun;
   struct Structor {
     Structor()
         : Priority(0), LexOrder(~0u), Initializer(nullptr),

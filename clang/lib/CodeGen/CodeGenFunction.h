@@ -254,6 +254,7 @@ public:
   /// A jump destination is an abstract label, branching to which may
   /// require a jump out through normal cleanups.
   QualType FSanPendingAllocType; 
+  bool PendingTypeIsValid = false;
   struct JumpDest {
     JumpDest() : Block(nullptr), Index(0) {}
     JumpDest(llvm::BasicBlock *Block, EHScopeStack::stable_iterator Depth,

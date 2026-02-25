@@ -1736,11 +1736,13 @@ void CodeGenFunction::EmitDeclStmt(const DeclStmt &S) {
         if (const auto *Call = dyn_cast<CallExpr>(Init)) {
           if (FSAN::isAllocCall(Call)) {
             llvm::errs() << "EmitDeclStmt:- ALLOC SITE FOUND " << VD->getName() << ", SRC LOC: " << VD->getLocation().printToString(getContext().getSourceManager()) << "\n";
-            // VD->getType() is your LHS type -- right here, no parent walk
             QualType LHSTy = VD->getType();
-            // Stash it so EmitCallExpr can pick it up
-            FSanPendingAllocType = LHSTy;
-            // TODO: complete later when emitting the call
+            if(!PendingTypeIsValid){
+              llvm::errs() << "[DBG] Setting pending alloc type: " << LHSTy.getAsString() << "\n";
+              FSanPendingAllocType = LHSTy;
+              PendingTypeIsValid = true;
+            }
+              
           }
         }
       }

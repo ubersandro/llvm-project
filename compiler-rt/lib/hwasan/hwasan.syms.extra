@@ -1,3 +1,5 @@
 __hwasan_*
 __ubsan_*
 __hwasan::fieldarmor_tag_memory*
+__hwasan::typed_new*
+__hwasan::def_typed_alloc*

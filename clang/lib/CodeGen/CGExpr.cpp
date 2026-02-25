@@ -19,6 +19,7 @@
 #include "CGObjCRuntime.h"
 #include "CGOpenMPRuntime.h"
 #include "CGRecordLayout.h"
+#include "CGValue.h"
 #include "CodeGenFunction.h"
 #include "CodeGenModule.h"
 #include "CodeGenPGO.h"
@@ -48,6 +49,7 @@
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 #include "llvm/Transforms/Utils/SanitizerStats.h"
 #include <numeric>
@@ -6293,6 +6295,7 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
                         CalleePtr->getPointerAlignment(CGM.getDataLayout())),
                     Callee.getPointerAuthInfo(), nullptr);
         CalleePtr = Addr.emitRawPointer(*this);
+        // HOOK: this is changing the pointer to the callee
       }
 
       // On 32-bit Arm, the low bit of a function pointer indicates whether
@@ -6455,19 +6458,147 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
     Callee.setFunctionPointer(Stub);
   }
   llvm::CallBase *LocalCallOrInvoke = nullptr;
-  RValue Call = EmitCall(FnInfo, Callee, ReturnValue, Args, &LocalCallOrInvoke,
-                         E == MustTailCall, E->getExprLoc());
+  RValue Call;
+  // FSAN MALLOC
+  auto CalleeDecl = dyn_cast_or_null<FunctionDecl>(TargetDecl);
+  bool enabled = true;
+  bool isMalloc = CalleeDecl && CalleeDecl->getIdentifier() &&
+                  (CalleeDecl->getName() == "malloc");
+  // bool isCalloc = CalleeDecl && CalleeDecl->getIdentifier() &&
+  // (CalleeDecl->getName() == "calloc"); // TODO test, it's undertested
+  // bool isRealloc =
+  //     CalleeDecl && CalleeDecl->getIdentifier() &&
+  //     (CalleeDecl->getName() == "realloc"); // TODO test, it's undertested
 
-  FSAN::TagFromCallSite(E, *this, Call, Callee);
-  // Generate function declaration DISuprogram in order to be used
-  // in debug info about call sites.
-  if (CGDebugInfo *DI = getDebugInfo()) {
-    if (auto *CalleeDecl = dyn_cast_or_null<FunctionDecl>(TargetDecl)) {
-      FunctionArgList Args;
-      QualType ResTy = BuildFunctionArgList(CalleeDecl, Args);
-      DI->EmitFuncDeclForCallSite(LocalCallOrInvoke,
-                                  DI->getFunctionType(CalleeDecl, ResTy, Args),
-                                  CalleeDecl);
+  if (CalleeDecl && FSAN::isAllocFD(CalleeDecl) &&
+      enabled /* && (isRealloc) && isMalloc*/) {
+    {
+      llvm::errs() << "FE-DBG: Dumping original callee: ";
+      CalleeType->dump();
+      // now dump it in IR type
+      llvm::errs() << "FE-DBG: Dumping original callee in IR type: ";
+      llvm::Type *IRFnType = CGM.getTypes().ConvertType(CalleeType);
+      IRFnType->print(llvm::errs()); // this is the ret type, I need the
+                                     // delcaration of  the target
+
+      llvm::errs() << "FE-DBG: Dumping what the callee would look like in IR: ";
+      llvm::Constant *CalleePtr = CGM.getRawFunctionPointer(CalleeDecl);
+      llvm::Value *CalleePtrV = llvm::cast<llvm::Value>(CalleePtr);
+      CalleePtrV->print(llvm::errs());
+      llvm::errs() << "\n";
+
+      PresumedLoc PLoc =
+          getContext().getSourceManager().getPresumedLoc(E->getExprLoc());
+      if (PLoc.isValid()) {
+        // NOTE: count these to see how many calls are emitted
+        llvm::errs() << "FSAN-FE - EmitCall: CALLEE  " << CalleeDecl->getName()
+                     << ", SRC: " << PLoc.getFilename() << ":" << PLoc.getLine()
+                     << ":" << PLoc.getColumn() << "\n";
+      } else {
+        llvm::errs() << "FSAN-FE - EmitCall: CALLEE" << CalleeDecl->getName()
+                     << ", SRC: <invalid>\n";
+      }
+    }
+
+    // NOTE: this is too early for figuring out the assignment as well, because
+    // of how the parser works.
+    // TODO: enforce that this is set, ow we lose type info!
+    std::string IRTyNameStr = "PLACEHOLDER";
+
+    // get ret type (void *)
+    auto resultType = CGM.getContext().VoidPtrTy;
+
+    // get args
+    auto args = Args;
+    if (PendingTypeIsValid) {
+      clang::QualType TypeToSize = FSanPendingAllocType;
+      TypeToSize = getContext().getCanonicalType(TypeToSize);
+      clang::QualType PointeeTy = TypeToSize;
+      llvm::Type *IRPointeeTy = ConvertTypeForMem(PointeeTy);
+      IRTyNameStr = IRPointeeTy->isStructTy()
+                        ? IRPointeeTy->getStructName().str()
+                        : "scalar";
+    }
+    // NOTE: pending type might not be valid!
+
+    // extra arg $1 -> type name
+    llvm::errs() << "FSAN-FE - EmitCall: TY NAME ARG " << IRTyNameStr << "\n";
+    llvm::Value *IRTyName = Builder.CreateGlobalString(IRTyNameStr);
+    args.add(RValue::get(IRTyName),
+             getContext().getPointerType(getContext().CharTy));
+
+    // extra arg $2 -> size of the allocated array
+    llvm::Value *NegOne = Builder.getInt32(-1);
+    args.add(RValue::get(NegOne),
+             getContext().getIntTypeForBitwidth(32, /*isSigned=*/true));
+
+    // extra arg $3 -> name of the replace function (e.g. malloc for malloc
+    // ,realloc for realloc etc)
+    auto FnNameStr = CalleeDecl->getName().str();
+    llvm::Value *OrigFnName = Builder.CreateGlobalString(FnNameStr);
+    args.add(RValue::get(OrigFnName),
+             getContext().getPointerType(getContext().CharTy));
+
+    const CGFunctionInfo &fnInfo =
+        CGM.getTypes().arrangeBuiltinFunctionCall(resultType, args);
+    llvm::FunctionType *fnTy = CGM.getTypes().GetFunctionType(fnInfo);
+    llvm::AttrBuilder fnAttrB(getLLVMContext());
+    fnAttrB.addAttribute(llvm::Attribute::NoUnwind);
+    fnAttrB.addAttribute(llvm::Attribute::WillReturn);
+    fnAttrB.addAttribute(llvm::Attribute::NoAlias);
+    llvm::AttributeList fnAttrs = llvm::AttributeList::get(
+        getLLVMContext(), llvm::AttributeList::FunctionIndex, fnAttrB);
+
+    // Try to reuse an existing declaration of typed_allocation if present,
+    // otherwise insert one with the requested function type and attach the
+    // desired function attributes to the newly-created function.
+    llvm::FunctionCallee fn;
+    if (llvm::Function *Existing =
+            CGM.getModule().getFunction("typed_allocation")) {
+      fn = llvm::FunctionCallee(Existing->getFunctionType(), Existing);
+      auto callee = CGCallee::forDirect(fn);
+      llvm::errs() << "[DBG] FSAN typing allocation: " << *fn.getCallee()
+                   << "\n";
+
+      llvm::errs() << "[DBG] FSAN OLD CALL: ";
+      // LocalCallOrInvoke->dump();
+      LocalCallOrInvoke = nullptr;
+      RValue newCall =
+          EmitCall(fnInfo, callee, ReturnValue, args, &LocalCallOrInvoke,
+                   E == MustTailCall, E->getExprLoc());
+      if (CallOrInvoke)
+        *CallOrInvoke = LocalCallOrInvoke;
+      // dump new call
+      llvm::errs() << "[DBG] FSAN NEW CALL: ";
+      LocalCallOrInvoke->dump();
+      // reset FSanPendingAllocType and PendingTypeIsValid
+      FSanPendingAllocType = QualType();
+      PendingTypeIsValid = false;
+
+      return newCall;
+    } // if fun found
+    else
+      assert(false && "FSAN ERROR: typed_allocation function not found");
+
+  } // is allocationFD
+
+  else {
+
+    Call = EmitCall(FnInfo, Callee, ReturnValue, Args, &LocalCallOrInvoke,
+                    E == MustTailCall, E->getExprLoc());
+
+    FSAN::TagFromCallSite(E, *this, Call, Callee); // attach MD node to callsite
+    // Generate function declaration DISuprogram in order to be used
+    // in debug info about call sites.
+    if (CGDebugInfo *DI = getDebugInfo()) {
+      if (auto *CalleeDecl = dyn_cast_or_null<FunctionDecl>(TargetDecl)) {
+        FunctionArgList Args;
+        QualType ResTy = BuildFunctionArgList(CalleeDecl, Args);
+        DI->EmitFuncDeclForCallSite(
+            LocalCallOrInvoke, DI->getFunctionType(CalleeDecl, ResTy, Args),
+            CalleeDecl);
+
+      } // if decl
     }
   }
   if (CallOrInvoke)

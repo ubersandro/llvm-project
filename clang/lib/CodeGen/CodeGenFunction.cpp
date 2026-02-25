@@ -89,6 +89,12 @@ CodeGenFunction::CodeGenFunction(CodeGenModule &cgm, bool suppressNewContext)
   EHStack.setCGF(this);
 
   SetFastMathFlags(CurFPFeatures);
+  // create function definition for typed_malloc
+  // void* typed_malloc(size_t, const char*, int)
+  // TODO
+  // llvm::errs() << "[++] CodeGenFunction constructor called\n";
+  // // dump current module
+  // CGM.getModule().print(llvm::errs(), nullptr);
 }
 
 CodeGenFunction::~CodeGenFunction() {

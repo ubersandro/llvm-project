@@ -66,6 +66,7 @@
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
 #include "llvm/Transforms/Instrumentation/BoundsChecking.h"
 #include "llvm/Transforms/Instrumentation/DataFlowSanitizer.h"
+#include "llvm/Transforms/Instrumentation/FSanRewriteFunctionCalls.h"
 #include "llvm/Transforms/Instrumentation/GCOVProfiler.h"
 #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
 #include "llvm/Transforms/Instrumentation/InstrProfiling.h"
@@ -176,7 +177,7 @@ class EmitAssemblyHelper {
   std::unique_ptr<llvm::ToolOutputFile> openOutputFile(StringRef Path) {
     std::error_code EC;
     auto F = std::make_unique<llvm::ToolOutputFile>(Path, EC,
-                                                     llvm::sys::fs::OF_None);
+                                                    llvm::sys::fs::OF_None);
     if (EC) {
       Diags.Report(diag::err_fe_unable_to_open_output) << Path << EC.message();
       F.reset();
@@ -583,8 +584,7 @@ static void setCommandLineOpts(const CodeGenOptions &CodeGenOpts) {
   // FIXME: The command line parser below is not thread-safe and shares a global
   // state, so this call might crash or overwrite the options of another Clang
   // instance in the same process.
-  llvm::cl::ParseCommandLineOptions(BackendArgs.size() - 1,
-                                    BackendArgs.data());
+  llvm::cl::ParseCommandLineOptions(BackendArgs.size() - 1, BackendArgs.data());
 }
 
 void EmitAssemblyHelper::CreateTargetMachine(bool MustCreateTM) {
@@ -812,18 +812,18 @@ static void addSanitizers(const Triple &TargetTriple,
   if (LowerAllowCheckPass::IsRequested() || ScaledCutoffs.has_value() ||
       CodeGenOpts.AllowRuntimeCheckSkipHotCutoff.has_value()) {
     // We want to call it after inline, which is about OptimizerEarlyEPCallback.
-    PB.registerOptimizerEarlyEPCallback(
-        [ScaledCutoffs, AllowRuntimeCheckSkipHotCutoff](
-            ModulePassManager &MPM, OptimizationLevel Level,
-            ThinOrFullLTOPhase Phase) {
-          LowerAllowCheckPass::Options Opts;
-          // TODO: after removing IsRequested(), make this unconditional
-          if (ScaledCutoffs.has_value())
-            Opts.cutoffs = ScaledCutoffs.value();
-          Opts.runtime_check = AllowRuntimeCheckSkipHotCutoff;
-          MPM.addPass(
-              createModuleToFunctionPassAdaptor(LowerAllowCheckPass(Opts)));
-        });
+    PB.registerOptimizerEarlyEPCallback([ScaledCutoffs,
+                                         AllowRuntimeCheckSkipHotCutoff](
+                                            ModulePassManager &MPM,
+                                            OptimizationLevel Level,
+                                            ThinOrFullLTOPhase Phase) {
+      LowerAllowCheckPass::Options Opts;
+      // TODO: after removing IsRequested(), make this unconditional
+      if (ScaledCutoffs.has_value())
+        Opts.cutoffs = ScaledCutoffs.value();
+      Opts.runtime_check = AllowRuntimeCheckSkipHotCutoff;
+      MPM.addPass(createModuleToFunctionPassAdaptor(LowerAllowCheckPass(Opts)));
+    });
   }
 }
 
@@ -1021,12 +1021,11 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     const bool PrepareForLTO = CodeGenOpts.PrepareForLTO;
 
     if (LangOpts.ObjCAutoRefCount) {
-      PB.registerPipelineStartEPCallback(
-          [](ModulePassManager &MPM, OptimizationLevel Level) {
-            if (Level != OptimizationLevel::O0)
-              MPM.addPass(
-                  createModuleToFunctionPassAdaptor(ObjCARCExpandPass()));
-          });
+      PB.registerPipelineStartEPCallback([](ModulePassManager &MPM,
+                                            OptimizationLevel Level) {
+        if (Level != OptimizationLevel::O0)
+          MPM.addPass(createModuleToFunctionPassAdaptor(ObjCARCExpandPass()));
+      });
       PB.registerPipelineEarlySimplificationEPCallback(
           [](ModulePassManager &MPM, OptimizationLevel Level,
              ThinOrFullLTOPhase) {
@@ -1155,8 +1154,8 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
           if (!ThinLinkOS)
             return;
         }
-        MPM.addPass(ThinLTOBitcodeWriterPass(
-            *OS, ThinLinkOS ? &ThinLinkOS->os() : nullptr));
+        MPM.addPass(ThinLTOBitcodeWriterPass(*OS, ThinLinkOS ? &ThinLinkOS->os()
+                                                             : nullptr));
       } else if (Action == Backend_EmitLL) {
         MPM.addPass(PrintModulePass(*OS, "", CodeGenOpts.EmitLLVMUseLists,
                                     /*EmitLTOSummary=*/true));
@@ -1184,6 +1183,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     if (shouldEmitUnifiedLTOModueFlag())
       TheModule->addModuleFlag(llvm::Module::Error, "UnifiedLTO", uint32_t(1));
   }
+  // add pass for rewriting malloc calls
 
   // FIXME: This should eventually be replaced by a first-class driver option.
   // This should be done for both clang and flang simultaneously.
@@ -1197,6 +1197,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     outs() << "\n";
     return;
   }
+  MPM.addPass(FSanRewriteFunctionCallsPass());
 
   // Now that we have all of the passes ready, run them.
   {
@@ -1419,7 +1420,7 @@ void clang::emitBackendOutput(CompilerInstance &CI, CodeGenOptions &CGOpts,
                       .moveInto(CombinedIndex)) {
       logAllUnhandledErrors(std::move(E), errs(),
                             "Error loading index file '" +
-                            CGOpts.ThinLTOIndexFile + "': ");
+                                CGOpts.ThinLTOIndexFile + "': ");
       return;
     }
 

@@ -14,6 +14,7 @@
 #include "CGCXXABI.h"
 #include "CGDebugInfo.h"
 #include "CGObjCRuntime.h"
+#include "CGValue.h"
 #include "CodeGenFunction.h"
 #include "ConstantEmitter.h"
 #include "TargetInfo.h"
@@ -1331,10 +1332,34 @@ static void EmitNewInitializer(CodeGenFunction &CGF, const CXXNewExpr *E,
 static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
                                 const FunctionDecl *CalleeDecl,
                                 const FunctionProtoType *CalleeType,
-                                const CallArgList &Args) {
+                                /**const*/ CallArgList &Args,
+                                std::string typeName = "") {
   llvm::CallBase *CallOrInvoke;
   llvm::Constant *CalleePtr = CGF.CGM.GetAddrOfFunction(CalleeDecl);
   CGCallee Callee = CGCallee::forDirect(CalleePtr, GlobalDecl(CalleeDecl));
+  // NOTE: a call is emitted also for placement new!
+  // if callee is new, replace it -> TODO
+  // Q: what happens if there is an extra arg for alignment?
+  auto calleeName = CalleeDecl->getQualifiedNameAsString();
+  if (calleeName.find("operator new") != std::string::npos) {
+    llvm::errs() << "\tEmitNewDeleteCall: Callee for NEW "
+                 << (typeName.empty() ? "_EMPTY_" : typeName) << ": "
+                 << *CalleeDecl << ", CalleeName: " << calleeName << " \n";
+    auto &ctx = CGF.getContext();
+    if (!typeName.empty()) {
+
+      llvm::Value *typeNamePtr =
+          CGF.Builder.CreateGlobalString(typeName, "typeName");
+      Args.add(RValue::get(typeNamePtr), ctx.getPointerType(ctx.CharTy));
+    } // !typeName.empty()
+    else {
+      // placement new case
+      llvm::Value *typeNamePtr =
+          CGF.Builder.CreateGlobalString("PLACEMENT", "PLACEMENT_TYPE");
+      Args.add(RValue::get(typeNamePtr), ctx.getPointerType(ctx.CharTy));
+    }
+  } // if callee is new
+
   RValue RV = CGF.EmitCall(CGF.CGM.getTypes().arrangeFreeFunctionCall(
                                Args, CalleeType, /*ChainCall=*/false),
                            Callee, ReturnValueSlot(), Args, &CallOrInvoke);
@@ -1591,17 +1616,25 @@ static void EnterNewDeleteCleanup(CodeGenFunction &CGF, const CXXNewExpr *E,
   CGF.initFullExprCleanup();
 }
 
+/** This method emits both calls and invokes. */
 llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   // The element type being allocated.
-  llvm::errs() << "[FE] EmitCXXNewExpr: SRC LOC: "
+  llvm::errs() << "[FE] EmitCXXNewExpr: CALLED on SRC LOC: "
                << E->getExprLoc().printToString(getContext().getSourceManager())
-               << " AllocType: " << E->getAllocatedType().getAsString() << "\n";
+               << ", TYPE: " << E->getAllocatedType().getAsString() << "\n";
+  bool guard = false;
+
   QualType allocType = getContext().getBaseElementType(E->getAllocatedType());
   auto IRType = ConvertTypeForMem(allocType);
   std::string IRTypeName = IRType->isStructTy() ? IRType->getStructName().str()
                                                 : allocType.getAsString();
   // 1. Build a call to the allocation function.
   FunctionDecl *allocator = E->getOperatorNew();
+  llvm::errs() << "\t[DBG-FE] Allocator: "
+               << allocator->getQualifiedNameAsString() << ", SRC LOC: "
+               << E->getExprLoc().printToString(getContext().getSourceManager())
+               << "\n";
+  allocator->dump();
 
   // If there is a brace-initializer or C++20 parenthesized initializer, cannot
   // allocate fewer elements than inits.
@@ -1637,6 +1670,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   CallArgList allocatorArgs;
   RValue TypeIdentityArg;
   if (allocator->isReservedGlobalPlacementOperator()) {
+    // TODO: in this case, there is no explicit call to new in the IR
     // NOTE: we want to skip placement new, it's CMA and fuck them
     assert(E->getNumPlacementArgs() == 1);
     const Expr *arg = *E->placement_arguments().begin();
@@ -1657,7 +1691,10 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
       allocatorArgs.add(RValue::get(allocSize), getContext().getSizeType());
       allocatorArgs.add(RValue::get(allocation, *this), arg->getType());
     }
-
+    llvm::errs() << "\t[DBG-FE] Placement new case , SRC LOC:";
+    E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
+    llvm::errs() << "\n";
+    // E->dump();
   } else {
     const FunctionProtoType *allocatorType =
         allocator->getType()->castAs<FunctionProtoType>();
@@ -1706,8 +1743,31 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     EmitCallArgs(allocatorArgs, allocatorType, E->placement_arguments(),
                  /*AC*/ AbstractCallee(), /*ParamsToSkip*/ ParamsToSkip);
 
-    RValue RV =
-        EmitNewDeleteCall(*this, allocator, allocatorType, allocatorArgs);
+    { // DBG
+      llvm::errs() << "\t[FE] EmitCXXNewExpr: ALLOCATOR: "
+                   << allocator->getQualifiedNameAsString() << ", ALLOC TYPE: "
+                   << allocatorType->getReturnType().getAsString() << ", args";
+      for (unsigned i = 0, e = allocatorArgs.size(); i != e; ++i) {
+        llvm::errs() << "\n  arg " << i << ": "
+                     << allocatorArgs[i].getType().getAsString() << " = ";
+        allocatorArgs[i].getRValue(*this).getScalarVal()->dump();
+      }
+      llvm::errs() << "\n";
+      allocatorType->dump();
+    } // DBG
+    // 1. replace the allocator with new_figa(unsigned long, char*)
+    // 2. append typename as arg
+    //  typeName = E->getAllocatedType().getAsString();
+    QualType AllocatedQualType = E->getAllocatedType();
+    std::string typeName =
+        ConvertTypeForMem(AllocatedQualType)->isStructTy()
+            ? ConvertTypeForMem(AllocatedQualType)->getStructName().str()
+            : "scalar";
+    RValue RV = EmitNewDeleteCall(*this, allocator, allocatorType,
+                                  allocatorArgs, typeName); // HOOK FOR NEW NEW
+    llvm::errs() << "\t[FE] EmitCXXNewExpr: Allocator call emitted: ";
+    RV.getScalarVal()->dump();
+    guard = true;
 
     // Set !heapallocsite metadata on the call to operator new.
     if (getDebugInfo())
@@ -1779,6 +1839,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   }
 
   llvm::Type *elementTy = ConvertTypeForMem(allocType);
+  // NOTE: allocation might come from placement new case as well!
   Address result = allocation.withElementType(elementTy);
 
   // Passing pointer through launder.invariant.group to avoid propagation of
@@ -1806,32 +1867,6 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   // emit store of a string to this resultPtr, make it non volatile
   // FSAN::persistWithStore(Builder, result, IRTypeName, ArraySize, *this, CGM);
   llvm::Value *resultPtr = result.emitRawPointer(*this);
-  llvm::LLVMContext &LLVMCtx = getLLVMContext();
-
-  if (numElements) {
-    if (llvm::ConstantInt *ConstNum = dyn_cast<llvm::ConstantInt>(numElements))
-      ArraySize = ConstNum->getZExtValue();
-  }
-
-  llvm::MDNode *FSanMD = llvm::MDNode::get(
-      LLVMCtx, {
-                   llvm::MDString::get(LLVMCtx, "fsan.new"),
-                   llvm::MDString::get(LLVMCtx, IRTypeName),
-                   llvm::ValueAsMetadata::get(llvm::ConstantInt::get(
-                       llvm::Type::getInt64Ty(LLVMCtx), ArraySize)),
-               });
-
-  llvm::errs() << "FSanMD for new-expression: ";
-  FSanMD->print(llvm::errs());
-  llvm::errs() << ", SRC LOC OF NEW: ";
-  E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
-  llvm::errs() << "\n";
-
-  if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(resultPtr))
-    I->setMetadata("fsan.new", FSanMD);
-  // THis does not do much
-  // FSAN::persistInGlobalVar(Builder, resultPtr, IRTypeName, ArraySize, *this,
-  //                          CGM);
 
   // Deactivate the 'operator delete' cleanup if we finished
   // initialization.
@@ -1858,9 +1893,35 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     resultPtr = PHI;
   }
   // FSAN
-  if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(resultPtr))
-    I->setMetadata("fsan.new", FSanMD); // TODO: not sure about his...
-  // FSAN
+
+  if (guard) { // NOTE: only type new, not placement new
+    llvm::LLVMContext &LLVMCtx = getLLVMContext();
+
+    if (numElements) {
+      if (llvm::ConstantInt *ConstNum =
+              dyn_cast<llvm::ConstantInt>(numElements))
+        ArraySize = ConstNum->getZExtValue();
+    }
+
+    llvm::MDNode *FSanMD = llvm::MDNode::get(
+        LLVMCtx, {
+                     llvm::MDString::get(LLVMCtx, "fsan.new"),
+                     llvm::MDString::get(LLVMCtx, IRTypeName),
+                     llvm::ValueAsMetadata::get(llvm::ConstantInt::get(
+                         llvm::Type::getInt64Ty(LLVMCtx), ArraySize)),
+                 });
+    llvm::errs() << "\t\tMD >> FSanMD for new-expression: ";
+    FSanMD->print(llvm::errs());
+    llvm::errs() << ", resultPtr: ";
+    resultPtr->print(llvm::errs());
+    llvm::errs() << ", SRC LOC OF NEW: ";
+    E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
+    llvm::errs() << "\n";
+    if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(resultPtr))
+      I->setMetadata("fsan.new", FSanMD); // TODO: not sure about his...
+    // FSAN
+  }
+
   return resultPtr;
 }
 

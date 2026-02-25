@@ -515,7 +515,7 @@ uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector, uptr array_size) {
   // NOTE: the above must be an integer division! Is this always the case?
 
   u_int8_t* ptr = (u_int8_t*)tag_vector;
-  VPrintf(2,
+  VPrintf(1,
           "[FieldArmor] TagMemory_mod : NEW VAR -> P: %p size: %p tag_vector: "
           "%p, array_size: %p, perElementSize: %p\n",
           (void*)p, (void*)size, (void*)tag_vector, (void*)array_size,
