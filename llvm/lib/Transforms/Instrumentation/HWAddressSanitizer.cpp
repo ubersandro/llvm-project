@@ -1908,7 +1908,6 @@ void HWAddressSanitizer::HandleMallocLikeCall(CallBase *CI) {
   }
 } // HandleMallocLikeCall
 
-
 // TAG NEW USING MD
 void HWAddressSanitizer::HandleNewCall(CallInst *CI) {
 
@@ -2188,7 +2187,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   //   CallInst *CI = PAIR.first;
   //   RewriteCallToTypedAllocator(CI);
   // }
-  // NOTE: call rewriting was moved to the very end of the optimization pipeline for double checking that no new mallocs/new pop out for some reason
+  // NOTE: call rewriting was moved to the very end of the optimization pipeline
+  // for double checking that no new mallocs/new pop out for some reason
 
   // TODO : handle ptr subs when at least 1 op results from a ptr to int
   if (!SInfo.AllocasToInstrument.empty()) {
@@ -3642,6 +3642,7 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
           ->isStructTy();
 
   if (!(isStruct || isArrayOfStructs || isMatrixOfStructs)) {
+    // TODO: handle this mess!
     errs() << "[FieldArmor - WARNING] Skipping global variable: "
            << GV->getName() << "\n";
     errs() << *type << "\n";
@@ -3868,9 +3869,9 @@ void HWAddressSanitizer::instrumentGlobals() {
             dyn_cast<ArrayType>(GV.getValueType()->getArrayElementType());
         if (!elemArrayType->getElementType()->isStructTy()) {
           // skipping 3d array
-          errs() << "[HWASAN] Skipping global variable (3D array): "
+          errs() << "[FSan] global variable (3D array): "
                  << GV.getName() << "\n";
-          continue;
+          // continue; // TODO: no longer skip, correctly engineer
         } // arrays of arrays of something other than structs
         else if (elemArrayType->getElementType()->isStructTy()) {
           bool isLiteral = dyn_cast<StructType>(elemArrayType->getElementType())
@@ -4144,20 +4145,18 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
 
     else if (sonType->isArrayTy()) {
       Type *elementType = sonType->getArrayElementType();
-      if (elementType->isStructTy()) {
+      if (StructType *structType = dyn_cast<StructType>(elementType)) {
         // case : ARRAY of STRUCTS embedded in a struct
-        if (StructType *structType = dyn_cast<StructType>(elementType)) {
-          if (structType->isLiteral()) {
-            LiteralStructs++;
-            // dont tag literal structs arrays for now
-            continue;
-          } else if (structType->getName().str().find("union.") == 0) {
-            // dont tag union arrays for now
-            continue;
-          }
-        } // skip literal and unions
 
-        auto structType = cast<StructType>(elementType);
+        if (structType->isLiteral()) {
+          LiteralStructs++;
+          // dont tag literal structs arrays for now
+          continue;
+        } else if (structType->getName().str().find("union.") == 0) {
+          // dont tag union arrays for now
+          continue;
+        }
+
         auto structName = structType->getStructName().str();
         auto tagVectorGlobal =
             M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
@@ -4168,8 +4167,11 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
         tagVectorGlobal =
             M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
 
-        if (!tagVectorGlobal)
-          continue;
+        if (!tagVectorGlobal) {
+          // continue;
+          assert(tagVectorGlobal &&
+                 "computeTags - error in creating and retrieving TV");
+        }
 
         Constant *tagVectorInit =
             cast<Constant>(tagVectorGlobal->getInitializer());
@@ -4189,6 +4191,7 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
       } // case: array of structs embedded in a struct
 
       else if (elementType->isArrayTy()) {
+        // 2+d matrix
         auto innerArrayType = dyn_cast<ArrayType>(elementType);
         Type *innerElementType = innerArrayType->getArrayElementType();
         if (innerElementType->isStructTy()) {
@@ -4243,11 +4246,82 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
             } // for each struct
           } // for each array of structs
         } // case : matrix of structs
+        else if (innerElementType->isArrayTy()) {
+          // case : matrix of arrays -> if struct, tag it. If not struct, no
+          // tags.
+          auto thirdLevElementType =
+              dyn_cast<ArrayType>(innerElementType)->getArrayElementType();
+          if (thirdLevElementType->isStructTy()) {
+            // case : 3D matrix of structs
+            auto structType = cast<StructType>(thirdLevElementType);
+            if (structType->isLiteral()) {
+              LiteralStructs++;
+              // dont tag literal struct matrices for now
+              continue;
+            } else if (structType->getName().str().find("union.") == 0) {
+              // dont tag union matrices for now
+              continue;
+            }
+
+            auto structName = structType->getStructName().str();
+            auto tagVectorGlobal =
+                M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
+
+            if (!tagVectorGlobal)
+              createTagVector(structType);
+
+            tagVectorGlobal =
+                M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
+
+            if (!tagVectorGlobal)
+              continue;
+            Constant *tagVectorInit =
+                cast<Constant>(tagVectorGlobal->getInitializer());
+            // compute the total number of structs enclosed in this aggregate
+            auto *L1arrayType = dyn_cast<ArrayType>(sonType);
+            auto *L2arrayType =
+                dyn_cast<ArrayType>(L1arrayType->getElementType());
+            auto *L3arrayType =
+                dyn_cast<ArrayType>(L2arrayType->getElementType());
+            structType =
+                dyn_cast<StructType>(L3arrayType->getArrayElementType());
+            assert(structType &&
+                   "Expected struct as innermost element of 3D matrix");
+            errs() << "3D array of " << structType->getStructName() << "\n";
+            auto L1Els = L1arrayType->getNumElements();
+            auto L2Els = L2arrayType->getNumElements();
+            auto L3Els = L3arrayType->getNumElements();
+            auto L1ArraySize = DL.getTypeAllocSize(L1arrayType);
+            auto L2ArraySize = DL.getTypeAllocSize(L2arrayType);
+            auto L3ArraySize = DL.getTypeAllocSize(L3arrayType);
+
+            auto structSize = DL.getTypeAllocSize(structType);
+            auto L1Offset = sonOffset; // offset from the beginning of the
+                                       // struct of the outermost array
+            for (u_int64_t L1 = 0; L1 < L1Els; L1++) {
+              // each element is an array of structs
+              L1Offset += L1 * L2ArraySize;
+
+              for (u_int64_t L2 = 0; L2 < L2Els; L2++) {
+                uint64_t L2Offset = L1Offset + L2 * L3ArraySize;
+
+                for (u_int64_t L3 = 0; L3 < L3Els; L3++) {
+                  uint64_t L3Offset = L2Offset + L3 * structSize;
+
+                  for (u_int64_t i = 0; i < structSize; i++) {
+                    tags[L3Offset + i] = static_cast<uint8_t>(
+                        cast<ConstantInt>(tagVectorInit->getAggregateElement(i))
+                            ->getZExtValue());
+                  }
+                } // for each struct in the innermost array
+              } // for each array of structs
+            } // for each matrix of structs
+            errs() << "TAGGED 3D MATRIX OF STRUCTS\n";
+          } // 3D matrix of structs
+        }
 
         else {
-          // array of arrays of scalars, or array of arrays of arrays of
-          // something else -> all same tag
-          // NOTE: this could be 3d matrices of structs as well!
+          // 2D matrices of scalars ONLY.
           uint8_t sonT = (fatherT + sonIdx) % 16;
           uint8_t sonTag = sonT | (fatherL << 4);
           uint64_t sonSize = DL.getTypeAllocSize(sonType);
