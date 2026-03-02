@@ -6464,14 +6464,8 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
   bool enabled = true;
   bool isMalloc = CalleeDecl && CalleeDecl->getIdentifier() &&
                   (CalleeDecl->getName() == "malloc");
-  // bool isCalloc = CalleeDecl && CalleeDecl->getIdentifier() &&
-  // (CalleeDecl->getName() == "calloc"); // TODO test, it's undertested
-  // bool isRealloc =
-  //     CalleeDecl && CalleeDecl->getIdentifier() &&
-  //     (CalleeDecl->getName() == "realloc"); // TODO test, it's undertested
 
-  if (CalleeDecl && FSAN::isAllocFD(CalleeDecl) &&
-      enabled /* && (isRealloc) && isMalloc*/) {
+  if (CalleeDecl && FSAN::isAllocFD(CalleeDecl) && enabled) {
     {
       llvm::errs() << "FE-DBG: Dumping original callee: ";
       CalleeType->dump();

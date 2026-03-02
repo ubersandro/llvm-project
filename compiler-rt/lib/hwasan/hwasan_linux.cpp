@@ -273,19 +273,18 @@ bool InitShadow() {
 
   return true;
 }
-#ifndef FINISH
-#define FINISH
-void __attribute__((destructor)) __hwasan_finish(){
+#  ifndef FINISH
+#    define FINISH
+void __attribute__((destructor)) __hwasan_finish() {
   // enable on need
   // Printf(
-  //     "FSAN: %llu checks, %llu on untagged ptrs, %llu on uninitialized shadow. Overflows %llu\n",
-  //     atomic_load(&total_checks, memory_order_relaxed),
-  //     atomic_load(&checks_on_untagged_ptr, memory_order_relaxed),
-  //     atomic_load(&checks_on_uninited_shadow, memory_order_relaxed), 
-  //     atomic_load(&overflows, memory_order_relaxed));
+  //     "FSAN: %llu checks, %llu on untagged ptrs, %llu on uninitialized
+  //     shadow. Overflows %llu\n", atomic_load(&total_checks,
+  //     memory_order_relaxed), atomic_load(&checks_on_untagged_ptr,
+  //     memory_order_relaxed), atomic_load(&checks_on_uninited_shadow,
+  //     memory_order_relaxed), atomic_load(&overflows, memory_order_relaxed));
 }
-#endif
-
+#  endif
 
 void InitThreads() {
   CHECK(__hwasan_shadow_memory_dynamic_address);
@@ -512,13 +511,13 @@ void Thread::InitStackAndTls(const InitState*) {
 }
 uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector, uptr array_size) {
   uptr perElementSize = size / array_size;
-  // NOTE: the above must be an integer division! Is this always the case?
-
+  // TODO: enforce correctness of the division
   u_int8_t* ptr = (u_int8_t*)tag_vector;
+  const char* whatIsIt = (tag_vector ? "TAGGING" : "UNTAGGING");
   VPrintf(1,
-          "[FieldArmor] TagMemory_mod : NEW VAR -> P: %p size: %p tag_vector: "
+          "[FieldArmor] TagMemory_mod : %s -> P: %p size: %p tag_vector: "
           "%p, array_size: %p, perElementSize: %p\n",
-          (void*)p, (void*)size, (void*)tag_vector, (void*)array_size,
+          whatIsIt, (void*)p, (void*)size, (void*)tag_vector, (void*)array_size,
           (void*)perElementSize);
   uptr tagged = AddTagToPointer(p, RPTag);  // TODO: handle array case!
 
@@ -560,7 +559,7 @@ uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
     internal_memset((void*)shadow_start, tag, shadow_size);
   }
   uptr tagged = AddTagToPointer(p, tag);
-  VPrintf(1, "[FieldArmor] TagMemoryAligned: return %p, untagged %p ",
+  VPrintf(1, "[FieldArmor] TagMemoryAligned: return %p, untagged %p \n",
           (void*)tagged, (void*)p);
   return tagged;
 }

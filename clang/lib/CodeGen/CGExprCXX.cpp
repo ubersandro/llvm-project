@@ -1333,7 +1333,8 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
                                 const FunctionDecl *CalleeDecl,
                                 const FunctionProtoType *CalleeType,
                                 /**const*/ CallArgList &Args,
-                                std::string typeName = "") {
+                                std::string typeName = "",
+                                bool cookie = false) {
   llvm::CallBase *CallOrInvoke;
   llvm::Constant *CalleePtr = CGF.CGM.GetAddrOfFunction(CalleeDecl);
   CGCallee Callee = CGCallee::forDirect(CalleePtr, GlobalDecl(CalleeDecl));
@@ -1341,13 +1342,13 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
   // if callee is new, replace it -> TODO
   // Q: what happens if there is an extra arg for alignment?
   auto calleeName = CalleeDecl->getQualifiedNameAsString();
-  if (calleeName.find("operator new") != std::string::npos) {
+  bool enableGuard = true;
+  if (enableGuard && calleeName.find("operator new") != std::string::npos) {
     llvm::errs() << "\tEmitNewDeleteCall: Callee for NEW "
                  << (typeName.empty() ? "_EMPTY_" : typeName) << ": "
                  << *CalleeDecl << ", CalleeName: " << calleeName << " \n";
     auto &ctx = CGF.getContext();
     if (!typeName.empty()) {
-
       llvm::Value *typeNamePtr =
           CGF.Builder.CreateGlobalString(typeName, "typeName");
       Args.add(RValue::get(typeNamePtr), ctx.getPointerType(ctx.CharTy));
@@ -1357,6 +1358,13 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
       llvm::Value *typeNamePtr =
           CGF.Builder.CreateGlobalString("PLACEMENT", "PLACEMENT_TYPE");
       Args.add(RValue::get(typeNamePtr), ctx.getPointerType(ctx.CharTy));
+    }
+    if (cookie) {
+      llvm::errs() << "[DBG-FE] ADDING A COOKIE MARKER TO THE NEW CALL" << "\n";
+      llvm::Value *cookieStr =
+          CGF.Builder.CreateGlobalString("PINO_PALETTA", "PINO_PALETTA"); // TODO: move this out of here
+      Args.add(RValue::get(cookieStr), ctx.getPointerType(ctx.CharTy));
+      // set name for cookieR to "pinobiscotto"
     }
   } // if callee is new
 
@@ -1634,7 +1642,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
                << allocator->getQualifiedNameAsString() << ", SRC LOC: "
                << E->getExprLoc().printToString(getContext().getSourceManager())
                << "\n";
-  allocator->dump();
+  // allocator->dump();
 
   // If there is a brace-initializer or C++20 parenthesized initializer, cannot
   // allocate fewer elements than inits.
@@ -1657,11 +1665,46 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
   llvm::Value *numElements = nullptr;
   llvm::Value *allocSizeWithoutCookie = nullptr;
+  // NOTE1: if it's not an array, there is no cookie
+  // NOTE2: no cookie on placement new because size requirements are strict!
+  // NOTE3: cookie size is ABI-dependent!
+  // NOTE4: always offsetting by 8 is bad because if the type has a trivial
+  // destructor, you mess up! SOL: add extra param on trivial destructor
+  // TODO: what if the type can grow? How does it work?
+  // Q: what is the min type of elements? -> mark this as TODO for future work
   llvm::Value *allocSize = EmitCXXNewAllocSize(
       *this, E, minElements, numElements, allocSizeWithoutCookie);
-  int64_t ArraySize = -1; // for MD
+  llvm::errs() << "\t[DBG-FE] Alloc size: ";
+  allocSize->dump();
+  llvm::errs() << "\t[DBG-FE] Alloc size w/ cookie: ";
+  allocSizeWithoutCookie->dump();
+  llvm::errs() << "[DBG-FE] Type size: ";
+  auto type = getContext().getTypeSizeInChars(allocType).getQuantity();
+  llvm::errs() << "[DBG-FE] Alloc Type Size: " << type << "\n";
+  bool cookie = false;
+  int64_t ArraySize = -1; // TODO: add extra param to NEW
   if (!E->isArray())
     ArraySize = 1;
+  else {
+    llvm::errs() << "[DBG-FE] Array elems value: ";
+    numElements->dump();
+    if (llvm::ConstantInt *CI = dyn_cast<llvm::ConstantInt>(numElements)) {
+      ArraySize = CI->getSExtValue();
+      llvm::errs() << "[DBG-FE] Array size: " << ArraySize << "\n";
+    }
+    // it's an array, does it have a trivial destr?
+    QualType ElementType =
+        getContext().getBaseElementType(E->getAllocatedType());
+    const RecordType *RT = ElementType->getAs<RecordType>();
+    if (RT) {
+      const CXXRecordDecl *RD = cast<CXXRecordDecl>(RT->getDecl());
+      if (!RD->hasTrivialDestructor()) {
+        llvm::errs() << "COOKIE IS GONNA BE THERE FOR TYPE: " << *RD << "\n";
+        cookie = true;
+      }
+    }
+  }
+
   CharUnits allocAlign = getContext().getTypeAlignInChars(allocType);
 
   // Emit the allocation call.  If the allocator is a global placement
@@ -1698,7 +1741,14 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   } else {
     const FunctionProtoType *allocatorType =
         allocator->getType()->castAs<FunctionProtoType>();
-    ImplicitAllocationParameters IAP = E->implicitAllocationParameters();
+    ImplicitAllocationParameters IAP =
+        E->implicitAllocationParameters(); // NOTE: this describes extra params
+    // DUMP IAP
+    llvm::errs() << "\t[DBG-FE] IAP: PassTypeIdentity: "
+                 << static_cast<unsigned>(IAP.PassTypeIdentity)
+                 << ", PassAlignment: "
+                 << static_cast<unsigned>(IAP.PassAlignment) << " IAP.Type "
+                 << IAP.Type.getAsString() << "\n";
     unsigned ParamsToSkip = 0;
     if (isTypeAwareAllocation(IAP.PassTypeIdentity)) {
       QualType SpecializedTypeIdentity = allocatorType->getParamType(0);
@@ -1721,6 +1771,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
     // The allocation alignment may be passed as the second argument.
     if (isAlignedAllocation(IAP.PassAlignment)) {
+      // TODO: handle this case later!
       QualType AlignValT = sizeType;
       if (allocatorType->getNumParams() > IndexOfAlignArg) {
         AlignValT = allocatorType->getParamType(IndexOfAlignArg);
@@ -1739,32 +1790,32 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     }
 
     // FIXME: Why do we not pass a CalleeDecl here?
-    // this dies if naively adding one more arg
     EmitCallArgs(allocatorArgs, allocatorType, E->placement_arguments(),
                  /*AC*/ AbstractCallee(), /*ParamsToSkip*/ ParamsToSkip);
+    // ADD extra args for cookie
 
     { // DBG
       llvm::errs() << "\t[FE] EmitCXXNewExpr: ALLOCATOR: "
                    << allocator->getQualifiedNameAsString() << ", ALLOC TYPE: "
                    << allocatorType->getReturnType().getAsString() << ", args";
       for (unsigned i = 0, e = allocatorArgs.size(); i != e; ++i) {
-        llvm::errs() << "\n  arg " << i << ": "
+        llvm::errs() << "\n  ARG " << i << ": "
                      << allocatorArgs[i].getType().getAsString() << " = ";
         allocatorArgs[i].getRValue(*this).getScalarVal()->dump();
       }
       llvm::errs() << "\n";
       allocatorType->dump();
     } // DBG
-    // 1. replace the allocator with new_figa(unsigned long, char*)
-    // 2. append typename as arg
-    //  typeName = E->getAllocatedType().getAsString();
+
     QualType AllocatedQualType = E->getAllocatedType();
     std::string typeName =
         ConvertTypeForMem(AllocatedQualType)->isStructTy()
             ? ConvertTypeForMem(AllocatedQualType)->getStructName().str()
             : "scalar";
-    RValue RV = EmitNewDeleteCall(*this, allocator, allocatorType,
-                                  allocatorArgs, typeName); // HOOK FOR NEW NEW
+    // at this point, we have all the right arguments only, no extra args yet
+    RValue RV =
+        EmitNewDeleteCall(*this, allocator, allocatorType, allocatorArgs,
+                          typeName, cookie); // HOOK FOR NEW NEW
     llvm::errs() << "\t[FE] EmitCXXNewExpr: Allocator call emitted: ";
     RV.getScalarVal()->dump();
     guard = true;

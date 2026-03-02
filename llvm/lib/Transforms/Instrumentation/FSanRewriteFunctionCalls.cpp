@@ -21,6 +21,10 @@
 
 using namespace llvm;
 
+// TODO: turn these into ct llvm flags
+bool tagNew = true;
+bool tagMallocLike = true;
+
 bool FSanRewriteFunctionCallsPass::isTypedMallocLike(CallBase *CB) {
   Value *V = CB->getCalledOperand()->stripPointerCasts();
   Function *Callee = dyn_cast<Function>(V);
@@ -36,10 +40,32 @@ bool FSanRewriteFunctionCallsPass::isTypedNewOperator(CallBase *CB) {
                         std::string::npos); // for now, TODO later fix
 }
 
+bool doCheckOnCookie(Value *V) {
+  errs() << "[IR] CHECKING COOKIE on ";
+  V->dump();
+  // example @COOKIE_IS_THERE.9 = private unnamed_addr constant [13 x i8]
+  // c"PINO_PALETTA\00", align 4
+  if (Constant *name = dyn_cast<Constant>(V)) {
+    if (ConstantDataArray *dataArray =
+            dyn_cast<ConstantDataArray>(name->getOperand(0))) {
+      if (dataArray->isString()) {
+        StringRef str = dataArray->getAsString();
+        // remove trailing nullbyte
+        std::string pinoPalettaStr = str.str().substr(0, str.size() - 1);
+        return pinoPalettaStr ==
+               "PINO_PALETTA"; // Q: will this work with null term?
+      }
+    }
+  }
+
+  return false;
+}
+
 // TODO: write rewriteNewLike
 // TODO: handle array sizes for news
-Value *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
-                   const std::string &formerAllocatorName, Module &M) {
+CallBase *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
+                      const std::string &formerAllocatorName, Module &M,
+                      bool *needsOffsetForCookie = nullptr) {
   bool isNew = false;
   Value *allocSize = nullptr;
   Value *nElems = nullptr;
@@ -49,6 +75,7 @@ Value *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
   Type *VoidPtrTy = CI->getType();                     // opaque
   FunctionCallee formerFn;
   bool isRealloc = false;
+  bool hasAlignment = false;
 
   // extract size, n, former ptr
   if (formerAllocatorName == "malloc") {
@@ -71,11 +98,21 @@ Value *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
   else if (formerAllocatorName.find("operator new[]") != std::string::npos) {
     allocSize = CI->getArgOperand(0);
     isNew = true;
+    // TODO: does it have alignment?? Only if 3 params there is alignment
+    auto callArgsNum = CI->arg_size();
+    if (callArgsNum == 3) {
+      // it has type and alignment
+      hasAlignment = true; // TODO
+    }
   } // operator new[]
   else if (formerAllocatorName.find("operator new") != std::string::npos) {
     allocSize = CI->getArgOperand(0);
     isNew = true;
-    arraySize = ConstantInt::get(SizeTy, 1);
+    auto callArgsNum = CI->arg_size();
+    if (callArgsNum == 3) {
+      // it has type and alignment
+      hasAlignment = true; // TODO
+    }
   } // operator new
 
   Type *sizeType = allocSize->getType();
@@ -114,91 +151,92 @@ Value *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
   }
   if (formerAllocatorName.find("operator new[]") != std::string::npos ||
       formerAllocatorName.find("operator new") != std::string::npos) {
-    // TODO : correct way of handling this is to push all the args, except the
-    // last one! New operators have several overloads.
+
+    // TODO: check on std::throw arg, if still there!
+    bool cookieStrIsThere = false;
+    cookieStrIsThere = doCheckOnCookie(CI->getArgOperand(CI->arg_size() - 1));
+    if (cookieStrIsThere)
+      errs() << "COOKIE ACK IN IR\n";
+    unsigned originalArgsNum =
+        cookieStrIsThere ? CI->arg_size() - 2 : CI->arg_size() - 1;
+    *needsOffsetForCookie = cookieStrIsThere;
+
+    for (unsigned i = 0; i < originalArgsNum; ++i)
+      arguments.push_back(CI->getArgOperand(i));
   }
-  if (isNew)
+
+  if (isNew) {
+    bool isInvoke = isa<InvokeInst>(CI);
+    if (isInvoke) {
+      InvokeInst *OldInv = cast<InvokeInst>(CI);
+      IRBuilder<> IRB(OldInv->getParent(), OldInv->getIterator());
+      auto *Dest = OldInv->getNormalDest();
+      auto *UnwindDest = OldInv->getUnwindDest();
+      Value *OldInvokedFunc = OldInv->getCalledOperand()->stripPointerCasts();
+      FunctionType *OldInvokedFuncTy = nullptr;
+      if (Function *OldInvokedFuncAsFn = dyn_cast<Function>(OldInvokedFunc)) {
+        OldInvokedFuncTy = OldInvokedFuncAsFn->getFunctionType();
+      }
+
+      assert(OldInvokedFuncTy &&
+             "Failed to get function type of old invoked function");
+      // DBG dump old function type
+      errs() << "[IR-DBG] Old invoked function type: " << *OldInvokedFuncTy
+             << "\n";
+      errs() << "Old invoked function " << *OldInvokedFunc << "\n";
+      errs() << "Arguments size " << arguments.size() << "\n";
+      for (auto arg : arguments) {
+        arg->dump();
+      }
+      // TODO: enforce the signature of the new operator is correct
+      InvokeInst *NewInvoke =
+          InvokeInst::Create(OldInvokedFuncTy, OldInv->getCalledOperand(), Dest,
+                             UnwindDest, arguments, "invoke.rewrite");
+      // TODO: REFACTOR and fix attributes to function call to match
+      // original!
+      NewInvoke->dump();
+      NewInvoke->setDebugLoc(OldInv->getDebugLoc());
+      // NewInvoke->setTailCall(true);
+
+      OldInv->dump();
+      // Insert it before the old one
+      NewInvoke->insertBefore(OldInv);
+      OldInv->replaceAllUsesWith(NewInvoke);
+
+      OldInv->eraseFromParent();
+      return NewInvoke;
+    } else {
+      // its a new call
+      Value *NewOperator = CI->getCalledOperand()->stripPointerCasts();
+      FunctionType *NewOperatorTy = nullptr;
+      if (Function *NewOperatorAsFn = dyn_cast<Function>(NewOperator)) {
+        NewOperatorTy = NewOperatorAsFn->getFunctionType();
+      }
+      assert(NewOperatorTy &&
+             "Failed to get function type of new operator function");
+      CI->dump();
+
+      CallInst *NewCall = CallInst::Create(
+          NewOperatorTy, CI->getCalledOperand(), arguments, "call.rewrite");
+      NewCall->setTailCall(true);
+      NewCall->setDebugLoc(CI->getDebugLoc());
+
+      NewCall->insertBefore(CI);
+      NewCall->dump();
+      CI->replaceAllUsesWith(NewCall);
+      CI->eraseFromParent();
+      return NewCall;
+    }
+
     return nullptr;
-  // if (isNew) {
-  //   bool isInvoke = isa<InvokeInst>(CI);
-  //   errs() << "DBG - rewrite NEW: " << *CI << "\n";
+  } // if isNew
 
-  //   auto *nextInstr = CI->getNextNonDebugInstruction();
-  //   if (!nextInstr) {
-  //     errs() << "[rewriteCall]NO NEXT: " << *CI << "\n";
-  //     errs() << "<FUNCTION>\n";
-  //     CI->getFunction()->dump();
-  //     errs() << "</FUNCTION>\n";
-  //     // TODO: handle this case
-  //     return nullptr; // TODO: handle this case, maybe insert at end of
-  //   } // no NextInstr
-
-  //   IRBuilder<> IRB(CI);
-  //   auto typeSize = M.getDataLayout().getTypeAllocSize(allocType);
-  //   if (!arraySize)
-  //     arraySize =
-  //         IRB.CreateUDiv(allocSize, ConstantInt::get(sizeType, typeSize));
-
-  //   auto *prevCalleeFn =
-  //       dyn_cast<Function>(CI->getCalledOperand()->stripPointerCasts());
-  //   assert(prevCalleeFn &&
-  //          "Failed to get previous callee function for operator new");
-
-  //   errs() << "[DBG] DUMP PREV CALLEE\n";
-  //   prevCalleeFn->dump();
-  //   // errs() << "\n";
-
-  //   Value *newCI = nullptr;
-
-  //   if (isInvoke) {
-  //     // errs() << "\t\t[IR] INVOKE NEW TO REWRITE: " << *CI << "\n";
-  //     // InvokeInst *OldInv = cast<InvokeInst>(CI);
-  //     // auto Int64Ty = Type::getInt64Ty(M.getContext());
-  //     // FunctionType *NewFTy = FunctionType::get(
-  //     //     VoidPtrTy, {Int64Ty}, false); // same sign for new and new[]
-  //     // StringRef formerName = prevCalleeFn->getName();
-  //     // Value *NewCallee = M.getOrInsertFunction(formerName,
-  //     // NewFTy).getCallee(); assert(NewCallee && "Failed to get or insert
-  //     new
-  //     // operator function");
-  //     // // NewCallee->dump();
-
-  //     // SmallVector<Value *, 2> NewArgs{
-  //     //     OldInv->getArgOperand(0)}; // Only size, skip typeName
-  //     // // TODO: check on other types of invoke instructions
-  //     // // https://llvm.org/doxygen/classllvm_1_1IRBuilderBase.html
-  //     // InvokeInst *NewInv =
-  //     //     IRB.CreateInvoke(NewFTy, NewCallee, OldInv->getNormalDest(),
-  //     //                      OldInv->getUnwindDest(), NewArgs,
-  //     //                      OldInv->getName());
-
-  //     // // Copy attributes like noalias noundef nonnull #21
-  //     // NewInv->setAttributes(OldInv->getAttributes());
-  //     // NewInv->setCallingConv(OldInv->getCallingConv());
-  //     // NewInv->setDebugLoc(OldInv->getDebugLoc());
-
-  //     // // Replace uses & erase
-  //     // llvm::errs() << "Replacing old invoke: " << *OldInv
-  //     //              << " with new invoke: " << *NewInv << "\n";
-  //     // OldInv->replaceAllUsesWith(NewInv);
-  //     // OldInv->eraseFromParent();
-  //     // newCI = NewInv;
-
-  //   } else {
-  //     // errs() << "\t\t[IR] CALL TO NEW TO REWRITE: " << *CI << "\n";
-  //     // rewrite call as with malloc
-  //   }
-
-  //   return newCI;
-
-  // } // if isNew
-  // else {
-  // malloc-like case, just rewrite call with new function and arguments
   IRBuilder<> IRB(CI);
   errs() << "[IR] MALLOC-LIKE FORMER FUNCTION SIGNATURE: "
          << *formerFn.getCallee() << "\n";
 
   CallBase *formerCall = IRB.CreateCall(formerFn, arguments);
+  // TODO: REFACTOR and fix attributes
   // formerCall->addParamAttr(0, Attribute::NoAlias);
   // if (isRealloc)
   //   formerCall->addParamAttr(1, Attribute::None); // size
@@ -208,18 +246,9 @@ Value *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
   //   formerCall->addParamAttr(1, Attribute::get(Ctx, "noundef"));
 
   formerCall->setCallingConv(CallingConv::C);
-
-  errs() << "[IR] Basic Block BEFORE:\n";
-  CI->getParent()->dump();
-
   CI->replaceAllUsesWith(formerCall);
   CI->eraseFromParent();
-  errs() << "[IR] Basic Block after erasing original call:\n";
-  // CI->getParent()->dump();
-  formerCall->getParent()->dump();
-  
   return formerCall;
-  // } // !isNew
 }
 
 Value *GetArraySize(CallBase *CI, std::string demangledName, Module &M,
@@ -374,9 +403,9 @@ u_int8_t *computeTags(StructType *Ty, Module &M) {
             continue;
           }
 
-          // TODO: handle arrays of C++ classes. What happens if the wrong tag
-          // vector is used? E.g. base vs non-base? Using struct size should
-          // be fine though.
+          // TODO: handle arrays of C++ classes. What happens if the wrong
+          // tag vector is used? E.g. base vs non-base? Using struct size
+          // should be fine though.
 
           auto structName = structType->getStructName().str();
           GlobalVariable *tagVectorGlobal = retrieveTV(structType, M);
@@ -592,7 +621,7 @@ bool FSanRewriteFunctionCallsPass::RewriteCallToTypedAllocator(CallBase *CI,
   llvm::errs() << "[DBG-IR] ARRAY SIZE: " << *arraySize << "\n";
 
   // this is a destructive operation for CI
-  Value *formerCall =
+  CallBase *formerCall =
       rewriteCall(CI, allocType, arraySize, formerAllocatorName, M);
   assert(formerCall &&
          "Failed to rewrite malloc-like call to former allocator");
@@ -671,7 +700,7 @@ void dbgSrcAndUses(CallBase *I) {
 }
 
 bool processNewOperatorCalls(CallBase *I, Module &M) {
-
+  // NOTE on sizing news -> cookie!!!!!
   Value *V = I->getCalledOperand()->stripPointerCasts();
   bool changed = false;
   Function *Callee = dyn_cast<Function>(V);
@@ -682,8 +711,8 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
     if (demangledName.find("operator new") != std::string::npos) {
       llvm::errs() << "[IR] CALL/INVOKE NEW: " << demangledName << ", " << *I
                    << "\n";
-      // dbgSrcAndUses(I);
-      // doQuickCheckOnMD(I);
+      // dbgSrcAndUses(I); // dump src and invoke uses => CONSTRUCTORS
+      // doQuickCheckOnMD(I); // check if MD is there, just for comparison
       { // NO THROW CASE
         // skip on throw for now
         if (demangledName.find("nothrow") != std::string::npos) {
@@ -693,9 +722,20 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
       } // NO THROW CASE
 
       auto size = I->arg_size();
-      auto lastArg = I->getArgOperand(I->arg_size() - 1); // typeName
+      if (size <= 1) {
+        llvm::errs() << "\t\t[IR] NOT ENOUGH ARGS FOR NEW, skipping: " << *I
+                     << "\n";
+        return false;
+      } // size guard
+
+      bool cookieIsThere = doCheckOnCookie(I->getArgOperand(size - 1));
+      auto lastArg =
+          cookieIsThere
+              ? I->getArgOperand(I->arg_size() - 2)
+              : I->getArgOperand(I->arg_size() - 1); // typeName or COOKIE!!!
+
       std::string structName = "";
-      StructType *allocType;
+      StructType *allocType = nullptr;
       if (Constant *name = dyn_cast<Constant>(lastArg)) {
         if (ConstantDataArray *dataArray =
                 dyn_cast<ConstantDataArray>(name->getOperand(0))) {
@@ -705,76 +745,145 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
                 structNameRef.str().substr(0, structNameRef.size() - 1);
             llvm::errs() << "\t\t[IR-DBG] LAST PARAM DUMP: " << structName
                          << "\n";
-            // NOTE: right now, placement news are not handled because their
-            // type is a placeholder string. TODO: future work.
+            // NOTE: right now, placement news are not handled because
+            // their type is a placeholder string. TODO: future work.
             if (allocType = StructType::getTypeByName(Callee->getContext(),
                                                       structName)) {
               llvm::errs() << "\t\t[IR] LAST PARAM IS STRUCT: " << structName
                            << "\n";
             }
-          } else
-            assert(false && "Expected last argument to be a string constant in "
-                            "processNewOperatorCalls");
+          } else {
+
+            llvm::errs() << "\t\t[IR-DBG] LAST PARAM IS NOT STRING: "
+                         << *lastArg << "\n";
+            auto *type = lastArg->getType();
+            llvm::errs() << "\t\t[IR-DBG] LAST PARAM TYPE: " << *type << "\n";
+            if (PHINode *phi = dyn_cast<PHINode>(lastArg)) {
+              llvm::errs() << "\t\t[IR-DBG] LAST PARAM IS PHI NODE, dumping "
+                              "incoming values:\n";
+              for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
+                Value *incoming = phi->getIncomingValue(i);
+                llvm::errs() << "\t\t\tINCOMING VALUE: " << *incoming << "\n";
+              }
+              auto *name = phi->getIncomingValue(0);
+              if (Constant *nameConst = dyn_cast<Constant>(name)) {
+                if (ConstantDataArray *dataArray =
+                        dyn_cast<ConstantDataArray>(nameConst->getOperand(0))) {
+                  if (dataArray->isString()) {
+                    StringRef structNameRef = dataArray->getAsString();
+                    std::string structName =
+                        structNameRef.str().substr(0, structNameRef.size() - 1);
+                    llvm::errs() << "\t\t[IR-DBG] PHI NODE INCOMING VALUE IS "
+                                    "STRING CONST: "
+                                 << structName << "\n";
+                    if (allocType = StructType::getTypeByName(
+                            Callee->getContext(), structName)) {
+                      llvm::errs()
+                          << "\t\t[IR] LAST PARAM IS STRUCT: " << structName
+                          << "\n";
+                    }
+                  }
+                }
+              }
+            } else
+              assert(false &&
+                     "Expected last argument to be a string constant in "
+                     "processNewOperatorCalls");
+          }
         }
       } // if constant last arg
-      if (allocType) {
-        bool isUnion = (structName.find("union") != std::string::npos);
-        if (isUnion) {
-          llvm::errs() << "\t\t[IR] UNION TYPE , SKIP: " << structName << "\n";
-          return false; // we are not rewriting here!!!!
-        }
-        // auto NewCI = rewriteCall(I, allocType, nullptr, demangledName, M);
-        // NOTE: dead argument elimination is doing us a favor, ignore the above
-        { // do the tagging
-          if (allocType && allocType->isStructTy()) {
-            // DO THE TAGGING
-            llvm::errs() << "[FieldArmor] TYPE TO TAG: "
-                         << allocType->getStructName() << "\n";
-            Instruction *next = I->getNextNonDebugInstruction();
-            IRBuilder<> IRB(I);
+      errs() << "\t\t[IR] REWRITING CALL TO NEW OPERATOR: " << *I << "\n";
+      bool needsOffsetForCookie = false;
+      CallBase *NewCI = rewriteCall(I, allocType, nullptr, demangledName, M,
+                                    &needsOffsetForCookie);
+      errs() << "\t\t[IR] REWRITING OK: " << *NewCI << "\n";
+      if (needsOffsetForCookie) {
+        errs() << "[IR] NEW OPERATOR CALL WITH COOKIE, will offset tagging by "
+                  "8 bytes\n";
+      }
 
-            if (next)
-              IRB.SetInsertPoint(next);
-            else {
-              if (InvokeInst *II = dyn_cast<InvokeInst>(I)) {
-                IRB.SetInsertPoint(II->getNormalDest()->getFirstNonPHI());
-              } else
-                assert(false && "Expected a call or invoke instruction in "
-                                "processNewOperatorCalls");
-            }
+      bool isUnion = (!structName.empty() &&
+                      structName.find("union") != std::string::npos);
+      if (isUnion) {
+        llvm::errs() << "\t\t[IR] UNION TYPE , SKIP: " << structName << "\n";
+        return true; // we are not rewriting here!!!!
+      }
 
-            // TODO: check on array size post FP
-            Value *ArraySize =
-                GetArraySize(I, demangledName, M, allocType, IRB);
-            assert(ArraySize != nullptr &&
-                   "Failed to compute array size for typed allocation");
-            TypeSize tSize = M.getDataLayout().getTypeAllocSize(allocType);
-            auto Int64Ty = Type::getInt64Ty(M.getContext());
-            PointerType *PtrTy = PointerType::getUnqual(M.getContext());
-            FunctionCallee fieldarmor_tag_memory = M.getOrInsertFunction(
-                "_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy, PtrTy, PtrTy,
-                Int64Ty, Int64Ty);
-            assert(fieldarmor_tag_memory &&
-                   "Expected to find or insert fieldarmor_tag_memory function");
-            auto *TagVector = retrieveTV(allocType, M);
-            assert(TagVector &&
-                   "Failed to retrieve or create tag vector for struct type");
+      { // do the tagging
+        if (allocType && allocType->isStructTy()) {
+          llvm::errs() << "[FieldArmor] TYPE TO TAG: "
+                       << allocType->getStructName() << "\n";
+          Instruction *InsertPt = nullptr;
 
-            // TODO: fix alignment, it's fucked up when allocating C++ object arrays
-            // TODO: dump params at runtime
-            IRB.CreateCall(fieldarmor_tag_memory,
-                           {IRB.CreatePointerCast(I, PtrTy),
-                            IRB.CreatePointerCast(TagVector, PtrTy),
-                            ConstantInt::get(Int64Ty, tSize), ArraySize});
-            llvm::errs() << "[FieldArmor] DYNAMIC TAGGING SUCCESS on new:\n\t"
-                         << *I
-                         << "\n\t\tstruct type: " << allocType->getStructName()
-                         << "\n\t\tARRAY SIZE: " << *ArraySize << "\n";
-            I->setName(I->getName() + ".tagged");
-            changed = true;
-          } // if allocType
-        } // do the tagging
-      } // if allocType
+          if (InvokeInst *Invoke = dyn_cast<InvokeInst>(NewCI)) {
+            BasicBlock *NormalDest = Invoke->getNormalDest();
+            if (NormalDest)
+              InsertPt = &NormalDest->front(); // insert at the beginning
+                                               // of the normal dest block
+            else
+              InsertPt = Invoke; // fallback to inserting after the invoke
+                                 // if no normal dest
+          } else
+            InsertPt =
+                NewCI->getNextNonDebugInstruction(); // insert right after
+                                                     // the new call
+          assert(InsertPt && "Failed to find insertion point for tagging after "
+                             "new operator call");
+          errs() << "\t\t[IR] INSERTION POINT FOR TAGGING: ";
+          InsertPt->dump();
+          IRBuilder<> IRB(InsertPt);
+
+          // TODO: check on array size post FP
+          Value *ArraySize =
+              GetArraySize(NewCI, demangledName, M, allocType, IRB);
+          assert(ArraySize != nullptr &&
+                 "Failed to compute array size for typed allocation");
+          TypeSize tSize = M.getDataLayout().getTypeAllocSize(allocType);
+          auto Int64Ty = Type::getInt64Ty(M.getContext());
+          PointerType *PtrTy = PointerType::getUnqual(M.getContext());
+          errs() << "\t\t[IR] HERE - ARRAY SIZE: " << *ArraySize << "\n";
+          FunctionCallee fieldarmor_tag_memory =
+              M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm",
+                                    PtrTy, PtrTy, PtrTy, Int64Ty, Int64Ty);
+          assert(fieldarmor_tag_memory &&
+                 "Expected to find or insert fieldarmor_tag_memory "
+                 "function");
+          auto *TagVector = retrieveTV(allocType, M);
+          assert(TagVector &&
+                 "Failed to retrieve or create tag vector for struct type");
+          Value *whereToTagFrom = NewCI;
+          bool isNewArray = demangledName.find("new[]") != std::string::npos;
+
+          // TODO: whereToTagFrom is the ptr to the first eleme of the
+          // array
+
+          if (isNewArray && needsOffsetForCookie) {
+            errs() << "\t\t[IR] NEW[] WITH COOKIE, OFFSETTING TAGGING POINTER BY 8 "
+                      "BYTES\n";
+            Value *Offset =
+                IRB.CreateGEP(IRB.getInt8Ty(), // element type: i8 (1 byte
+                                               // per index unit)
+                              NewCI,           // base pointer
+                              IRB.getInt64(8), // offset by 8 bytes
+                              "cookie_ptr");
+            whereToTagFrom = Offset;
+          }
+
+          IRB.CreateCall(fieldarmor_tag_memory,
+                         {IRB.CreatePointerCast(whereToTagFrom, PtrTy),
+                          IRB.CreatePointerCast(TagVector, PtrTy),
+                          ConstantInt::get(Int64Ty, tSize), ArraySize});
+          llvm::errs() << "[FieldArmor] DYNAMIC TAGGING SUCCESS on new:\n\t"
+                       << *NewCI
+                       << "\n\t\tstruct type: " << allocType->getStructName()
+                       << "\n\t\tARRAY SIZE: " << *ArraySize << "\n";
+          NewCI->setName(NewCI->getName() + ".tagged");
+          changed = true;
+        } // if allocType
+        else
+          return changed;
+      } // do the tagging
+      // } // if allocType
     } // it's operator new
     else
       assert(false && "Expected operator new call in processNewOperatorCalls");
@@ -786,7 +895,6 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
 } // processNewOperatorCalls
 
 // double check that there are no REALLOC,  MALLOC etc
-// TODO: bring back
 void doQuickCheck(CallBase *CI) {
   Value *V = CI->getCalledOperand()->stripPointerCasts();
   Function *Callee = dyn_cast<Function>(V);
@@ -803,12 +911,14 @@ void doQuickCheck(CallBase *CI) {
         // TODO: check if you can do something about this corner case
         // NOTE: "magic mallocs" appear when LLVM can infer the dst of an
         // indirect call and that is a malloc-like function.
+        // Q: can we catch all the mallocs that randomly appear?
         llvm::errs() << "[IR] MAGIC MALLOC ALERT : " << name
                      << " (demangled: " << demangledName << ")\n";
         CI->dump();
 
         llvm::errs() << "\tNumber of uses: " << CI->getNumUses() << "\n";
         if (CI->getNumUses() > 0) {
+          // I expect something newly created to have a lot of uses
           llvm::errs() << "\tUsers:\n";
           for (User *U : CI->users()) {
             llvm::errs() << "\t\t" << *U << "\n";
@@ -835,16 +945,13 @@ FSanRewriteFunctionCallsPass::run(Module &M, ModuleAnalysisManager &MAM) {
       continue;
     }
     // Collect calls first to avoid iterator invalidation
-    // SmallVector<CallBase *, 1000> typedMallocLikeToRewrite;
-    // SmallVector<CallBase *, 1000> typedNewOperatorToRewrite;
     std::set<CallBase *> typedMallocLikeToRewrite;
     std::set<CallBase *> typedNewOperatorToRewrite;
 
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         if (CallBase *CB = dyn_cast<CallBase>(&I)) {
-          // doQuickCheck(CB); // check that we did not miss this in FE
-          // TODO: bring back doQuickCheck
+          doQuickCheck(CB); // check that we did not miss this in FE
           if (isTypedMallocLike(CB)) {
             typedMallocLikeToRewrite.insert(CB);
           } // if isTypedMallocLike
@@ -859,20 +966,10 @@ FSanRewriteFunctionCallsPass::run(Module &M, ModuleAnalysisManager &MAM) {
     for (CallBase *CI : typedMallocLikeToRewrite) {
       changed |= RewriteCallToTypedAllocator(CI, M);
     }
-    // for (CallBase *CI : typedMallocLikeToRewrite) {
-    //   CI->eraseFromParent(); // TODO: check if this actually works! Some
-    //                          // function might be left there as deadcode if not
-    //                          // delete after. We dont want this dead code
-    //                          // because it can change memory layout and lead to
-    //                          // more memory consumption.
-    // }
 
     for (CallBase *CI : typedNewOperatorToRewrite) {
       changed |= processNewOperatorCalls(CI, M);
     }
-    // for (CallBase *CI : typedNewOperatorToRewrite) {
-    //   CI->eraseFromParent();
-    // }
   }
   return (changed ? PreservedAnalyses::none() : PreservedAnalyses::all());
 }
@@ -882,8 +979,8 @@ FSanRewriteFunctionCallsPass::run(Module &M, ModuleAnalysisManager &MAM) {
 llvm::PassPluginLibraryInfo getTypedAllocatorRewritePassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "FSanRewriteFunctionCallsPass",
           LLVM_VERSION_STRING, [](PassBuilder &PB) {
-            // Register as a module pass so we can call getOrInsertFunction on
-            // Module
+            // Register as a module pass so we can call
+            // getOrInsertFunction on Module
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
