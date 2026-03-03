@@ -351,7 +351,8 @@ private:
   Value *R_Mask_value = nullptr;
 
   void InstrumentGEP(GetElementPtrInst *GEPI);
-  void PreprocessGEP(GetElementPtrInst *GEPI);
+  StructType *getStructTypeFromDbgInfo(GlobalVariable *GV, int *numElements,
+                                       bool *isUnion);
   void InstrumentStoreOfFunctionArg(StoreInst *SI);
   Type *figureOutInheritance(const std::set<Type *> &structTypes);
 
@@ -467,7 +468,8 @@ private:
   ///   shadow = (mem >> Scale) + &__hwasan_shadow
   /// If `kTls`, then
   ///   extern char *__hwasan_tls ; // THIS IS USED BY DEFAULT @ale
-  ///   shadow = (mem>>Scale) + align_up(__hwasan_shadow, kShadowBaseAlignment)
+  ///   shadow = (mem>>Scale) + align_up(__hwasan_shadow,
+  ///   kShadowBaseAlignment)
   ///
   /// If WithFrameRecord is true, then __hwasan_tls will be used to access the
   /// ring buffer for storing stack allocations on targets that support it.
@@ -1566,13 +1568,17 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
 
     if (AllocaInst *AIcast = dyn_cast<AllocaInst>(AI)) {
       Type *allocatedType = AIcast->getAllocatedType();
-
+      // NOTE: SPEC 2017 does not have literals on stack.
       if (allocatedType->isArrayTy()) {
         auto elementType = allocatedType->getArrayElementType();
         if (elementType->isStructTy()) {
+          // 1D array
           StructType *ST_internal = dyn_cast<StructType>(elementType);
           if (ST_internal->isLiteral()) {
             LiteralStructs++;
+            errs()
+                << "[FieldArmor] STACK: Alloca of 1D array of literal structs "
+                << *(AI->getAllocatedType()) << "\n";
             continue;
           }
 
@@ -1588,6 +1594,8 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
             StructType *ST_internal_l2 = dyn_cast<StructType>(innerElementType);
             if (ST_internal_l2->isLiteral()) {
               LiteralStructs++;
+              errs() << "[FieldArmor] STACK: Alloca of 2D array of literal "
+                     << *(AI->getAllocatedType()) << "\n";
               continue;
             }
 
@@ -1595,8 +1603,9 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
               continue;
             }
           } // case: 2d array of structs
-
-          else {
+          else if (innerElementType->isArrayTy()) {
+            continue; // TODO
+          } else {
             continue;
           } // case: 2d array of scalars or other types I don't care about atm
 
@@ -1608,10 +1617,14 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
       } // case : alloca of ARRAY
 
       if (!allocatedType->isStructTy()) {
+        // not an array, not a struct
         continue;
       } else {
+        // it's a struct
         StructType *ST = dyn_cast<StructType>(allocatedType);
         if (ST->isLiteral()) {
+          errs() << "[FieldArmor] STACK: Alloca of literal struct "
+                 << *(AI->getAllocatedType()) << "\n";
           LiteralStructs++;
           continue;
         } else if (ST->getName().str().find("union.") == 0) {
@@ -3586,6 +3599,22 @@ void HWAddressSanitizer::InstrumentArithmetic(BinaryOperator *CI) {
 
 } // InstrumentArithmetic
 
+std::string computeHashFromElems(ArrayRef<Type *> Elems) {
+  std::string hashInput;
+  for (auto *elem : Elems) {
+    std::string typeStr;
+    raw_string_ostream rso(typeStr);
+    elem->print(rso);
+    hashInput += rso.str() + ";";
+  }
+  // Compute a simple hash (e.g., using std::hash)
+  std::hash<std::string> hasher;
+  size_t hashValue = hasher(hashInput);
+  // Convert the hash value to a string
+  std::string hashStr = itostr(hashValue);
+  return hashStr;
+}
+
 void HWAddressSanitizer::InstrumentPtrToInt(PtrToIntInst *PI) {
   // TODO: ptrtoint on global is constexpr!!!!
   // TODO: instrument only if they are flowing into arithmetic instructions?
@@ -3622,13 +3651,102 @@ void HWAddressSanitizer::InstrumentPtrToInt(PtrToIntInst *PI) {
   // Q: do I still need to replace the uses?
 }
 
+StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
+                                                         int *numElements,
+                                                         bool *isUnion) {
+  auto *MDNode = GV->getMetadata("dbg");
+  int depth = 0;
+  if (!MDNode) {
+    // this is very uncommon on 502
+    errs() << "[FieldArmor] No debug metadata for GV " << GV->getName() << "\n";
+    return nullptr;
+  }
+  errs() << "[FieldArmor] DBG INFO FOR GV " << GV->getName() << "\n";
+  DIGlobalVariableExpression *DIE =
+      dyn_cast<DIGlobalVariableExpression>(MDNode);
+
+  auto *di_type = DIE->getVariable()->getType();
+  DICompositeType *arrayType = dyn_cast<DICompositeType>(di_type), *cur = nullptr;
+  
+  // TODO: also N of elements
+  while (arrayType && arrayType->getTag() == dwarf::DW_TAG_array_type) {
+    arrayType->dump();
+    depth++;
+    cur = arrayType; // this will be set to the last type that is not array
+    arrayType = dyn_cast<DICompositeType>(arrayType->getBaseType());
+  }
+  // if arrayType is null, we reached a DerivedType or a StructType
+  // if arrayType is still set, it's an array of some other composite type?
+
+  errs() << "EOF parsing of DBG INFO for GV " << GV->getName() << "\n";
+  if(cur){
+    errs() << "DIC: \n";
+    cur->dump();
+    cur->getBaseType()->dump();
+  }
+  
+  std::string structName = "";
+  StructType *ret = nullptr;
+  {
+    auto * DerTy = cur? dyn_cast<DIDerivedType>(cur->getBaseType()) : dyn_cast<DIDerivedType>(di_type);
+    if (DerTy) {
+      auto *baseType = DerTy->getBaseType();
+      if (baseType) {
+        if (baseType->getTag() == dwarf::DW_TAG_structure_type) {
+          std::string typeName = baseType->getName().str();
+          errs() << "\t\tSTRUCT TYPE : " << typeName << "\n";
+          ret = StructType::getTypeByName(*C, "struct." + typeName);
+          if (ret)
+            ret->dump();
+          else
+            errs() << "\t\t\tNO TYPE: " << typeName << "\n";
+          /**
+           * Structs can be defined and instantiated on the fly
+           * EXAMPLE of a corner case:
+           * static const struct {
+           *   unsigned char flags;
+           *   unsigned char flags;
+           *   unsigned char combine;
+           *   unsigned short end;
+           * } ucnranges[] = {
+           */
+
+        } else if (baseType->getTag() == dwarf::DW_TAG_union_type) {
+          errs() << "\t\t UNION TYPE: " << baseType->getName().str() << "\n";
+        } else if (baseType->getTag() == dwarf::DW_TAG_typedef) {
+          // resolve the typedef, dump the type
+          auto *derived = dyn_cast<DIDerivedType>(baseType);
+          auto bt = derived->getBaseType();
+          errs() << "\t\tBASE TYPE (TYPEDEF): ";
+          bt->dump();
+          if (bt->getTag() == dwarf::DW_TAG_structure_type) {
+            std::string typeName = bt->getName().str();
+            errs() << "\t\tSTRUCT TYPE (TYPEDEF): " << typeName << "\n";
+            ret = StructType::getTypeByName(*C, "struct." + typeName);
+            if (ret)
+              ret->dump();
+            else
+              errs() << "\t\t\tNO TYPE: " << typeName << "\n";
+          } else if (bt->getTag() == dwarf::DW_TAG_union_type) {
+            errs() << "\t\t UNION TYPE (TYPEDEF): " << bt->getName().str()
+                   << "\n";
+          }
+        }
+      }
+    }
+  }
+  errs() << "END getStructTypeFromDbgInfo for GV " << GV->getName()
+         << ", DEPTH: " << depth << "\n";
+  return ret;
+}
+
 /** Only expect structs, arrays of structs, matrices of structs */
 void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   Constant *Initializer = GV->getInitializer();
   Type *type = GV->getValueType();
   assert(type->isAggregateType() &&
          "[FieldArmor] Expected only aggregate types to be instrumented");
-
+  StructType *TYPE = nullptr;
   bool isStruct = type->isStructTy();
   bool isArrayOfStructs =
       type->isArrayTy() &&
@@ -3640,53 +3758,119 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       dyn_cast<ArrayType>(dyn_cast<ArrayType>(type)->getElementType())
           ->getElementType()
           ->isStructTy();
+  bool is3DMatrixOfStructs =
+      type->isArrayTy() &&
+      dyn_cast<ArrayType>(type)->getElementType()->isArrayTy() &&
+      dyn_cast<ArrayType>(dyn_cast<ArrayType>(type)->getElementType())
+          ->getElementType()
+          ->isArrayTy() &&
+      dyn_cast<ArrayType>(
+          dyn_cast<ArrayType>(dyn_cast<ArrayType>(type)->getElementType())
+              ->getElementType())
+          ->getElementType()
+          ->isStructTy();
 
-  if (!(isStruct || isArrayOfStructs || isMatrixOfStructs)) {
-    // TODO: handle this mess!
+  if (!(isStruct || isArrayOfStructs || isMatrixOfStructs ||
+        is3DMatrixOfStructs)) {
+    // TODO: refactor
     errs() << "[FieldArmor - WARNING] Skipping global variable: "
-           << GV->getName() << "\n";
-    errs() << *type << "\n";
+           << GV->getName() << ", initializer type: " << *type << "\n";
     return;
   }
 
-  bool isUnion = false;
+  bool isUnion = false; // is union or aggregates of unions
   std::string struct_name = "";
 
   if (type->isStructTy()) {
     StructType *ST = dyn_cast<StructType>(type);
     if (ST->isLiteral()) {
-      LiteralStructs++;
-      return;
+      auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
+      if (tmp) {
+        ST = tmp;
+        errs() << "BOOM got NON NESTED struct type from dbg info: " << ST->getName()
+               << "\n";
+      } else
+        return;
     }
     isUnion = ST->getName().str().find("union.") != std::string::npos;
     struct_name = ST->getName().str();
+    TYPE = ST;
   }
 
   if (isArrayOfStructs) {
     Type *elementType = type->getArrayElementType();
     StructType *STA = dyn_cast<StructType>(elementType);
+
+    errs()
+        << "[FieldArmor] Instrumenting global variable with array of structs: "
+        << GV->getName() << "\n";
     if (STA->isLiteral()) {
-      LiteralStructs++;
-      return;
+      auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
+      if (tmp) {
+        STA = tmp;
+        errs() << "BOOM got struct type from dbg info: " << STA->getName()
+               << "\n";
+      }
+
+      else
+        return;
     }
     isUnion = STA->getName().str().find("union.") != std::string::npos;
     struct_name = STA->getName().str();
+    TYPE = STA;
   }
 
   if (isMatrixOfStructs) {
     Type *elementType = dyn_cast<ArrayType>(type)->getElementType();
     Type *structType = dyn_cast<ArrayType>(elementType)->getElementType();
     StructType *STM = dyn_cast<StructType>(structType);
+    errs()
+        << "[FieldArmor] Instrumenting global variable with matrix of structs: "
+        << GV->getName() << "\n";
     if (STM->isLiteral()) {
-      LiteralStructs++;
-      return;
+      auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
+      if (tmp) {
+        errs() << "BOOM got struct type from dbg info: " << STM->getName()
+               << "\n";
+        STM = tmp;
+      }
+
+      else
+        return;
     }
     isUnion = STM->getName().str().find("union.") != std::string::npos;
     struct_name = STM->getName().str();
+    TYPE = STM;
   }
 
-  if (isUnion)
+  if (is3DMatrixOfStructs) {
+    errs() << "[FieldArmor] Instrumenting global 3D array of structs: "
+           << GV->getName() << "\n";
+    Type *elementType = dyn_cast<ArrayType>(type)->getElementType();
+    Type *innerArrayType = dyn_cast<ArrayType>(elementType)->getElementType();
+    Type *structType = dyn_cast<ArrayType>(innerArrayType)->getElementType();
+    StructType *STM = dyn_cast<StructType>(structType);
+    if (STM->isLiteral()) {
+      auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
+      if (tmp) {
+        STM = tmp;
+        errs() << "BOOM got struct type from dbg info: " << STM->getName()
+               << "\n";
+      }
+
+      else
+        return;
+    }
+    isUnion = STM->getName().str().find("union.") != std::string::npos;
+    struct_name = STM->getName().str();
+    TYPE = STM;
+  }
+
+  if (isUnion) {
+    errs() << "[FieldArmor] Skipping union/aggregate of unions GV: "
+           << GV->getName() << "\n";
     return;
+  }
 
   uint64_t SizeInBytes =
       M.getDataLayout().getTypeAllocSize(Initializer->getType());
@@ -3710,11 +3894,11 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   // being incorrectly ICF'd with an uninstrumented (i.e. tag 0) global that
   // happened to have the short granule tag in the last byte.
   NewGV->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
-  // NOTE: the new global is actually the symbol that gets loaded on each use
-  // of the former global
+  // NOTE: the new global is actually the symbol that gets loaded on each
+  // use of the former global
 
-  // NOTE: dont set tag vector here, do it once and for all in constructor and
-  // only reference it here
+  // NOTE: dont set tag vector here, do it once and for all in constructor
+  // and only reference it here
 
   auto *DescriptorTy = StructType::get(
       Int32Ty, Int32Ty, Int32Ty,
@@ -3742,6 +3926,9 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
         M.getGlobalVariable(struct_name + ".fieldarmor.tagvec", true);
 
     if (TagVector == nullptr) {
+      // TODO: create and then fail if still no TV
+      createTagVector(TYPE);
+      TagVector = M.getGlobalVariable(struct_name + ".fieldarmor.tagvec", true);
       // NOTE: this fails for arrays of pairs
       errs() << "[FieldArmor] Error: Tag vector global not found for struct: "
              << struct_name << "\n";
@@ -3792,6 +3979,23 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
         arraySize =
             ConstantInt::get(Int32Ty, outerArrayType->getNumElements() *
                                           innerArrayType->getNumElements());
+      } else if (is3DMatrixOfStructs) {
+        auto outerArrayType = dyn_cast<ArrayType>(type);
+        auto middleArrayType =
+            dyn_cast<ArrayType>(outerArrayType->getElementType());
+        auto innerArrayType =
+            dyn_cast<ArrayType>(middleArrayType->getElementType());
+        assert(outerArrayType &&
+               "Outer array type must be valid for 3D matrix of structs.");
+        assert(middleArrayType &&
+               "Middle array type must be valid for 3D matrix of structs.");
+        assert(innerArrayType &&
+               "Inner array type must be valid for 3D matrix of structs.");
+
+        arraySize =
+            ConstantInt::get(Int32Ty, outerArrayType->getNumElements() *
+                                          middleArrayType->getNumElements() *
+                                          innerArrayType->getNumElements());
       } else {
         auto arrayType = dyn_cast<ArrayType>(type);
         arraySize = ConstantInt::get(Int32Ty, arrayType->getNumElements());
@@ -3813,9 +4017,9 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   // uint8_t Tag = 0b10000000U;
   uint8_t Tag = RPTag; // global tags must be handled carefully, the linker does
                        // not know how to relocate it if the MSB is set!!!
-  // in the asm, this gets evaluated to 2^^32. The linker, subsequently, does
-  // the relocation magic and replaces that with something else like the thing
-  // down here
+  // in the asm, this gets evaluated to 2^^32. The linker, subsequently,
+  // does the relocation magic and replaces that with something else like
+  // the thing down here
   Constant *Aliasee = ConstantExpr::getIntToPtr(
       ConstantExpr::getAdd(
           ConstantExpr::getPtrToInt(NewGV, Int64Ty),
@@ -3869,22 +4073,24 @@ void HWAddressSanitizer::instrumentGlobals() {
             dyn_cast<ArrayType>(GV.getValueType()->getArrayElementType());
         if (!elemArrayType->getElementType()->isStructTy()) {
           // skipping 3d array
-          errs() << "[FSan] global variable (3D array): "
-                 << GV.getName() << "\n";
+          errs() << "[FSan] global variable (3D array): " << GV.getName()
+                 << "\n";
           // continue; // TODO: no longer skip, correctly engineer
         } // arrays of arrays of something other than structs
         else if (elemArrayType->getElementType()->isStructTy()) {
-          bool isLiteral = dyn_cast<StructType>(elemArrayType->getElementType())
-                               ->isLiteral();
-          if (isLiteral)
-            LiteralStructs++;
+          // bool isLiteral =
+          // dyn_cast<StructType>(elemArrayType->getElementType())
+          //                      ->isLiteral();
+          // if (isLiteral)
+          //   LiteralStructs++;
           bool isUnion =
-              isLiteral ? true
-                        : dyn_cast<StructType>(elemArrayType->getElementType())
-                                  ->getName()
-                                  .str()
-                                  .find("union.") == 0;
-          if (isUnion || isLiteral) {
+              // isLiteral ? true
+              // :
+              dyn_cast<StructType>(elemArrayType->getElementType())
+                  ->getName()
+                  .str()
+                  .find("union.") == 0;
+          if (isUnion) { // || isLiteral) {
             continue;
           }
         } // if array of arrays of structs
@@ -3981,7 +4187,8 @@ void HWAddressSanitizer::ShadowMapping::init(Triple &TargetTriple,
 
   // // Tune for the target.
   // if (TargetTriple.isOSFuchsia()) {
-  //   // Fuchsia is always PIE, which means that the beginning of the address
+  //   // Fuchsia is always PIE, which means that the beginning of the
+  //   address
   //   // space is always available.
   //   SetFixed(0);
   // } else
@@ -4013,16 +4220,19 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
   std::string TagVecName = t->getStructName().str() + ".fieldarmor.tagvec";
   auto *TagVec = M.getGlobalVariable(TagVecName, true);
   if (TagVec) {
-    errs() << "[FieldArmor] Tag vector " << TagVecName
-           << " already exists, skipping creation.\n";
+    // errs() << "[FieldArmor] Tag vector " << TagVecName
+    //        << " already exists, skipping creation.\n";
     return;
   }
   auto size = M.getDataLayout().getTypeAllocSize(t);
 
   u_int8_t *tags = nullptr;
   bool isLiteral = t->isLiteral();
-  if (isLiteral)
+  if (isLiteral) {
     LiteralStructs++;
+    errs() << "[FieldArmor] StructType " << *t << " is literal!\n";
+  }
+
   bool isUnion =
       !isLiteral && t->getName().str().find("union.") != std::string::npos;
 
@@ -4053,22 +4263,23 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
 
 void HWAddressSanitizer::createTagVectors() {
   auto identifiedStructTypes = M.getIdentifiedStructTypes();
-  // for (auto t : identifiedStructTypes)
-  //   errs() << "[FieldArmor] Identified StructType: " << *t << "\n";
+  for (auto t : identifiedStructTypes)
+    // errs() << "[FieldArmor] Identified StructType: " << *t << ", is literal "
+    //        << (t->isLiteral() ? "yes" : "no") << "\n";
 
-  for (auto t : identifiedStructTypes) {
-    StructType *ty = dyn_cast<StructType>(t);
-    // errs() << "[FieldArmor] Creating tag vector for StructType " << *t <<
-    // "\n";
-    /** NOTE: opaque types are not sized. */
-    if (!ty->isSized()) {
-      // Q: what is the solution to this?
-      errs() << "[FieldArmor] StructType " << *t << " is not sized!\n";
-      continue;
+    for (auto t : identifiedStructTypes) {
+      StructType *ty = dyn_cast<StructType>(t);
+      // errs() << "[FieldArmor] Creating tag vector for StructType " << *t <<
+      // "\n";
+      /** NOTE: opaque types are not sized. */
+      if (!ty->isSized()) {
+        // Q: what is the solution to this?
+        errs() << "[FieldArmor] StructType " << *t << " is not sized!\n";
+        continue;
+      }
+
+      createTagVector(t);
     }
-
-    createTagVector(t);
-  }
 }
 
 /** This method computes tags for aggregates of unions up to level 2
@@ -4206,9 +4417,9 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
             continue;
           }
 
-          // TODO: handle arrays of C++ classes. What happens if the wrong tag
-          // vector is used? E.g. base vs non-base? Using struct size should
-          // be fine though.
+          // TODO: handle arrays of C++ classes. What happens if the wrong
+          // tag vector is used? E.g. base vs non-base? Using struct size
+          // should be fine though.
 
           auto structName = structType->getStructName().str();
           auto tagVectorGlobal =
@@ -4277,7 +4488,8 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
               continue;
             Constant *tagVectorInit =
                 cast<Constant>(tagVectorGlobal->getInitializer());
-            // compute the total number of structs enclosed in this aggregate
+            // compute the total number of structs enclosed in this
+            // aggregate
             auto *L1arrayType = dyn_cast<ArrayType>(sonType);
             auto *L2arrayType =
                 dyn_cast<ArrayType>(L1arrayType->getElementType());

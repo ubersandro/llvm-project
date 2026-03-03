@@ -252,8 +252,8 @@ TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
                         dyn_cast<llvm::ConstantDataArray>(
                             name->getOperand(0))) {
                   if (dataArray->isString()) {
-                    llvm::errs() << "\t\tTYPE STR: "
-                                 << dataArray->getAsString() << "\n";
+                    // llvm::errs() << "\t\tTYPE STR: "
+                    //              << dataArray->getAsString() << "\n";
                     typeStrToStr = dataArray->getAsString().str().substr(0, dataArray->getAsString().size() - 1);
                   }
                 }

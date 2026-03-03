@@ -496,6 +496,7 @@ GlobalVariable *retrieveTV(StructType *t, Module &M) {
   bool isUnion =
       !isLiteral && t->getName().str().find("union.") != std::string::npos;
 
+  // TODO: do literals exist in this case? I think they are never on the heap!
   if (isLiteral || isUnion) {
     tags = new uint8_t[size];
     memset(tags, (unsigned char)0x00, size);
@@ -858,7 +859,8 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
           // array
 
           if (isNewArray && needsOffsetForCookie) {
-            errs() << "\t\t[IR] NEW[] WITH COOKIE, OFFSETTING TAGGING POINTER BY 8 "
+            errs() << "\t\t[IR] NEW[] WITH COOKIE, OFFSETTING TAGGING POINTER "
+                      "BY 8 "
                       "BYTES\n";
             Value *Offset =
                 IRB.CreateGEP(IRB.getInt8Ty(), // element type: i8 (1 byte
