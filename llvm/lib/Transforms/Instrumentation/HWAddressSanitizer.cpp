@@ -413,7 +413,7 @@ private:
                                  Instruction *InsertBefore, DomTreeUpdater &DTU,
                                  LoopInfo *LI);
   bool ignoreMemIntrinsic(OptimizationRemarkEmitter &ORE, MemIntrinsic *MI);
-  void instrumentMemIntrinsic(MemIntrinsic *MI);
+  void instrumentMemIntrinsic(MemIntrinsic *MI, bool untag_first = false);
   bool instrumentMemAccess(InterestingMemoryOperand &O, DomTreeUpdater &DTU,
                            LoopInfo *LI, const DataLayout &DL);
   bool ignoreAccessWithoutRemark(Instruction *Inst, Value *Ptr);
@@ -1223,16 +1223,63 @@ bool HWAddressSanitizer::ignoreMemIntrinsic(OptimizationRemarkEmitter &ORE,
   return false;
 }
 
-void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
-  /** TODO: just instrument intrinsics that operate on non-root ptrs. Ideally,
-   * we want to start catching memcpys on pointers to fields that overwrite the
-   * whole struct or parts of it. */
+void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI,
+                                                bool untag_first) {
   IRBuilder<> IRB(MI);
-
   if (isa<MemTransferInst>(MI)) { /*memcpy, memmove*/
+    auto arg0 = MI->getOperand(0);
+    auto arg1 = MI->getOperand(1);
+    bool arg0isStructField = dyn_cast<GetElementPtrInst>(arg0);
+    bool arg1isStructField = dyn_cast<GetElementPtrInst>(arg1);
+
+    auto sizeofthecopy = IRB.CreateIntCast(MI->getOperand(2), IntptrTy, false);
+    if (arg0isStructField || arg1isStructField) {
+      if (ConstantInt *CI = dyn_cast<ConstantInt>(sizeofthecopy)) {
+        uint64_t copySize = CI->getZExtValue();
+        uint64_t structFieldSize = -1;
+        if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(arg0)) {
+          if (StructType *structTy =
+                  dyn_cast<StructType>(GEP->getSourceElementType())) {
+            auto structLayout = M.getDataLayout().getStructLayout(structTy);
+            auto noperands = GEP->getNumOperands();
+
+            if (noperands >= 3) {
+              int64_t fieldIndex =
+                  dyn_cast<ConstantInt>(GEP->getOperand(2))->getZExtValue();
+              if (fieldIndex < 0)
+                errs() << "[FieldArmor] DBG: negative field index in GEP\n";
+              else if (fieldIndex + 1 < structTy->getNumElements())
+                structFieldSize =
+                    structLayout->getElementOffset(fieldIndex + 1) -
+                    structLayout->getElementOffset(fieldIndex);
+              else
+                structFieldSize = structLayout->getSizeInBytes() -
+                                  structLayout->getElementOffset(fieldIndex);
+            }
+          }
+        }
+        errs() << "[FieldArmor] Copy size: " << copySize
+               << ", Struct field size: " << structFieldSize << "\n";
+        if (structFieldSize > 0 && copySize > structFieldSize) {
+          errs() << "[FieldArmor] WARNING: memcpy violates the C std!\n";
+          MI->dump();
+          untag_first = true;
+        }
+      } // if constant size
+    }
+
+    if (untag_first) {
+      auto arg0long = untagPointer(IRB, IRB.CreatePointerCast(arg0, IntptrTy));
+      auto arg1long = untagPointer(IRB, IRB.CreatePointerCast(arg1, IntptrTy));
+      arg0 = IRB.CreateIntToPtr(arg0long, arg0->getType());
+      arg0->setName("untagged_dest");
+      arg1 = IRB.CreateIntToPtr(arg1long, arg1->getType());
+      arg1->setName("untagged_src");
+      errs() << "[FieldArmor] Untagging memcpy/memmove arguments\n";
+    }
+
     SmallVector<Value *, 4> Args{
-        MI->getOperand(0), MI->getOperand(1),
-        IRB.CreateIntCast(MI->getOperand(2), IntptrTy, false)};
+        arg0, arg1, IRB.CreateIntCast(MI->getOperand(2), IntptrTy, false)};
 
     if (UseMatchAllCallback)
       Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
@@ -1260,7 +1307,8 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
   // If the pointer is statically known to be zero, the tag check will pass
   // since:
   // 1) it has a zero tag
-  // 2) the shadow memory corresponding to address 0 is initialized to zero and
+  // 2) the shadow memory corresponding to address 0 is initialized to zero
+  // and
   //    never updated.
   // We can therefore elide the tag check.
   llvm::KnownBits Known(DL.getPointerTypeSizeInBits(Addr->getType()));
@@ -1294,7 +1342,8 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
     IRB.CreateCall(HwasanMemoryAccessCallbackSized[O.IsWrite], Args);
   }
   untagPointerOperand(
-      O.getInsn(), Addr); // This is the right way of handling pointer operands
+      O.getInsn(),
+      Addr); // This is the right way of handling pointer operands
   NumInstrumentedMemAccesses++;
   return true;
 }
@@ -1332,7 +1381,8 @@ Value *HWAddressSanitizer::ApplyRLT(IRBuilder<> &IRB, Instruction *AI,
 
 void HWAddressSanitizer::untagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
                                      const DataLayout &DL) {
-  /** Apply tag 0 to the previously tagged memory, immaterially of the type. */
+  /** Apply tag 0 to the previously tagged memory, immaterially of the type.
+   */
   FunctionCallee fieldarmor_tag_memory =
       M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy,
                             PtrTy, PtrTy, Int64Ty, Int64Ty);
@@ -1523,12 +1573,14 @@ bool HWAddressSanitizer::instrumentLandingPads(
 //   if (fatherType->isStructTy()) {
 //     StructType *ST = dyn_cast<StructType>(fatherType);
 //     if (!ST->isLiteral())
-//       // return (ST->getName().str().find("union.") != std::string::npos) ||
+//       // return (ST->getName().str().find("union.") != std::string::npos)
+//       ||
 //       //        (ST->getName().str().find("std::") != std::string::npos);
 //       // NOTE: the above introduces FPs in some benchmarks while fixing
 //       others return (ST->getName().str().find("class.std::") !=
 //       std::string::npos ||
-//               ST->getName().str().find("struct.std::") != std::string::npos);
+//               ST->getName().str().find("struct.std::") !=
+//               std::string::npos);
 //     // NOTE: assuming std types are safe just because are in the std lib is
 //     bad.
 //     // They are (mis)used all over SPEC benchmarks.
@@ -1541,7 +1593,8 @@ bool HWAddressSanitizer::instrumentLandingPads(
 
 //     StructType *ST = dyn_cast<StructType>(t);
 //     if (!ST->isLiteral())
-//       // return (ST->getName().str().find("union.") != std::string::npos) ||
+//       // return (ST->getName().str().find("union.") != std::string::npos)
+//       ||
 //       //        (ST->getName().str().find("std::") != std::string::npos) ||
 //       //        (ST->getName().str().find("int2type") != std::string::npos)
 //       ||
@@ -1576,9 +1629,9 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
           StructType *ST_internal = dyn_cast<StructType>(elementType);
           if (ST_internal->isLiteral()) {
             LiteralStructs++;
-            errs()
-                << "[FieldArmor] STACK: Alloca of 1D array of literal structs "
-                << *(AI->getAllocatedType()) << "\n";
+            errs() << "[FieldArmor] STACK: Alloca of 1D array of literal "
+                      "structs "
+                   << *(AI->getAllocatedType()) << "\n";
             continue;
           }
 
@@ -1635,8 +1688,8 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     else
       assert(false && "Allocas must be AllocaInsts");
 
-    // AT THIS POINT, IT'S EITHER A STRUCT, A 1d ARRAY OF STRUCTS, OR A 2d ARRAY
-    // OF STRUCTS
+    // AT THIS POINT, IT'S EITHER A STRUCT, A 1d ARRAY OF STRUCTS, OR A 2d
+    // ARRAY OF STRUCTS
     IRBuilder<> IRB(AI->getNextNonDebugInstruction());
     if (!Tag)
       Tag = getRPTag(IRB);
@@ -1906,13 +1959,16 @@ void HWAddressSanitizer::HandleMallocLikeCall(CallBase *CI) {
           //        function");
           // auto *TagVector = retrieveTV(allocType, M);
           // assert(TagVector &&
-          //        "Failed to retrieve or create tag vector for struct type");
+          //        "Failed to retrieve or create tag vector for struct
+          //        type");
           // IRB.CreateCall(fieldarmor_tag_memory,
           //                {IRB.CreatePointerCast(CI, PtrTy),
           //                 IRB.CreatePointerCast(TagVector, PtrTy),
           //                 ConstantInt::get(Int64Ty, tSize), ArraySize});
-          // llvm::errs() << "[FieldArmor] DYNAMIC TAGGING SUCCESS:\n\t" << *CI
-          //              << "\n\t\tstruct type: " << allocType->getStructName()
+          // llvm::errs() << "[FieldArmor] DYNAMIC TAGGING SUCCESS:\n\t" <<
+          // *CI
+          //              << "\n\t\tstruct type: " <<
+          //              allocType->getStructName()
           //              << "\n\t\tARRAY SIZE: " << *ArraySize << "\n";
           // CI->setName(CI->getName() + ".tagged");
         } // if allocType and not union
@@ -2063,6 +2119,50 @@ void HWAddressSanitizer::HandleNewCall(CallInst *CI) {
   }
 } // HandleNewCall
 
+bool functionIsCopyConst(Function &F) {
+  // same name as the namespace
+  // taking reference/ptr to same type as the namespace
+  auto name = F.getName();
+  auto demangledName = demangle(name.str());
+  auto methodName = demangledName.substr(demangledName.rfind("::") + 2);
+  methodName = methodName.substr(0, methodName.find("("));
+  errs() << "[DBG] CHECKING IF CPY CONST: " << demangledName << "\n";
+  auto nsname = demangledName.substr(0, demangledName.find("::"));
+  if (nsname == methodName) {
+    // check on parameters
+    errs() << "[DBG] METHOD NAME: " << methodName
+           << ", NAMESPACE NAME: " << nsname << "\n";
+    auto params = demangledName.substr(demangledName.find("(") + 1);
+    params = params.substr(0, params.find(")"));
+    errs() << "[DBG] PARAMS: " << params << "\n";
+    if (params.find(nsname + " const&") != std::string::npos ||
+        params.find(nsname + " const *") != std::string::npos) {
+      errs() << "[DBG] FUNCTION " << demangledName
+             << " IS A COPY CONSTRUCTOR, SKIPPING MEMINTRINSIC "
+                "INSTRUMENTATION\n";
+      return true;
+    }
+  }
+  // NOTE: this does not work when inlined!!!!
+  // TODO: patch FE to emit something with a name that I can use?
+  else if (methodName == "operator=") {
+    // check on parameters
+    errs() << "[DBG] METHOD NAME: " << methodName
+           << ", NAMESPACE NAME: " << nsname << "\n";
+    auto params = demangledName.substr(demangledName.find("(") + 1);
+    params = params.substr(0, params.find(")"));
+    errs() << "[DBG] PARAMS: " << params << "\n";
+    if (params.find(nsname + "const&") != std::string::npos ||
+        params.find(nsname + "const *") != std::string::npos) {
+      errs() << "[DBG] FUNCTION " << demangledName
+             << " IS AN OPERATOR=, SKIPPING MEMINTRINSIC INSTRUMENTATION\n";
+      return true;
+    }
+  }
+
+  return false;
+}
+
 void HWAddressSanitizer::sanitizeFunction(Function &F,
                                           FunctionAnalysisManager &FAM) {
   if (&F == HwasanCtorFunction)
@@ -2113,6 +2213,9 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
 
   memtag::StackInfoBuilder SIB(SSI, DEBUG_TYPE);
+  // bool isCopyConst = functionIsCopyConst(F);
+  bool isCopyConst = false; // function-level guard
+  // NOTE: this also entails operator= and similar!
   for (auto &Inst : instructions(F)) {
 
     if (InstrumentStack) {
@@ -2124,8 +2227,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
     // TODO: filter out something
     // TODO: I am ignoring ORE at the moment, I think it's fine to have the
-    // RemarkEmitter emit info in SIB, just double check that it does not break
-    // stuff.
+    // RemarkEmitter emit info in SIB, just double check that it does not
+    // break stuff.
     getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
 
     /* NOTE: ideally, one wants to instrument memcpy/memmove/memset only when
@@ -2144,8 +2247,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     // TODO: sub between ptrs has weird result
     // TODO: compiler can decide to statically fold some arithmetics to wrong
     // result -> InstCombiner does this, replacing the wrong value
-    // TODO: compare how many typed allocations you see here and how many at the
-    // end
+    // TODO: compare how many typed allocations you see here and how many at
+    // the end
 
     // COLLECT CALLS TO TYPED ALLOCATION FUNCTION FOR MALLOC-LIKE CALLS
     // if (CallBase *CI = dyn_cast<CallInst>(&Inst)) {
@@ -2200,8 +2303,9 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   //   CallInst *CI = PAIR.first;
   //   RewriteCallToTypedAllocator(CI);
   // }
-  // NOTE: call rewriting was moved to the very end of the optimization pipeline
-  // for double checking that no new mallocs/new pop out for some reason
+  // NOTE: call rewriting was moved to the very end of the optimization
+  // pipeline for double checking that no new mallocs/new pop out for some
+  // reason
 
   // TODO : handle ptr subs when at least 1 op results from a ptr to int
   if (!SInfo.AllocasToInstrument.empty()) {
@@ -2226,7 +2330,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   if (ClInstrumentMemIntrinsics && !IntrinToInstrument.empty()) {
     for (auto *Inst : IntrinToInstrument)
-      instrumentMemIntrinsic(Inst);
+      instrumentMemIntrinsic(Inst, isCopyConst);
   }
 
   for (auto &GEPI : GEPsToInstrument) {
@@ -2248,16 +2352,15 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   // TODO: properly handle container-of macros
   // NOTE: container_of-like macros subtract ints to pointers. To preserve
-  // semantic, tag is removed so that the result is always untagged. This causes
-  // tag loss. However, FPs resulting from a non-root ptr used to access a
-  // struct are ruled out by default.
-  // NOTE: enabling this breaks 502 -> TODO: investigate more. It seems to be
-  // necessary for 520.
+  // semantic, tag is removed so that the result is always untagged. This
+  // causes tag loss. However, FPs resulting from a non-root ptr used to
+  // access a struct are ruled out by default. NOTE: enabling this breaks 502
+  // -> TODO: investigate more. It seems to be necessary for 520.
 
   /* NOTE: at O2, most arithmetic operations seem to be taken care by the
    * compiler. It folds constants in such a way that nothing is performed at
-   * runtime and that code is safe. E.g. compiling 500.perlbench_r at O0 causes
-   * an invalid malloc when size is computed using ptr arithm. */
+   * runtime and that code is safe. E.g. compiling 500.perlbench_r at O0
+   * causes an invalid malloc when size is computed using ptr arithm. */
   // for (auto &BO : ArithInstructions) {
   //   InstrumentArithmetic(BO);
   // }
@@ -2271,8 +2374,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   for (auto &Operand : OperandsToInstrument)
     instrumentMemAccess(Operand, DTU, LI, DL);
   DTU.flush();
-  /** NOTE: keeping the DomTree up-to-date might be necessary even for the above
-   * transformations. TODO: implement and test.*/
+  /** NOTE: keeping the DomTree up-to-date might be necessary even for the
+   * above transformations. TODO: implement and test.*/
 
   ShadowBase = nullptr;
 }
@@ -2319,8 +2422,8 @@ void HWAddressSanitizer::RewriteCallToTypedAllocator(CallBase *CI) {
         StringRef structNameRef = dataArray->getAsString();
         structName = structNameRef.str();
         if (structName.find("struct") != StringRef::npos) {
-          // struct name has a \00 at the end because it's stored as a C string,
-          // remove it
+          // struct name has a \00 at the end because it's stored as a C
+          // string, remove it
           structName = structName.substr(0, structName.size() - 1);
           allocType = StructType::getTypeByName(CI->getModule()->getContext(),
                                                 structName);
@@ -2560,7 +2663,8 @@ bool augmentstructTypesFromTypeSet(std::set<Type *> &structTypes,
   }
   // bool changed = (structTypes.size() - before) > 0;
   // if (changed)
-  //   errs() << "\t\t [FieldArmor] INTERESTING INFO: populated structTypes from
+  //   errs() << "\t\t [FieldArmor] INTERESTING INFO: populated structTypes
+  //   from
   //   "
   //             "TypeSet.\n";
   return false;
@@ -2632,9 +2736,9 @@ HWAddressSanitizer::figureOutInheritance(const std::set<Type *> &structTypes) {
       }
     } else {
       // not a struct, put it as is
-      errs()
-          << "[FieldArmor] WARNING: type is not a struct, skipping inheritance "
-             "analysis for type: ";
+      errs() << "[FieldArmor] WARNING: type is not a struct, skipping "
+                "inheritance "
+                "analysis for type: ";
       t->print(errs());
       errs() << "\n";
     }
@@ -2672,8 +2776,8 @@ HWAddressSanitizer::figureOutInheritance(const std::set<Type *> &structTypes) {
   return ret;
 }
 
-// TODO: patch Frontend to make sure Structs emerge even when they are only used
-// as i8
+// TODO: patch Frontend to make sure Structs emerge even when they are only
+// used as i8
 
 // TODO: handle xmalloc and xcalloc, these wrappers are simple
 // TODO: handle ConstExpr GEPs used as pointers in the StoreInsts
@@ -3296,8 +3400,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   // Value *fatherT = IRB.CreateAnd(fullFatherTag, T_Mask_value);
 
   // Value *fatherT = IRB.CreateLShr(
-  //     IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x0FLu << 56Lu)),
-  //     PointerTagShift);
+  //     IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x0FLu <<
+  //     56Lu)), PointerTagShift);
 
   // fatherT->setName("fatherT");
   std::string endResultName = "";
@@ -3666,8 +3770,9 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
       dyn_cast<DIGlobalVariableExpression>(MDNode);
 
   auto *di_type = DIE->getVariable()->getType();
-  DICompositeType *arrayType = dyn_cast<DICompositeType>(di_type), *cur = nullptr;
-  
+  DICompositeType *arrayType = dyn_cast<DICompositeType>(di_type),
+                  *cur = nullptr;
+
   // TODO: also N of elements
   while (arrayType && arrayType->getTag() == dwarf::DW_TAG_array_type) {
     arrayType->dump();
@@ -3679,16 +3784,17 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
   // if arrayType is still set, it's an array of some other composite type?
 
   errs() << "EOF parsing of DBG INFO for GV " << GV->getName() << "\n";
-  if(cur){
+  if (cur) {
     errs() << "DIC: \n";
     cur->dump();
     cur->getBaseType()->dump();
   }
-  
+
   std::string structName = "";
   StructType *ret = nullptr;
   {
-    auto * DerTy = cur? dyn_cast<DIDerivedType>(cur->getBaseType()) : dyn_cast<DIDerivedType>(di_type);
+    auto *DerTy = cur ? dyn_cast<DIDerivedType>(cur->getBaseType())
+                      : dyn_cast<DIDerivedType>(di_type);
     if (DerTy) {
       auto *baseType = DerTy->getBaseType();
       if (baseType) {
@@ -3787,8 +3893,8 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
       if (tmp) {
         ST = tmp;
-        errs() << "BOOM got NON NESTED struct type from dbg info: " << ST->getName()
-               << "\n";
+        errs() << "BOOM got NON NESTED struct type from dbg info: "
+               << ST->getName() << "\n";
       } else
         return;
     }
@@ -3801,9 +3907,9 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     Type *elementType = type->getArrayElementType();
     StructType *STA = dyn_cast<StructType>(elementType);
 
-    errs()
-        << "[FieldArmor] Instrumenting global variable with array of structs: "
-        << GV->getName() << "\n";
+    errs() << "[FieldArmor] Instrumenting global variable with array of "
+              "structs: "
+           << GV->getName() << "\n";
     if (STA->isLiteral()) {
       auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
       if (tmp) {
@@ -3824,9 +3930,9 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     Type *elementType = dyn_cast<ArrayType>(type)->getElementType();
     Type *structType = dyn_cast<ArrayType>(elementType)->getElementType();
     StructType *STM = dyn_cast<StructType>(structType);
-    errs()
-        << "[FieldArmor] Instrumenting global variable with matrix of structs: "
-        << GV->getName() << "\n";
+    errs() << "[FieldArmor] Instrumenting global variable with matrix of "
+              "structs: "
+           << GV->getName() << "\n";
     if (STM->isLiteral()) {
       auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
       if (tmp) {
@@ -4264,7 +4370,8 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
 void HWAddressSanitizer::createTagVectors() {
   auto identifiedStructTypes = M.getIdentifiedStructTypes();
   for (auto t : identifiedStructTypes)
-    // errs() << "[FieldArmor] Identified StructType: " << *t << ", is literal "
+    // errs() << "[FieldArmor] Identified StructType: " << *t << ", is literal
+    // "
     //        << (t->isLiteral() ? "yes" : "no") << "\n";
 
     for (auto t : identifiedStructTypes) {

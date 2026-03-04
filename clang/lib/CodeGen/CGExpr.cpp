@@ -6461,11 +6461,8 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
   RValue Call;
   // FSAN MALLOC
   auto CalleeDecl = dyn_cast_or_null<FunctionDecl>(TargetDecl);
-  bool enabled = true;
-  bool isMalloc = CalleeDecl && CalleeDecl->getIdentifier() &&
-                  (CalleeDecl->getName() == "malloc");
-
-  if (CalleeDecl && FSAN::isAllocFD(CalleeDecl) && enabled) {
+  bool enabled = SanOpts.has(SanitizerKind::HWAddress);
+  if (enabled && CalleeDecl && FSAN::isAllocFD(CalleeDecl)) {
     {
       llvm::errs() << "FE-DBG: Dumping original callee: ";
       CalleeType->dump();
@@ -6581,7 +6578,7 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
     Call = EmitCall(FnInfo, Callee, ReturnValue, Args, &LocalCallOrInvoke,
                     E == MustTailCall, E->getExprLoc());
 
-    FSAN::TagFromCallSite(E, *this, Call, Callee); // attach MD node to callsite
+    // FSAN::TagFromCallSite(E, *this, Call, Callee); // attach MD node to callsite
     // Generate function declaration DISuprogram in order to be used
     // in debug info about call sites.
     if (CGDebugInfo *DI = getDebugInfo()) {

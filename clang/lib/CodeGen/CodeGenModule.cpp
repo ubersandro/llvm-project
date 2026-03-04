@@ -557,13 +557,15 @@ CodeGenModule::CodeGenModule(ASTContext &C,
   if (!Context.getAuxTargetInfo())
     checkDataLayoutConsistency(Context.getTargetInfo(), LLVMContext, LangOpts);
   // FSAN: declare typed_allocation function
-  llvm::errs() << "CGM: " << Context.getTargetInfo().getTriple().str() << "\n";
+  // TODO: do only if sanitizer is active
+  // llvm::errs() << "CGM: " << Context.getTargetInfo().getTriple().str() << "\n";
   auto TypedAllocationFn = getModule().getOrInsertFunction(
       "typed_allocation", llvm::FunctionType::get(VoidPtrTy, {}, true));
   typedAllocFun = cast<llvm::Function>(TypedAllocationFn.getCallee());
   typedAllocFun->addRetAttr(
       llvm::Attribute::NoAlias); // tell the compiler the return value is fresh
-  llvm::errs() << "CGM: typed_allocation: " << *typedAllocFun << "\n";
+  // llvm::errs() << "CGM: typed_allocation: " << *typedAllocFun << "\n";
+  // FSAN
 }
 
 CodeGenModule::~CodeGenModule() {}

@@ -1339,11 +1339,10 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
   llvm::Constant *CalleePtr = CGF.CGM.GetAddrOfFunction(CalleeDecl);
   CGCallee Callee = CGCallee::forDirect(CalleePtr, GlobalDecl(CalleeDecl));
   // NOTE: a call is emitted also for placement new!
-  // if callee is new, replace it -> TODO
-  // Q: what happens if there is an extra arg for alignment?
+  // FSAN
   auto calleeName = CalleeDecl->getQualifiedNameAsString();
-  bool enableGuard = true;
-  if (enableGuard && calleeName.find("operator new") != std::string::npos) {
+  bool isEnabled = CGF.SanOpts.has(SanitizerKind::HWAddress); 
+  if (isEnabled && calleeName.find("operator new") != std::string::npos) {
     llvm::errs() << "\tEmitNewDeleteCall: Callee for NEW "
                  << (typeName.empty() ? "_EMPTY_" : typeName) << ": "
                  << *CalleeDecl << ", CalleeName: " << calleeName << " \n";
@@ -1367,6 +1366,7 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
       // set name for cookieR to "pinobiscotto"
     }
   } // if callee is new
+  // FSAN
 
   RValue RV = CGF.EmitCall(CGF.CGM.getTypes().arrangeFreeFunctionCall(
                                Args, CalleeType, /*ChainCall=*/false),
