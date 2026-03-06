@@ -728,8 +728,8 @@ void HWAddressSanitizer::initializeModule() {
 
   PointerTagShift = IsX86_64 ? 57 : 56;
   TagMaskByte = IsX86_64 ? 0x3F : 0xFF;
-  errs() << "[DBGDBG] PointerTagShift: " << PointerTagShift
-         << ", TagMaskByte: " << (unsigned)TagMaskByte << "\n";
+  // errs() << "[DBGDBG] PointerTagShift: " << PointerTagShift
+  //        << ", TagMaskByte: " << (unsigned)TagMaskByte << "\n";
   Mapping.init(TargetTriple, InstrumentWithCalls, CompileKernel);
 
   C = &(M.getContext());
@@ -1258,8 +1258,6 @@ void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI,
             }
           }
         }
-        errs() << "[FieldArmor] Copy size: " << copySize
-               << ", Struct field size: " << structFieldSize << "\n";
         if (structFieldSize > 0 && copySize > structFieldSize) {
           errs() << "[FieldArmor] WARNING: memcpy violates the C std!\n";
           MI->dump();
@@ -3775,7 +3773,7 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
 
   // TODO: also N of elements
   while (arrayType && arrayType->getTag() == dwarf::DW_TAG_array_type) {
-    arrayType->dump();
+    // arrayType->dump();
     depth++;
     cur = arrayType; // this will be set to the last type that is not array
     arrayType = dyn_cast<DICompositeType>(arrayType->getBaseType());
@@ -3786,8 +3784,8 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
   errs() << "EOF parsing of DBG INFO for GV " << GV->getName() << "\n";
   if (cur) {
     errs() << "DIC: \n";
-    cur->dump();
-    cur->getBaseType()->dump();
+    // cur->dump();
+    // cur->getBaseType()->dump();
   }
 
   std::string structName = "";
@@ -3843,13 +3841,23 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
   }
   errs() << "END getStructTypeFromDbgInfo for GV " << GV->getName()
          << ", DEPTH: " << depth << "\n";
+  if(numElements) *numElements = depth;
   return ret;
 }
 
 /** Only expect structs, arrays of structs, matrices of structs */
 void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
+  bool isGVArray = GV->getValueType()->isArrayTy();
+
   Constant *Initializer = GV->getInitializer();
-  Type *type = GV->getValueType();
+  Type *type = GV->getValueType(); // this is a lie!
+  // errs() << "[FieldArmor] Instrumenting global variable: " << GV->getName()
+  //        << ", type: " << *type << "\n";
+  std::string TypeStr;
+  raw_string_ostream RSO(TypeStr);
+  type->print(RSO);
+  // errs() << "[FieldArmor] Type: " << RSO.str() << ", isVector: " << type->isVectorTy() << ", isArray: " << type->isArrayTy() << ", isStruct: " << type->isStructTy() << ", is GVARRAY: " << isGVArray << "\n";
+
   assert(type->isAggregateType() &&
          "[FieldArmor] Expected only aggregate types to be instrumented");
   StructType *TYPE = nullptr;
@@ -3879,8 +3887,8 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   if (!(isStruct || isArrayOfStructs || isMatrixOfStructs ||
         is3DMatrixOfStructs)) {
     // TODO: refactor
-    errs() << "[FieldArmor - WARNING] Skipping global variable: "
-           << GV->getName() << ", initializer type: " << *type << "\n";
+    // errs() << "[FieldArmor - WARNING] Skipping global variable: "
+    //        << GV->getName() << ", initializer type: " << *type << "\n";
     return;
   }
 
@@ -3890,11 +3898,19 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   if (type->isStructTy()) {
     StructType *ST = dyn_cast<StructType>(type);
     if (ST->isLiteral()) {
-      auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
+      int depth = 0; 
+      // something is rotten in the state of denmark!
+      // DEPTH can be GT 1 because const struct arrays become structs of the same type!!!!
+      auto *tmp = getStructTypeFromDbgInfo(GV, &depth, &isUnion);
+
       if (tmp) {
         ST = tmp;
-        errs() << "BOOM got NON NESTED struct type from dbg info: "
-               << ST->getName() << "\n";
+        // errs() << "BOOM got NON NESTED struct type from dbg info: "
+        //        << ST->getName() << " BUT DEPTH " << depth << "\n";
+        if(depth!=0){
+          // errs() << "[FieldArmor - WARNING] SKIPPING THIS CRAP!\n"; 
+          return;
+        }
       } else
         return;
     }
@@ -3907,15 +3923,15 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     Type *elementType = type->getArrayElementType();
     StructType *STA = dyn_cast<StructType>(elementType);
 
-    errs() << "[FieldArmor] Instrumenting global variable with array of "
-              "structs: "
-           << GV->getName() << "\n";
+    // errs() << "[FieldArmor] Instrumenting global variable with array of "
+    //           "structs: "
+    //        << GV->getName() << "\n";
     if (STA->isLiteral()) {
       auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
       if (tmp) {
         STA = tmp;
-        errs() << "BOOM got struct type from dbg info: " << STA->getName()
-               << "\n";
+        // errs() << "BOOM got struct type from dbg info: " << STA->getName()
+        //        << "\n";
       }
 
       else
@@ -3930,14 +3946,14 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     Type *elementType = dyn_cast<ArrayType>(type)->getElementType();
     Type *structType = dyn_cast<ArrayType>(elementType)->getElementType();
     StructType *STM = dyn_cast<StructType>(structType);
-    errs() << "[FieldArmor] Instrumenting global variable with matrix of "
-              "structs: "
-           << GV->getName() << "\n";
+    // errs() << "[FieldArmor] Instrumenting global variable with matrix of "
+    //           "structs: "
+    //        << GV->getName() << "\n";
     if (STM->isLiteral()) {
       auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
       if (tmp) {
-        errs() << "BOOM got struct type from dbg info: " << STM->getName()
-               << "\n";
+        // errs() << "BOOM got struct type from dbg info: " << STM->getName()
+        //        << "\n";
         STM = tmp;
       }
 
@@ -3950,8 +3966,8 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   }
 
   if (is3DMatrixOfStructs) {
-    errs() << "[FieldArmor] Instrumenting global 3D array of structs: "
-           << GV->getName() << "\n";
+    // errs() << "[FieldArmor] Instrumenting global 3D array of structs: "
+    //        << GV->getName() << "\n";
     Type *elementType = dyn_cast<ArrayType>(type)->getElementType();
     Type *innerArrayType = dyn_cast<ArrayType>(elementType)->getElementType();
     Type *structType = dyn_cast<ArrayType>(innerArrayType)->getElementType();
@@ -3960,8 +3976,8 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
       if (tmp) {
         STM = tmp;
-        errs() << "BOOM got struct type from dbg info: " << STM->getName()
-               << "\n";
+        // errs() << "BOOM got struct type from dbg info: " << STM->getName()
+        //        << "\n";
       }
 
       else
@@ -3973,8 +3989,8 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   }
 
   if (isUnion) {
-    errs() << "[FieldArmor] Skipping union/aggregate of unions GV: "
-           << GV->getName() << "\n";
+    // errs() << "[FieldArmor] Skipping union/aggregate of unions GV: "
+    //        << GV->getName() << "\n";
     return;
   }
 
@@ -4036,26 +4052,26 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       createTagVector(TYPE);
       TagVector = M.getGlobalVariable(struct_name + ".fieldarmor.tagvec", true);
       // NOTE: this fails for arrays of pairs
-      errs() << "[FieldArmor] Error: Tag vector global not found for struct: "
-             << struct_name << "\n";
-      errs() << *GV << "\n";
-      errs() << *type << "\n";
-      errs() << "isStructTy()? " << type->isStructTy() << "\n";
-      errs() << "isArrayTy()? " << type->isArrayTy() << "\n";
-      errs() << "isMatrixOfStructs? " << isMatrixOfStructs << "\n";
-      errs() << "isArrayOfStructs? " << isArrayOfStructs << "\n";
-      errs() << "isLiteral? "
-             << (type->isStructTy() ? dyn_cast<StructType>(type)->isLiteral()
-                                    : false)
-             << "\n";
-      errs() << "isOpaque? "
-             << (type->isStructTy() ? dyn_cast<StructType>(type)->isOpaque()
-                                    : false)
-             << "\n";
-      errs() << "isSized?"
-             << (type->isStructTy() ? dyn_cast<StructType>(type)->isSized()
-                                    : false)
-             << "\n";
+      // errs() << "[FieldArmor] Error: Tag vector global not found for struct: "
+      //        << struct_name << "\n";
+      // errs() << *GV << "\n";
+      // errs() << *type << "\n";
+      // errs() << "isStructTy()? " << type->isStructTy() << "\n";
+      // errs() << "isArrayTy()? " << type->isArrayTy() << "\n";
+      // errs() << "isMatrixOfStructs? " << isMatrixOfStructs << "\n";
+      // errs() << "isArrayOfStructs? " << isArrayOfStructs << "\n";
+      // errs() << "isLiteral? "
+      //        << (type->isStructTy() ? dyn_cast<StructType>(type)->isLiteral()
+      //                               : false)
+      //        << "\n";
+      // errs() << "isOpaque? "
+      //        << (type->isStructTy() ? dyn_cast<StructType>(type)->isOpaque()
+      //                               : false)
+      //        << "\n";
+      // errs() << "isSized?"
+      //        << (type->isStructTy() ? dyn_cast<StructType>(type)->isSized()
+      //                               : false)
+      //        << "\n";
       assert(TagVector &&
              "Tag vector global must exist and be properly initialized.");
     }
@@ -4398,7 +4414,8 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
   // TODO: measure coverage of literal structs
   DataLayout DL = M.getDataLayout();
   u_int8_t *tags = new u_int8_t[DL.getTypeAllocSize(Ty)];
-  memset(tags, 0, DL.getTypeAllocSize(Ty));
+  // Ty->dump();
+  memset(tags, 0xff, DL.getTypeAllocSize(Ty)); // padding is gonna stay tagged!
 
   assert(tags && "Could not allocate tags array");
   std::deque<std::tuple<Type *, uint8_t, uint8_t, uint8_t, size_t>> AggQueue;
@@ -4637,6 +4654,17 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
             } // for each matrix of structs
             errs() << "TAGGED 3D MATRIX OF STRUCTS\n";
           } // 3D matrix of structs
+          else {
+            // 3+D array of something that is not a struct -> dont tag! Memset
+            // to 0!
+            // TODO! This could bring FPs, debug!
+            uint8_t sonT = (fatherT + sonIdx) % 16;
+            uint8_t sonTag = sonT | (fatherL << 4);
+            uint64_t sonSize = DL.getTypeAllocSize(sonType);
+            for (uint64_t i = 0; i < sonSize; i++) {
+              tags[sonOffset + i] = sonTag;
+            }
+          }
         }
 
         else {
@@ -4653,10 +4681,34 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
         // array of scalars -> all same tag
         uint8_t sonT = (fatherT + sonIdx) % 16;
         uint8_t sonTag = sonT | (fatherL << 4);
-        uint64_t sonSize = DL.getTypeAllocSize(sonType);
-        for (uint64_t i = 0; i < sonSize; i++) {
-          tags[sonOffset + i] = sonTag;
-        }
+        uint64_t sonSize =
+            DL.getTypeAllocSize(sonType); // USE ARRAY SIZE INSTEAD
+        uint64_t nElems = dyn_cast<ArrayType>(sonType)->getNumElements();
+        uint64_t remainingSizeOfStruct = DL.getTypeAllocSize(Ty) - (sonOffset);
+        // TODO: if size is 1 byte and field is the last field of the struct,
+        // detect possible flexible array and memset remaining part of tagVector
+        // to 0 to avoid FPs
+        bool isLastFieldOfStruct =
+            (sonIdx) ==
+            Ty->getNumContainedTypes(); // NOTEL sonIdx is adj to be 1-based
+        // if (isLastFieldOfStruct)
+        //   errs() << "[FieldArmor] Detected possible flexible array of size 0
+        //   "
+        //             "at offset "
+        //          << sonOffset << " of struct " << *Ty << ", sonSize " <<
+        //          sonSize
+        //          << "\n";
+        if (nElems == 1 && isLastFieldOfStruct) {
+          errs() << "[FieldArmor] Detected possible flexible array at offset "
+                 << sonOffset << " of struct " << *Ty << ", memsetting "
+                 << remainingSizeOfStruct << " bytes to 0\n";
+          // detect possible flexible array and memset remaining part of
+          // tagVector to 0 to avoid FPs
+          memset(&tags[sonOffset], 0x00, remainingSizeOfStruct);
+
+        } else
+          for (uint64_t i = 0; i < sonSize; i++)
+            tags[sonOffset + i] = sonTag;
       } // array of scalars
     } // case: son is array
 
@@ -4665,24 +4717,7 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
 
       if (sonType->isStructTy()) {
         StructType *ty = dyn_cast<StructType>(sonType);
-        // DEBUG
-        // errs() << "[FieldArmor - WARNING] Treating as scalar EMBEDDED
-        // struct
-        // "
-        //           "field: ";
-        // errs() << *ty << "\n";
-        // errs() << "container " << *Ty << "\n";
-        // errs() << "is opaque " << (ty->isOpaque() ? "true" : "false") <<
-        // "\n"; errs() << "is literal " << (ty->isLiteral() ? "true" :
-        // "false")
-        // << "\n"; if (!ty->isLiteral())
-        //   errs() << "is union "
-        //          << ((ty->getName().str().find("union.") == 0) ? "true"
-        //                                                        : "false")
-        //          << "\n";
-        // if (!ty->isLiteral())
-        //   errs() << "struct name " << ty->getName().str() << "\n";
-        // EDN DEBUG
+        // errs() << "[DBG] Embedded struct is a literal " << *sonType << "\n";
         memset(&tags[sonOffset], 0x00,
                DL.getTypeAllocSize(sonType)); // treat as NULL scalar field
 

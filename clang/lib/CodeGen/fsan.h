@@ -8,7 +8,12 @@
 namespace FSAN {
 
 // NOTE: no new operator, that's a different story
-inline std::set<std::string> allocFunctions = {
+inline std::set<std::string> allocFunctions = {"malloc", "realloc", "calloc",
+                                               "reallocarray"};
+// TODO: handle more!
+// "memalign",
+// "aligned_alloc", "posix_memalign", "valloc", "pvalloc"};
+inline std::set<std::string> fullsetOfAllocFunctions = {
     "malloc",        "realloc",        "calloc", "reallocarray", "memalign",
     "aligned_alloc", "posix_memalign", "valloc", "pvalloc"};
 
@@ -84,7 +89,11 @@ inline bool isAllocFD(const clang::FunctionDecl *FD) {
     return allocFunctions.count(II->getName().str()) > 0;
   };
 
-  return matchesAllocFn(FD);
+  bool ret = matchesAllocFn(FD);
+  if(!ret && fullsetOfAllocFunctions.count(FD->getName().str()) > 0) {
+    llvm::errs() << "[DBG]:- Alloc function " << FD->getName().str() << " TODO TODO TODO.\n";
+  }
+  return ret;
 
   // Case 3: __builtin_malloc etc.
   // TODO: debug this case eventually
@@ -102,8 +111,6 @@ inline bool isAllocFD(const clang::FunctionDecl *FD) {
   //     }
   //   }
   // }
-
-  return false;
 }
 
 // NOTE: this does not work because you cannot persist ptrs inside global!
@@ -230,56 +237,59 @@ TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
 
   if (DestTy->isPointerType()) {
     if (auto *Call = dyn_cast<llvm::CallBase>(Src)) {
-        if (llvm::CallBase *CI = dyn_cast<llvm::CallBase>(Call)) {
+      if (llvm::CallBase *CI = dyn_cast<llvm::CallBase>(Call)) {
 
-          llvm::Function *Callee = dyn_cast<llvm::Function>(CI->getCalledOperand()->stripPointerCasts());
-          // if (!Callee) {
-          //   llvm::Value *V = CI->getCalledOperand()->stripPointerCasts();
-          //   Callee = dyn_cast<llvm::Function>(V);
-            if (Callee && Callee->getName() == "typed_allocation") {
+        llvm::Function *Callee = dyn_cast<llvm::Function>(
+            CI->getCalledOperand()->stripPointerCasts());
+        // if (!Callee) {
+        //   llvm::Value *V = CI->getCalledOperand()->stripPointerCasts();
+        //   Callee = dyn_cast<llvm::Function>(V);
+        if (Callee && Callee->getName() == "typed_allocation") {
 
-              CI->dump();
-              auto nArgs = CI->arg_size();
-              auto typeStrArgIdx = nArgs - 3; // NOT THERE YET
-              auto typeStr = CI->getArgOperand(typeStrArgIdx);
+          CI->dump();
+          auto nArgs = CI->arg_size();
+          auto typeStrArgIdx = nArgs - 3; // NOT THERE YET
+          auto typeStr = CI->getArgOperand(typeStrArgIdx);
 
-              llvm::errs() << "TagFromBitcast: SRC: " << *Src
-                           << " -  DestTy: " << DestTy << "\n";
-              // typeStr->dump();
-              std::string typeStrToStr;
-              if (llvm::Constant *name = dyn_cast<llvm::Constant>(typeStr)) {
-                if (llvm::ConstantDataArray *dataArray =
-                        dyn_cast<llvm::ConstantDataArray>(
-                            name->getOperand(0))) {
-                  if (dataArray->isString()) {
-                    // llvm::errs() << "\t\tTYPE STR: "
-                    //              << dataArray->getAsString() << "\n";
-                    typeStrToStr = dataArray->getAsString().str().substr(0, dataArray->getAsString().size() - 1);
-                  }
-                }
+          llvm::errs() << "TagFromBitcast: SRC: " << *Src
+                       << " -  DestTy: " << DestTy << "\n";
+          // typeStr->dump();
+          std::string typeStrToStr;
+          if (llvm::Constant *name = dyn_cast<llvm::Constant>(typeStr)) {
+            if (llvm::ConstantDataArray *dataArray =
+                    dyn_cast<llvm::ConstantDataArray>(name->getOperand(0))) {
+              if (dataArray->isString()) {
+                // llvm::errs() << "\t\tTYPE STR: "
+                //              << dataArray->getAsString() << "\n";
+                typeStrToStr = dataArray->getAsString().str().substr(
+                    0, dataArray->getAsString().size() - 1);
               }
-              
-              if (typeStrToStr == "PLACEHOLDER") {
-                
-                clang::QualType PointeeTy = DestTy->getPointeeType();
-                llvm::Type *IRPointeeTy = CGF.ConvertTypeForMem(PointeeTy);
-                std::string IRTyNameStr =
-                    IRPointeeTy->isStructTy()
-                        ? IRPointeeTy->getStructName().str()
-                        : "scalar";
-                // TODO: literal structs should be "scalar" -> CHECK
-                llvm::errs() << "- REPLACE PLACEHOLDER: " << typeStrToStr << " ->  " << IRTyNameStr << "\n";
-                llvm::StringRef IRPointeeTyName(IRTyNameStr);
-                // CI->replaceArgWith(typeStrArgIdx, CGF.Builder.CreateGlobalString(IRPointeeTyName)); // this method is BS, does not exist
-                llvm::Value *NewTypeStr = CGF.Builder.CreateGlobalString(IRPointeeTyName);
-                CI->setArgOperand(typeStrArgIdx, NewTypeStr);
-                llvm::errs() << "Updated call instruction: ";
-                CI->dump();
-              }// 
             }
-          // }
+          }
 
+          if (typeStrToStr == "PLACEHOLDER") {
+
+            clang::QualType PointeeTy = DestTy->getPointeeType();
+            llvm::Type *IRPointeeTy = CGF.ConvertTypeForMem(PointeeTy);
+            std::string IRTyNameStr = IRPointeeTy->isStructTy()
+                                          ? IRPointeeTy->getStructName().str()
+                                          : "scalar";
+            // TODO: literal structs should be "scalar" -> CHECK
+            llvm::errs() << "- REPLACE PLACEHOLDER: " << typeStrToStr << " ->  "
+                         << IRTyNameStr << "\n";
+            llvm::StringRef IRPointeeTyName(IRTyNameStr);
+            // CI->replaceArgWith(typeStrArgIdx,
+            // CGF.Builder.CreateGlobalString(IRPointeeTyName)); // this method
+            // is BS, does not exist
+            llvm::Value *NewTypeStr =
+                CGF.Builder.CreateGlobalString(IRPointeeTyName);
+            CI->setArgOperand(typeStrArgIdx, NewTypeStr);
+            llvm::errs() << "Updated call instruction: ";
+            CI->dump();
+          } //
         }
+        // }
+      }
 
       return;
       // STOP HERE, we dont care about metadata
@@ -449,7 +459,6 @@ inline void TagFromCallSite(const clang::CallExpr *E,
     CGF.FSanPendingAllocType = clang::QualType();
     CGF.PendingTypeIsValid = false;
   }
-  
 
   if (FSAN::allocFunctions.count(FNName.str())) {
     dumpAllocSite(E, FNName, CGF);
@@ -529,7 +538,8 @@ inline void TagFromCallSite(const clang::CallExpr *E,
                          binaryoperator->getLHS())) {
             if (LHS->getKind() == clang::UETT_SizeOf) {
               clang::QualType TypeToSize = LHS->getTypeOfArgument();
-              llvm::errs()                  << "LHS: This is a sizeof operator in the argument! Type: "
+              llvm::errs()
+                  << "LHS: This is a sizeof operator in the argument! Type: "
                   << TypeToSize.getAsString() << ", SRC LOC: "
                   << LHS->getExprLoc().printToString(
                          CGF.getContext().getSourceManager())

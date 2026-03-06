@@ -58,9 +58,9 @@ std::string di_to_ir_type(const std::string &di_type) {
   }
 
   if (ir_type.empty()) {
-    errs() << "[TypeCopilot] WARNING: empty DI type after trimming pointers, "
-              "returning 'void'. Original DI type: "
-           << di_type << "\n";
+    // errs() << "[TypeCopilot] WARNING: empty DI type after trimming pointers, "
+    //           "returning 'void'. Original DI type: "
+    //        << di_type << "\n";
     return "void*"; // should be the easiest option
   }
 
@@ -1460,9 +1460,9 @@ public:
     alias = new TypeAlias(&M, tg, worklist, diHelper);
     std::set<const char *> UnhandledOpcodes;
     if (!diHelper->hasDebugInfo(M)) {
-      errs() << "[TypeCopilot] WARNING: " << M.getName()
-             << " has no debug info! Type reconstruction will not "
-                "happen.\n";
+      // errs() << "[TypeCopilot] WARNING: " << M.getName()
+      //        << " has no debug info! Type reconstruction will not "
+      //           "happen.\n";
       return nullptr;
     }
 
@@ -1489,13 +1489,13 @@ public:
       } else if (ConstantExpr *constExpr = dyn_cast<ConstantExpr>(inst)) {
         if (constExpr->getOpcode() == Instruction::GetElementPtr) {
           // TODO -> store operands should end up here, but they don't
-          errs() << "[TypeCopilot] CONST EXPR GEP: " << *constExpr << "\n";
+          // errs() << "[TypeCopilot] CONST EXPR GEP: " << *constExpr << "\n";
           auto *gep =
               dyn_cast<GetElementPtrInst>(constExpr->getAsInstruction());
           if (!gep) {
-            errs() << "[TypeCopilot] WARNING: Unsupported ConstantExpr opcode: "
-                   << constExpr->getOpcodeName() << "\n";
-            UnhandledOpcodes.insert(constExpr->getOpcodeName());
+            // errs() << "[TypeCopilot] WARNING: Unsupported ConstantExpr opcode: "
+            //        << constExpr->getOpcodeName() << "\n";
+            // UnhandledOpcodes.insert(constExpr->getOpcodeName());
             continue;
           }
           alias->processFieldOf(gep->getFunction(), *gep);

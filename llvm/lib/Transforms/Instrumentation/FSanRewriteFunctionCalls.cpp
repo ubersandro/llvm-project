@@ -76,7 +76,12 @@ CallBase *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
   FunctionCallee formerFn;
   bool isRealloc = false;
   bool hasAlignment = false;
-
+  errs() << "Rewriting call to " << formerAllocatorName << "\n";
+  CI->dump();
+  
+  // inline std::set<std::string> allocFunctions = {
+  //     "malloc",        "realloc",        "calloc", "reallocarray", "memalign",
+  //     "aligned_alloc", "posix_memalign", "valloc", "pvalloc"};
   // extract size, n, former ptr
   if (formerAllocatorName == "malloc") {
     allocSize = CI->getArgOperand(0);
@@ -114,6 +119,7 @@ CallBase *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
       hasAlignment = true; // TODO
     }
   } // operator new
+  // TODO: handle memalign, aligned_alloc, posix_memalign, valloc, pvalloc
 
   Type *sizeType = allocSize->getType();
 
@@ -245,7 +251,7 @@ CallBase *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
   // if (isRealloc)
   //   formerCall->addParamAttr(1, Attribute::get(Ctx, "noundef"));
 
-  formerCall->setCallingConv(CallingConv::C);
+  // formerCall->setCallingConv(CallingConv::C);
   CI->replaceAllUsesWith(formerCall);
   CI->eraseFromParent();
   return formerCall;
@@ -296,7 +302,7 @@ GlobalVariable *retrieveTV(StructType *Ty, Module &M);
 u_int8_t *computeTags(StructType *Ty, Module &M) {
   DataLayout DL = M.getDataLayout();
   uint8_t *tags = new uint8_t[DL.getTypeAllocSize(Ty)];
-  memset(tags, 0, DL.getTypeAllocSize(Ty));
+  memset(tags, 0xff, DL.getTypeAllocSize(Ty));
 
   assert(tags && "Could not allocate tags array");
   std::deque<std::tuple<Type *, uint8_t, uint8_t, uint8_t, size_t>> AggQueue;
@@ -467,14 +473,42 @@ u_int8_t *computeTags(StructType *Ty, Module &M) {
                DL.getTypeAllocSize(sonType)); // treat as NULL scalar field
 
       } else {
+        // uint8_t sonT = (fatherT + sonIdx) % 16;
+        // uint8_t sonTag = sonT | (fatherL << 4);
+        // if (isUnion)
+        //   sonTag = 0x00;
+        int sonSize = DL.getTypeAllocSize(sonType);
+        // for (int i = 0; i < sonSize; i++) {
+        //   tags[sonOffset + i] = sonTag;
+        // }
+        // array of scalars -> all same tag
         uint8_t sonT = (fatherT + sonIdx) % 16;
         uint8_t sonTag = sonT | (fatherL << 4);
-        if (isUnion)
-          sonTag = 0x00;
-        int sonSize = DL.getTypeAllocSize(sonType);
-        for (int i = 0; i < sonSize; i++) {
-          tags[sonOffset + i] = sonTag;
-        }
+        uint64_t remainingSizeOfStruct = DL.getTypeAllocSize(Ty) - (sonOffset);
+        // TODO: if size is 1 byte and field is the last field of the struct,
+        // detect possible flexible array and memset remaining part of tagVector
+        // to 0 to avoid FPs
+        bool isLastFieldOfStruct =
+            (sonIdx) ==
+            Ty->getNumContainedTypes(); // NOTEL sonIdx is adj to be 1-based
+        // if (isLastFieldOfStruct)
+        //   errs() << "[FieldArmor] Detected possible flexible array of size 0
+        //   "
+        //             "at offset "
+        //          << sonOffset << " of struct " << *Ty << ", sonSize " <<
+        //          sonSize
+        //          << "\n";
+        if (sonSize == 1 && isLastFieldOfStruct) {
+          errs() << "[FieldArmor] Detected possible flexible array at offset "
+                 << sonOffset << " of struct " << *Ty << ", memsetting "
+                 << remainingSizeOfStruct << " bytes to 0\n";
+          // detect possible flexible array and memset remaining part of
+          // tagVector to 0 to avoid FPs
+          memset(&tags[sonOffset], 0x00, remainingSizeOfStruct);
+
+        } else
+          for (uint64_t i = 0; i < sonSize; i++)
+            tags[sonOffset + i] = sonTag;
       }
     } // case : scalar fields, literal structs, unions
   } // while agg queue not empty
@@ -614,12 +648,12 @@ bool FSanRewriteFunctionCallsPass::RewriteCallToTypedAllocator(CallBase *CI,
         formerAllocatorName = ref.str();
         formerAllocatorName =
             formerAllocatorName.substr(0, formerAllocatorName.size() - 1);
-        llvm::errs() << "[DBG-IR] FUNCTION TO CALL: " << formerAllocatorName
-                     << "\n";
+        // llvm::errs() << "[DBG-IR] FUNCTION TO CALL: " << formerAllocatorName
+        //              << "\n";
       }
     }
   }
-  llvm::errs() << "[DBG-IR] ARRAY SIZE: " << *arraySize << "\n";
+  // llvm::errs() << "[DBG-IR] ARRAY SIZE: " << *arraySize << "\n";
 
   // this is a destructive operation for CI
   CallBase *formerCall =
@@ -635,6 +669,7 @@ bool FSanRewriteFunctionCallsPass::RewriteCallToTypedAllocator(CallBase *CI,
   errs() << "\t[IR] REWRITING OK: " << *newCI << "\n";
   if (allocType && !dontTag) {
     // DO THE TAGGING
+    // TODO: handle flex members at the end -> cannot tag them with the same tag as the padding!
     IRBuilder<> IRB(newCI->getNextNonDebugInstruction());
 
     Value *ArraySize =
@@ -693,7 +728,7 @@ void dbgSrcAndUses(CallBase *I) {
         Function *Invokee = dyn_cast<Function>(V);
         if (Invokee) {
           auto demangledNameOfInvoke = demangle(Invokee->getName().str());
-          llvm::errs() << "\tINVOKE USR: " << demangledNameOfInvoke << "\n";
+          // llvm::errs() << "\tINVOKE USR: " << demangledNameOfInvoke << "\n";
         }
       }
     }
@@ -744,8 +779,8 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
             StringRef structNameRef = dataArray->getAsString();
             std::string structName =
                 structNameRef.str().substr(0, structNameRef.size() - 1);
-            llvm::errs() << "\t\t[IR-DBG] LAST PARAM DUMP: " << structName
-                         << "\n";
+            // llvm::errs() << "\t\t[IR-DBG] LAST PARAM DUMP: " << structName
+            //              << "\n";
             // NOTE: right now, placement news are not handled because
             // their type is a placeholder string. TODO: future work.
             if (allocType = StructType::getTypeByName(Callee->getContext(),
@@ -755,16 +790,16 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
             }
           } else {
 
-            llvm::errs() << "\t\t[IR-DBG] LAST PARAM IS NOT STRING: "
-                         << *lastArg << "\n";
+            // llvm::errs() << "\t\t[IR-DBG] LAST PARAM IS NOT STRING: "
+            //              << *lastArg << "\n";
             auto *type = lastArg->getType();
-            llvm::errs() << "\t\t[IR-DBG] LAST PARAM TYPE: " << *type << "\n";
+            // llvm::errs() << "\t\t[IR-DBG] LAST PARAM TYPE: " << *type << "\n";
             if (PHINode *phi = dyn_cast<PHINode>(lastArg)) {
-              llvm::errs() << "\t\t[IR-DBG] LAST PARAM IS PHI NODE, dumping "
-                              "incoming values:\n";
+              // llvm::errs() << "\t\t[IR-DBG] LAST PARAM IS PHI NODE, dumping "
+              //                 "incoming values:\n";
               for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
                 Value *incoming = phi->getIncomingValue(i);
-                llvm::errs() << "\t\t\tINCOMING VALUE: " << *incoming << "\n";
+                // llvm::errs() << "\t\t\tINCOMING VALUE: " << *incoming << "\n";
               }
               auto *name = phi->getIncomingValue(0);
               if (Constant *nameConst = dyn_cast<Constant>(name)) {
@@ -774,9 +809,9 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
                     StringRef structNameRef = dataArray->getAsString();
                     std::string structName =
                         structNameRef.str().substr(0, structNameRef.size() - 1);
-                    llvm::errs() << "\t\t[IR-DBG] PHI NODE INCOMING VALUE IS "
-                                    "STRING CONST: "
-                                 << structName << "\n";
+                    // llvm::errs() << "\t\t[IR-DBG] PHI NODE INCOMING VALUE IS "
+                    //                 "STRING CONST: "
+                    //              << structName << "\n";
                     if (allocType = StructType::getTypeByName(
                             Callee->getContext(), structName)) {
                       llvm::errs()
@@ -793,7 +828,7 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
           }
         }
       } // if constant last arg
-      errs() << "\t\t[IR] REWRITING CALL TO NEW OPERATOR: " << *I << "\n";
+      // errs() << "\t\t[IR] REWRITING CALL TO NEW OPERATOR: " << *I << "\n";
       bool needsOffsetForCookie = false;
       CallBase *NewCI = rewriteCall(I, allocType, nullptr, demangledName, M,
                                     &needsOffsetForCookie);
@@ -830,8 +865,8 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
                                                      // the new call
           assert(InsertPt && "Failed to find insertion point for tagging after "
                              "new operator call");
-          errs() << "\t\t[IR] INSERTION POINT FOR TAGGING: ";
-          InsertPt->dump();
+          // errs() << "\t\t[IR] INSERTION POINT FOR TAGGING: ";
+          // InsertPt->dump();
           IRBuilder<> IRB(InsertPt);
 
           // TODO: check on array size post FP
@@ -842,7 +877,7 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
           TypeSize tSize = M.getDataLayout().getTypeAllocSize(allocType);
           auto Int64Ty = Type::getInt64Ty(M.getContext());
           PointerType *PtrTy = PointerType::getUnqual(M.getContext());
-          errs() << "\t\t[IR] HERE - ARRAY SIZE: " << *ArraySize << "\n";
+          // errs() << "\t\t[IR] HERE - ARRAY SIZE: " << *ArraySize << "\n";
           FunctionCallee fieldarmor_tag_memory =
               M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm",
                                     PtrTy, PtrTy, PtrTy, Int64Ty, Int64Ty);
@@ -859,9 +894,9 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
           // array
 
           if (isNewArray && needsOffsetForCookie) {
-            errs() << "\t\t[IR] NEW[] WITH COOKIE, OFFSETTING TAGGING POINTER "
-                      "BY 8 "
-                      "BYTES\n";
+            // errs() << "\t\t[IR] NEW[] WITH COOKIE, OFFSETTING TAGGING POINTER "
+            //           "BY 8 "
+            //           "BYTES\n";
             Value *Offset =
                 IRB.CreateGEP(IRB.getInt8Ty(), // element type: i8 (1 byte
                                                // per index unit)
