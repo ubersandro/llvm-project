@@ -1017,7 +1017,7 @@ uptr MapDynamicShadow(uptr shadow_size_bytes, uptr shadow_scale,
 
   const uptr shadow_start = RoundUpTo(map_start + left_padding, alignment);
   
-  VPrintf(2, "alignment: %p\npadding %p\nshadow_start: %p\nshadow_size: %p\nmap_start %p\n", (void *)alignment, (void *)left_padding, (void *)shadow_start, (void *)shadow_size, (void *)map_start);
+  // VPrintf(2, "alignment: %p\npadding %p\nshadow_start: %p\nshadow_size: %p\nmap_start %p\n", (void *)alignment, (void *)left_padding, (void *)shadow_start, (void *)shadow_size, (void *)map_start);
   UnmapFromTo(map_start, shadow_start - left_padding);
   UnmapFromTo(shadow_start + shadow_size, map_start + map_size); // @ale: in brief, this only keep the shadow memory mapped
 

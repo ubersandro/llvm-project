@@ -23,7 +23,7 @@ uptr TagMemory(uptr p, uptr size, tag_t tag) {
   
   uptr start = RoundDownTo(p, kShadowAlignment);
   uptr end = RoundUpTo(p + size, kShadowAlignment);
-  VPrintf(1, "\t[FieldArmor-RUNTIME] TAG MEMORY CALL: A=%p SZ=%zu TAG=0x%x\n", (void*)start, (void*)(end - start), tag);
+  // VPrintf(1, "[TagMemory] : A=%p SZ=%zu TAG=0x%x\n", (void*)start, (void*)(end - start), tag);
   return TagMemoryAligned(start, end - start, tag);
 }
 

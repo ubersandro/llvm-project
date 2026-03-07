@@ -10,7 +10,7 @@
 /// This file is a part of HWAddressSanitizer, an address basic correctness
 /// checker based on tagged addressing.
 //===----------------------------------------------------------------------===//
-// #define TRANS_CONST 0x400000000000ULL // FSAN MAP
+#define TRANS_CONSTANT 0x400000000000ULL // 1<<46
 #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -1050,9 +1050,9 @@ Value *HWAddressSanitizer::memToShadow(Value *Mem, IRBuilder<> &IRB) {
   // // (Mem >> Scale) + Offset
   // return IRB.CreatePtrAdd(ShadowBase, Shadow);
   // NEW
-  // CURRENT: mem ^ 0x400000000000
+  // CURRENT: mem ^ 0x400000000000 // 1<<46
   Value *XorVal =
-      IRB.CreateXor(Mem, ConstantInt::get(IntptrTy, 0x400000000000ULL));
+      IRB.CreateXor(Mem, ConstantInt::get(IntptrTy, TRANS_CONSTANT));
   return IRB.CreateIntToPtr(XorVal, PtrTy);
 }
 

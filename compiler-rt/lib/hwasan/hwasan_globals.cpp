@@ -87,12 +87,12 @@ ArrayRef<const hwasan_global> HwasanGlobalsFor(ElfW(Addr) base,
       // elide the code model check if there are no globals.
       if (globals_begin != globals_end)
         CheckCodeModel(base, phdr, phnum);
-      VPrintf(2, "[FieldArmor] BEGIN PTR OF GLOBALS: %p\n",
-              (const void *)globals_begin);
-      VPrintf(2, "[FieldArmor] END PTR OF GLOBALS: %p\n",
-              (const void *)globals_end);
-      VPrintf(2, "[FieldArmor] GLOBALS SIZE: %zu\n",
-              (u_int64_t)((u_int64_t)globals_end - (u_int64_t)globals_begin));
+      // VPrintf(2, "[FieldArmor] BEGIN PTR OF GLOBALS: %p\n",
+      //         (const void *)globals_begin);
+      // VPrintf(2, "[FieldArmor] END PTR OF GLOBALS: %p\n",
+      //         (const void *)globals_end);
+      // VPrintf(2, "[FieldArmor] GLOBALS SIZE: %zu\n",
+      //         (u_int64_t)((u_int64_t)globals_end - (u_int64_t)globals_begin));
       return {globals_begin, globals_end};
     }
   }

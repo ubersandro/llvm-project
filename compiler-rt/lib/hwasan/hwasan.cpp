@@ -296,7 +296,7 @@ uptr fieldarmor_tag_memory(void* ptr, uptr tags, uptr size) {
   // TODO: make sure pointer is untagged
   if (!tags) {
     // untag memory, i.e. tag it with 0s
-    VPrintf(2, "[FieldArmor] untagging memory %p of size %zu\n", ptr, size);
+    // VPrintf(2, "[FieldArmor] untagging memory %p of size %zu\n", ptr, size);
     // TODO
     return TagMemory_mod((uptr)ptr, size, 0, 1);
     // return (uptr) UntagPtr(ptr);
@@ -446,7 +446,7 @@ __attribute__((constructor(0))) void __hwasan_init() {
     Symbolizer::LateInitialize();
   }
 
-  VPrintf(1, "HWAddressSanitizer init done\n");
+  // VPrintf(1, "HWAddressSanitizer init done\n");
 
   hwasan_init_is_running = 0;
   hwasan_inited = 1;
@@ -483,10 +483,10 @@ void __hwasan_print_shadow(const void* p, uptr sz) {
 }
 
 sptr __hwasan_test_shadow(const void* p, uptr sz) {
-  VPrintf(1,
-          "[FieldArmor] This routine has been patched. Test shadow for %p size "
-          "%zu\n",
-          p, sz);
+  // VPrintf(1,
+  //         "[FieldArmor] This routine has been patched. Test shadow for %p size "
+  //         "%zu\n",
+  //         p, sz);
   if (sz == 0)
     return -1;
   uptr ptr = reinterpret_cast<uptr>(p);
@@ -703,10 +703,10 @@ void __hwasan_store16_match_all_noabort(uptr p, u8 match_all_tag) {
 // NOTE: this exists because I'm inlining tagging logic. This can go in the
 // future.
 void __hwasan_tag_memory(uptr p, u8 tag, uptr sz, uptr type_descriptor) {
-  VPrintf(2,
-          "[FieldArmor] Tagging memory %p of size %zu with tag %02x (type "
-          "descriptor %zx)\n",
-          (void*)p, sz, tag, type_descriptor);
+  // VPrintf(2,
+  //         "[FieldArmor] Tagging memory %p of size %zu with tag %02x (type "
+  //         "descriptor %zx)\n",
+  //         (void*)p, sz, tag, type_descriptor);
 
   TagMemoryAligned(UntagAddr(p), sz, tag);
 }

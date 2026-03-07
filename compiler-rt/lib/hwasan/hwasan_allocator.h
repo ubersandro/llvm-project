@@ -12,7 +12,9 @@
 
 #ifndef HWASAN_ALLOCATOR_H
 #define HWASAN_ALLOCATOR_H
-
+#ifdef HWASAN_ALIASING_MODE
+#  undef HWASAN_ALIASING_MODE
+#endif
 #include "hwasan.h"
 #include "hwasan_interface_internal.h"
 #include "hwasan_mapping.h"
