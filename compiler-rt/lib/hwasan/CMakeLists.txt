@@ -247,9 +247,9 @@ endfunction()
 
 foreach(arch ${HWASAN_SUPPORTED_ARCH})
   add_hwasan_runtimes(${arch} FALSE)
-  if(${arch} MATCHES "x86_64")
-    add_hwasan_runtimes(${arch} TRUE)
-  endif()
+  # if(${arch} MATCHES "x86_64")
+  #   add_hwasan_runtimes(${arch} TRUE)
+  # endif()
 endforeach()
 
 add_compiler_rt_runtime(clang_rt.hwasan-preinit

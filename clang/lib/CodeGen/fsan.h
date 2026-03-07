@@ -90,9 +90,6 @@ inline bool isAllocFD(const clang::FunctionDecl *FD) {
   };
 
   bool ret = matchesAllocFn(FD);
-  if(!ret && fullsetOfAllocFunctions.count(FD->getName().str()) > 0) {
-    llvm::errs() << "[DBG]:- Alloc function " << FD->getName().str() << " TODO TODO TODO.\n";
-  }
   return ret;
 
   // Case 3: __builtin_malloc etc.

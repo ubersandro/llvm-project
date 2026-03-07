@@ -147,8 +147,10 @@ void HwasanAllocatorInit() {
   if (common_flags()->max_allocation_size_mb) {
     max_malloc_size = common_flags()->max_allocation_size_mb << 20;
     max_malloc_size = Min(max_malloc_size, kMaxAllowedMallocSize);
+    // VPrintf(1, "HWASAN: max_malloc_size is set to %zu bytes\n", max_malloc_size);
   } else {
     max_malloc_size = kMaxAllowedMallocSize;
+    // VPrintf(1, "HWASAN: CONST max_malloc_size is set to %zu bytes\n", max_malloc_size);
   }
 }
 
@@ -256,8 +258,8 @@ static void* HwasanAllocate(StackTrace* stack, uptr orig_size, uptr alignment,
 // #endif
   meta->SetAllocated(StackDepotPut(*stack), orig_size);
   RunMallocHooks(user_ptr, orig_size);
-  VPrintf(1, "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n",
-          orig_size, alignment, user_ptr);
+  // VPrintf(1, "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n",
+  //         orig_size, alignment, user_ptr);
   return user_ptr;
 }
 
@@ -288,7 +290,7 @@ static void HwasanDeallocate(StackTrace* stack, void* tagged_ptr) {
   // VPrintf(0, "[HWASAN] HwasanDeallocate: ptr=%p\n", tagged_ptr);
   CHECK(tagged_ptr);
   void* untagged_ptr = UntagPtr(tagged_ptr);
-  VPrintf(1, "[HWASAN] HwasanDeallocate: ptr=%p\n", untagged_ptr);
+  // VPrintf(1, "[HWASAN] HwasanDeallocate: ptr=%p\n", untagged_ptr);
 
   if (RunFreeHooks(tagged_ptr))
     return;
@@ -303,8 +305,8 @@ static void HwasanDeallocate(StackTrace* stack, void* tagged_ptr) {
   Metadata* meta =
       reinterpret_cast<Metadata*>(allocator.GetMetaData(aligned_ptr));
   if (!meta) {
-    VPrintf(1, "[HWASAN] HwasanDeallocate: no metadata for ptr=%p/%p\n",
-            tagged_ptr, untagged_ptr);
+    // VPrintf(1, "[HWASAN] HwasanDeallocate: no metadata for ptr=%p/%p\n",
+    //         tagged_ptr, untagged_ptr);
     ReportInvalidFree(stack, reinterpret_cast<uptr>(tagged_ptr));
     return;
   }
@@ -381,8 +383,8 @@ static void HwasanDeallocate(StackTrace* stack, void* tagged_ptr) {
 
 static void* HwasanReallocate(StackTrace* stack, void* tagged_ptr_old,
                               uptr new_size, uptr alignment) {
-  VPrintf(1, "[HWASAN] HwasanReallocate: ptr=%p new_size=%zx\n", tagged_ptr_old,
-          new_size);
+  // VPrintf(1, "[HWASAN] HwasanReallocate: ptr=%p new_size=%zx\n", tagged_ptr_old,
+          // new_size);
   void* untagged_ptr_old = UntagPtr(tagged_ptr_old);
   if (CheckInvalidFree(stack, untagged_ptr_old, tagged_ptr_old))
     return nullptr;

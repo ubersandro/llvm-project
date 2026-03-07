@@ -13,6 +13,9 @@
 
 #ifndef HWASAN_H
 #define HWASAN_H
+#ifdef HWASAN_ALIASING_MODE
+#  undef HWASAN_ALIASING_MODE
+#endif
 
 #include "hwasan_flags.h"
 #include "hwasan_interface_internal.h"
