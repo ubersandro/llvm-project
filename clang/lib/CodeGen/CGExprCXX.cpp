@@ -1343,9 +1343,9 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
   auto calleeName = CalleeDecl->getQualifiedNameAsString();
   bool isEnabled = CGF.SanOpts.has(SanitizerKind::HWAddress); 
   if (isEnabled && calleeName.find("operator new") != std::string::npos) {
-    llvm::errs() << "\tEmitNewDeleteCall: Callee for NEW "
-                 << (typeName.empty() ? "_EMPTY_" : typeName) << ": "
-                 << *CalleeDecl << ", CalleeName: " << calleeName << " \n";
+    // llvm::errs() << "\tEmitNewDeleteCall: Callee for NEW "
+    //              << (typeName.empty() ? "_EMPTY_" : typeName) << ": "
+    //              << *CalleeDecl << ", CalleeName: " << calleeName << " \n";
     auto &ctx = CGF.getContext();
     if (!typeName.empty()) {
       llvm::Value *typeNamePtr =
@@ -1359,7 +1359,7 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
       Args.add(RValue::get(typeNamePtr), ctx.getPointerType(ctx.CharTy));
     }
     if (cookie) {
-      llvm::errs() << "[DBG-FE] ADDING A COOKIE MARKER TO THE NEW CALL" << "\n";
+      // llvm::errs() << "[DBG-FE] ADDING A COOKIE MARKER TO THE NEW CALL" << "\n";
       llvm::Value *cookieStr =
           CGF.Builder.CreateGlobalString("PINO_PALETTA", "PINO_PALETTA"); // TODO: move this out of here
       Args.add(RValue::get(cookieStr), ctx.getPointerType(ctx.CharTy));
@@ -1627,9 +1627,9 @@ static void EnterNewDeleteCleanup(CodeGenFunction &CGF, const CXXNewExpr *E,
 /** This method emits both calls and invokes. */
 llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   // The element type being allocated.
-  llvm::errs() << "[FE] EmitCXXNewExpr: CALLED on SRC LOC: "
-               << E->getExprLoc().printToString(getContext().getSourceManager())
-               << ", TYPE: " << E->getAllocatedType().getAsString() << "\n";
+  // llvm::errs() << "[FE] EmitCXXNewExpr: CALLED on SRC LOC: "
+  //              << E->getExprLoc().printToString(getContext().getSourceManager())
+  //              << ", TYPE: " << E->getAllocatedType().getAsString() << "\n";
   bool guard = false;
 
   QualType allocType = getContext().getBaseElementType(E->getAllocatedType());
@@ -1638,10 +1638,10 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
                                                 : allocType.getAsString();
   // 1. Build a call to the allocation function.
   FunctionDecl *allocator = E->getOperatorNew();
-  llvm::errs() << "\t[DBG-FE] Allocator: "
-               << allocator->getQualifiedNameAsString() << ", SRC LOC: "
-               << E->getExprLoc().printToString(getContext().getSourceManager())
-               << "\n";
+  // llvm::errs() << "\t[DBG-FE] Allocator: "
+  //              << allocator->getQualifiedNameAsString() << ", SRC LOC: "
+  //              << E->getExprLoc().printToString(getContext().getSourceManager())
+  //              << "\n";
   // allocator->dump();
 
   // If there is a brace-initializer or C++20 parenthesized initializer, cannot
@@ -1674,23 +1674,23 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   // Q: what is the min type of elements? -> mark this as TODO for future work
   llvm::Value *allocSize = EmitCXXNewAllocSize(
       *this, E, minElements, numElements, allocSizeWithoutCookie);
-  llvm::errs() << "\t[DBG-FE] Alloc size: ";
-  allocSize->dump();
-  llvm::errs() << "\t[DBG-FE] Alloc size w/ cookie: ";
+  // llvm::errs() << "\t[DBG-FE] Alloc size: ";
+  // allocSize->dump();
+  // llvm::errs() << "\t[DBG-FE] Alloc size w/ cookie: ";
   allocSizeWithoutCookie->dump();
-  llvm::errs() << "[DBG-FE] Type size: ";
+  // llvm::errs() << "[DBG-FE] Type size: ";
   auto type = getContext().getTypeSizeInChars(allocType).getQuantity();
-  llvm::errs() << "[DBG-FE] Alloc Type Size: " << type << "\n";
+  // llvm::errs() << "[DBG-FE] Alloc Type Size: " << type << "\n";
   bool cookie = false;
   int64_t ArraySize = -1; // TODO: add extra param to NEW
   if (!E->isArray())
     ArraySize = 1;
   else {
-    llvm::errs() << "[DBG-FE] Array elems value: ";
-    numElements->dump();
+    // llvm::errs() << "[DBG-FE] Array elems value: ";
+    // numElements->dump();
     if (llvm::ConstantInt *CI = dyn_cast<llvm::ConstantInt>(numElements)) {
       ArraySize = CI->getSExtValue();
-      llvm::errs() << "[DBG-FE] Array size: " << ArraySize << "\n";
+      // llvm::errs() << "[DBG-FE] Array size: " << ArraySize << "\n";
     }
     // it's an array, does it have a trivial destr?
     QualType ElementType =
@@ -1699,7 +1699,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     if (RT) {
       const CXXRecordDecl *RD = cast<CXXRecordDecl>(RT->getDecl());
       if (!RD->hasTrivialDestructor()) {
-        llvm::errs() << "COOKIE IS GONNA BE THERE FOR TYPE: " << *RD << "\n";
+        // llvm::errs() << "COOKIE IS GONNA BE THERE FOR TYPE: " << *RD << "\n";
         cookie = true;
       }
     }
@@ -1734,9 +1734,9 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
       allocatorArgs.add(RValue::get(allocSize), getContext().getSizeType());
       allocatorArgs.add(RValue::get(allocation, *this), arg->getType());
     }
-    llvm::errs() << "\t[DBG-FE] Placement new case , SRC LOC:";
-    E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
-    llvm::errs() << "\n";
+    // llvm::errs() << "\t[DBG-FE] Placement new case , SRC LOC:";
+    // E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
+    // llvm::errs() << "\n";
     // E->dump();
   } else {
     const FunctionProtoType *allocatorType =
@@ -1744,11 +1744,11 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     ImplicitAllocationParameters IAP =
         E->implicitAllocationParameters(); // NOTE: this describes extra params
     // DUMP IAP
-    llvm::errs() << "\t[DBG-FE] IAP: PassTypeIdentity: "
-                 << static_cast<unsigned>(IAP.PassTypeIdentity)
-                 << ", PassAlignment: "
-                 << static_cast<unsigned>(IAP.PassAlignment) << " IAP.Type "
-                 << IAP.Type.getAsString() << "\n";
+    // llvm::errs() << "\t[DBG-FE] IAP: PassTypeIdentity: "
+    //              << static_cast<unsigned>(IAP.PassTypeIdentity)
+    //              << ", PassAlignment: "
+    //              << static_cast<unsigned>(IAP.PassAlignment) << " IAP.Type "
+    //              << IAP.Type.getAsString() << "\n";
     unsigned ParamsToSkip = 0;
     if (isTypeAwareAllocation(IAP.PassTypeIdentity)) {
       QualType SpecializedTypeIdentity = allocatorType->getParamType(0);
@@ -1795,16 +1795,16 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     // ADD extra args for cookie
 
     { // DBG
-      llvm::errs() << "\t[FE] EmitCXXNewExpr: ALLOCATOR: "
-                   << allocator->getQualifiedNameAsString() << ", ALLOC TYPE: "
-                   << allocatorType->getReturnType().getAsString() << ", args";
-      for (unsigned i = 0, e = allocatorArgs.size(); i != e; ++i) {
-        llvm::errs() << "\n  ARG " << i << ": "
-                     << allocatorArgs[i].getType().getAsString() << " = ";
-        allocatorArgs[i].getRValue(*this).getScalarVal()->dump();
-      }
-      llvm::errs() << "\n";
-      allocatorType->dump();
+      // llvm::errs() << "\t[FE] EmitCXXNewExpr: ALLOCATOR: "
+      //              << allocator->getQualifiedNameAsString() << ", ALLOC TYPE: "
+      //              << allocatorType->getReturnType().getAsString() << ", args";
+      // for (unsigned i = 0, e = allocatorArgs.size(); i != e; ++i) {
+      //   llvm::errs() << "\n  ARG " << i << ": "
+      //                << allocatorArgs[i].getType().getAsString() << " = ";
+      //   allocatorArgs[i].getRValue(*this).getScalarVal()->dump();
+      // }
+      // llvm::errs() << "\n";
+      // allocatorType->dump();
     } // DBG
 
     QualType AllocatedQualType = E->getAllocatedType();
@@ -1816,8 +1816,8 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     RValue RV =
         EmitNewDeleteCall(*this, allocator, allocatorType, allocatorArgs,
                           typeName, cookie); // HOOK FOR NEW NEW
-    llvm::errs() << "\t[FE] EmitCXXNewExpr: Allocator call emitted: ";
-    RV.getScalarVal()->dump();
+    // llvm::errs() << "\t[FE] EmitCXXNewExpr: Allocator call emitted: ";
+    // RV.getScalarVal()->dump();
     guard = true;
 
     // Set !heapallocsite metadata on the call to operator new.
@@ -1945,33 +1945,33 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   }
   // FSAN
 
-  if (guard) { // NOTE: only type new, not placement new
-    llvm::LLVMContext &LLVMCtx = getLLVMContext();
+  // if (guard) { // NOTE: only type new, not placement new
+  //   llvm::LLVMContext &LLVMCtx = getLLVMContext();
 
-    if (numElements) {
-      if (llvm::ConstantInt *ConstNum =
-              dyn_cast<llvm::ConstantInt>(numElements))
-        ArraySize = ConstNum->getZExtValue();
-    }
+  //   if (numElements) {
+  //     if (llvm::ConstantInt *ConstNum =
+  //             dyn_cast<llvm::ConstantInt>(numElements))
+  //       ArraySize = ConstNum->getZExtValue();
+  //   }
 
-    llvm::MDNode *FSanMD = llvm::MDNode::get(
-        LLVMCtx, {
-                     llvm::MDString::get(LLVMCtx, "fsan.new"),
-                     llvm::MDString::get(LLVMCtx, IRTypeName),
-                     llvm::ValueAsMetadata::get(llvm::ConstantInt::get(
-                         llvm::Type::getInt64Ty(LLVMCtx), ArraySize)),
-                 });
-    llvm::errs() << "\t\tMD >> FSanMD for new-expression: ";
-    FSanMD->print(llvm::errs());
-    llvm::errs() << ", resultPtr: ";
-    resultPtr->print(llvm::errs());
-    llvm::errs() << ", SRC LOC OF NEW: ";
-    E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
-    llvm::errs() << "\n";
-    if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(resultPtr))
-      I->setMetadata("fsan.new", FSanMD); // TODO: not sure about his...
+  //   llvm::MDNode *FSanMD = llvm::MDNode::get(
+  //       LLVMCtx, {
+  //                    llvm::MDString::get(LLVMCtx, "fsan.new"),
+  //                    llvm::MDString::get(LLVMCtx, IRTypeName),
+  //                    llvm::ValueAsMetadata::get(llvm::ConstantInt::get(
+  //                        llvm::Type::getInt64Ty(LLVMCtx), ArraySize)),
+  //                });
+    // llvm::errs() << "\t\tMD >> FSanMD for new-expression: ";
+    // FSanMD->print(llvm::errs());
+    // llvm::errs() << ", resultPtr: ";
+    // resultPtr->print(llvm::errs());
+    // llvm::errs() << ", SRC LOC OF NEW: ";
+    // E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
+    // llvm::errs() << "\n";
+    // if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(resultPtr))
+    //   I->setMetadata("fsan.new", FSanMD); // TODO: not sure about his...
     // FSAN
-  }
+  // }
 
   return resultPtr;
 }
