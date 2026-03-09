@@ -172,9 +172,9 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
     // atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
     return;
   }
-  tag_t R = getR(ptr_tag);
-  tag_t L = getL(ptr_tag);
-  tag_t T = getT(ptr_tag);
+  // tag_t R = getR(ptr_tag);
+  // tag_t L = getL(ptr_tag);
+  // tag_t T = getT(ptr_tag);
 
   // VPrintf(1, "[FieldArmor] CAS A=%p SZ=%u - PTR R=%u L=%u T=%u\n", (void*)p,
   // sz,
@@ -190,43 +190,45 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   //   atomic_store(&overflows, 1ULL, memory_order_relaxed);
   // }
 
-  if (R) {
-    // VPrintf(1, "\t\t[FieldArmor] RP CHECK A=%p SZ=%u\n", (void*)p, sz);
-    if ((L == 0) && (T == 0))
-      return; /* pointer to outer root struct can do whatever -> CASE1*/
-    // TODO
-  } else {  // R == 0
-    // VPrintf(1, "\t[FieldArmor] NO RP CHK A=%p SZ=%u\n", (void*)p, sz);
+  // if (R) {
+  //   // VPrintf(1, "\t\t[FieldArmor] RP CHECK A=%p SZ=%u\n", (void*)p, sz);
+  //   if ((L == 0) && (T == 0))
+  //     return; /* pointer to outer root struct can do whatever -> CASE1*/
+  //   // TODO
+  // } else {  // R == 0
+  // VPrintf(1, "\t[FieldArmor] NO RP CHK A=%p SZ=%u\n", (void*)p, sz);
 
-    for (uptr i = 0; i < sz; i++) {
-      mem_tag = *(tag_t*)MemToShadow((uptr)untagged_ptr + i);
-      // NOTE: memtag can become 0 at some point if a) going out of bounds on
-      // the current object b) flexible array member. We tolerate a), but have
-      // to be lenient on b)
+  auto baseShadow = MemToShadow((uptr)untagged_ptr);
+  unsigned int size = (unsigned int)sz;
+  for (unsigned int i = 0; i < size; i++) {
+    mem_tag = *(tag_t*)(baseShadow + i);
+    // NOTE: memtag can become 0 at some point if a) going out of bounds on
+    // the current object b) flexible array member. We tolerate a), but have
+    // to be lenient on b)
 
-      // TODO: un-ignore levels!!!!
-      if ((getT(mem_tag)) != getT(ptr_tag) && mem_tag != 0) {
-        VPrintf(1, "[FieldArmor] TAG MISMATCH A=%p SZ=%u\n",
-                (void*)(untagged_ptr + i), sz);
-        VPrintf(1, "\t[FieldArmor] memory T: %u, pointer T: %u\n",
-                getT(mem_tag), getT(ptr_tag));
-        // VPrintf(1, "\t[FieldArmor] EXP_T=%x, MEM_T=%x\n", ptr_tag,
-        // *curr_memtag);
+    // TODO: un-ignore levels!!!!
+    if ((getT(mem_tag)) != getT(ptr_tag)) {  //  && mem_tag != 0
+      // VPrintf(1, "[FieldArmor] TAG MISMATCH A=%p SZ=%u\n",
+      //         (void*)(untagged_ptr + i), sz);
+      // VPrintf(1, "\t[FieldArmor] memory T: %u, pointer T: %u\n",
+      //         getT(mem_tag), getT(ptr_tag));
+      // VPrintf(1, "\t[FieldArmor] EXP_T=%x, MEM_T=%x\n", ptr_tag,
+      // *curr_memtag);
 
-        SigTrap<EA, AT>(p, sz);  // keeps on failing...
-        if (EA == ErrorAction::Abort)
-          __builtin_unreachable();
-      }
-      // else VPrintf(1, "\t\t[FieldArmor] TAG MATCH A=%p SZ=%u\n",
-      //         (void*)(untagged_ptr+ i), 1);
-    }  // for
-  }  // NON RP chk
+      SigTrap<EA, AT>(p, sz);  // keeps on failing...
+      if (EA == ErrorAction::Abort)
+        __builtin_unreachable();
+    }
+    // else VPrintf(1, "\t\t[FieldArmor] TAG MATCH A=%p SZ=%u\n",
+    //         (void*)(untagged_ptr+ i), 1);
+  }  // for
+  // }  // NON RP chk
 }  // CheckAddressSized
 
 template <ErrorAction EA, AccessType AT, unsigned LogSize>
 __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
-  if (!InTaggableRegion(p))
-    return;
+  // if (!InTaggableRegion(p))
+  //   return;
   // VPrintf(1, "[FieldArmor] CA -> A=%p SZ=%u\n", (void*)p, 1 << LogSize);
   // VPrintf(1, "\t[FieldArmor] CALL CAS A=%p SZ=%u\n", (void*)p, 1 << LogSize);
   CheckAddressSized<EA, AT>(p, 1 << LogSize);
