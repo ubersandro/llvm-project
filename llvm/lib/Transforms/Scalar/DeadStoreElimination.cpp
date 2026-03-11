@@ -2254,7 +2254,8 @@ struct DSEState {
       Changed |= tryToShortenEnd(DeadI, IntervalMap, DeadStart, DeadSize);
       if (IntervalMap.empty())
         continue;
-      Changed |= tryToShortenBegin(DeadI, IntervalMap, DeadStart, DeadSize);
+      // Changed |= tryToShortenBegin(DeadI, IntervalMap, DeadStart, DeadSize);
+      // FSAN: never shorten at the beginning!
     }
     return Changed;
   }
@@ -2645,7 +2646,7 @@ static bool eliminateDeadStores(Function &F, AliasAnalysis &AA, MemorySSA &MSSA,
 // DSE Pass
 //===----------------------------------------------------------------------===//
 PreservedAnalyses DSEPass::run(Function &F, FunctionAnalysisManager &AM) {
-  return PreservedAnalyses::all(); // TODO: remove this and properly fix memset shortening
+  // return PreservedAnalyses::all(); // FSAN fix -> untag the ptr before doing this
   AliasAnalysis &AA = AM.getResult<AAManager>(F);
   const TargetLibraryInfo &TLI = AM.getResult<TargetLibraryAnalysis>(F);
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
