@@ -133,6 +133,7 @@ static cl::opt<bool> ClFSAN_globals("fsan-instrument-globals",
 static cl::opt<bool> ClFSAN_memAccesses("fsan-instrument-mem-accesses",
                                         cl::desc("instrument memory accesses"),
                                         cl::Hidden, cl::init(true));
+// NO MEM ACCESSES + NO BOP -> 510 crashes for SEGV
 
 static cl::opt<bool> ClFSAN_memIntr("fsan-instrument-mem-intrinsics",
                                     cl::desc("instrument memory intrinsics"),
@@ -1307,11 +1308,11 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
        *O.Alignment >= O.TypeStoreSize / 8)) {
     size_t AccessSizeIndex = TypeSizeToSizeIndex(O.TypeStoreSize);
 
-    SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
-    IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
-                   Args);
-    // instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, I, DTU, LI);
-    // NumMemAccessesInlined++;
+    // SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
+    // IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
+    //                Args);
+    instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, I, DTU, LI);
+    NumMemAccessesInlined++;
 
   } else {
     SmallVector<Value *, 3> Args{
