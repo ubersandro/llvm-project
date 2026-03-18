@@ -13,10 +13,12 @@
 #ifndef HWASAN_CHECKS_H
 #define HWASAN_CHECKS_H
 
+#include "hwasan/hwasan.h"
 #include "hwasan_allocator.h"
 #include "hwasan_mapping.h"
 #include "hwasan_registers.h"
 #include "sanitizer_common/sanitizer_common.h"
+#include "sanitizer_common/sanitizer_internal_defs.h"
 
 // #ifdef CAN_SANITIZE_LEAKS
 // #  define CAN_SANITIZE_LEAKS 0
@@ -162,76 +164,124 @@ template <ErrorAction EA, AccessType AT>
 __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
                                                                       uptr sz) {
   if (sz == 0 || !InTaggableRegion(p)) {
-    // VPrintf(1, "[FieldArmor] CAS A=%p S=%u: <SKIP> \n", (void*)p, sz);
     return;
   }
 
   unsigned char* untagged_ptr = (unsigned char*)(p & ~kAddressTagMask);
   tag_t ptr_tag = GetTagFromPointer(p);
-  if (ptr_tag == 0) {
+
+  if (UNLIKELY(ptr_tag == 0)) {
     // atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
     return;
   }
-  // tag_t R = getR(ptr_tag);
-  // tag_t L = getL(ptr_tag);
-  // tag_t T = getT(ptr_tag);
 
-  // VPrintf(1, "[FieldArmor] CAS A=%p SZ=%u - PTR R=%u L=%u T=%u\n", (void*)p,
-  // sz,
-  //         R, L, T);
-  tag_t mem_tag = *(tag_t*)MemToShadow((uptr)untagged_ptr);
-  if (mem_tag == 0) {
+  uptr baseShadow = MemToShadow((uptr)untagged_ptr);
+  uint8_t mem_tag = *(uint8_t*)baseShadow;
+  bool memIsNull = mem_tag == 0UL;
+  // NOTE: do check on first byte, catch the smallest read possible
+
+  if (UNLIKELY(memIsNull)) {
     // atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
     return;
   }
-  // atomic_fetch_add(&total_checks, 1ULL, memory_order_relaxed);
-  // if(atomic_load(&total_checks, memory_order_relaxed) == 0){
-  //   // prevent overflow
-  //   atomic_store(&overflows, 1ULL, memory_order_relaxed);
-  // }
 
-  // if (R) {
-  //   // VPrintf(1, "\t\t[FieldArmor] RP CHECK A=%p SZ=%u\n", (void*)p, sz);
-  //   if ((L == 0) && (T == 0))
-  //     return; /* pointer to outer root struct can do whatever -> CASE1*/
-  //   // TODO
-  // } else {  // R == 0
-  // VPrintf(1, "\t[FieldArmor] NO RP CHK A=%p SZ=%u\n", (void*)p, sz);
-
-  auto baseShadow = MemToShadow((uptr)untagged_ptr);
   unsigned int size = (unsigned int)sz;
+  unsigned int chunks8B = size / 8;
+  unsigned int remainder = size % 8;
+  uint64_t ptr_tag_8B = ptr_tag * 0x0101010101010101UL;
+
+  // uint64_t extendedMemTag;
+  // for (unsigned int i = 0; i < chunks8B; i++) {
+  //   extendedMemTag = *(uint64_t*)(baseShadow + i * 8) &
+  //                    0x0F0F0F0F0F0F0F0FUL;  // only get T bits
+  //   if (UNLIKELY(extendedMemTag != ptr_tag_8B)) {
+  //     SigTrap<EA, AT>(p, sz);
+  //     if (EA == ErrorAction::Abort)
+  //       __builtin_unreachable();
+  //   }
+  // }  // for
+
+  // uptr curShadow = baseShadow + chunks8B * 8;
+  uptr curShadow = baseShadow;
+  // for (unsigned int i = 0; i < remainder; i++) {
   for (unsigned int i = 0; i < size; i++) {
-    mem_tag = *(tag_t*)(baseShadow + i);
+    tag_t mem_tag = *(tag_t*)(curShadow + i);
     // NOTE: memtag can become 0 at some point if a) going out of bounds on
     // the current object b) flexible array member. We tolerate a), but have
     // to be lenient on b)
+    if (UNLIKELY(getT(mem_tag) != getT(ptr_tag))) {  //  && mem_tag != 0
 
-    // TODO: un-ignore levels!!!!
-    if ((getT(mem_tag)) != getT(ptr_tag)) {  //  && mem_tag != 0
-      // VPrintf(1, "[FieldArmor] TAG MISMATCH A=%p SZ=%u\n",
-      //         (void*)(untagged_ptr + i), sz);
-      // VPrintf(1, "\t[FieldArmor] memory T: %u, pointer T: %u\n",
-      //         getT(mem_tag), getT(ptr_tag));
-      // VPrintf(1, "\t[FieldArmor] EXP_T=%x, MEM_T=%x\n", ptr_tag,
-      // *curr_memtag);
-
-      SigTrap<EA, AT>(p, sz);  // keeps on failing...
+      SigTrap<EA, AT>(p, sz);
       if (EA == ErrorAction::Abort)
         __builtin_unreachable();
     }
-    // else VPrintf(1, "\t\t[FieldArmor] TAG MATCH A=%p SZ=%u\n",
-    //         (void*)(untagged_ptr+ i), 1);
   }  // for
-  // }  // NON RP chk
 }  // CheckAddressSized
 
 template <ErrorAction EA, AccessType AT, unsigned LogSize>
 __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
-  // if (!InTaggableRegion(p))
-  //   return;
-  // VPrintf(1, "[FieldArmor] CA -> A=%p SZ=%u\n", (void*)p, 1 << LogSize);
-  // VPrintf(1, "\t[FieldArmor] CALL CAS A=%p SZ=%u\n", (void*)p, 1 << LogSize);
-  CheckAddressSized<EA, AT>(p, 1 << LogSize);
+  if (!InTaggableRegion(p))
+  return;
+  // NOTE: levels are masked for now, but they could be removed to make this
+  // check even faster
+
+  uint8_t tag = GetTagFromPointer(p) & 0x0FUL;  // only get T bits
+  uptr untagged_ptr = UntagAddr(p);             // this could be avoided
+  uptr shadow_addr = MemToShadow(untagged_ptr);
+  uint8_t ShadowTag = getT(*(uint8_t*)shadow_addr);
+  uint16_t TagShort = 0;
+  uint16_t ShadowTagShort = 0;
+  uint16_t ShadowTagMaskShort = 0x0F0FUL;  // only get T bits
+
+  uint32_t TagInt = 0;
+  uint32_t ShadowTagInt = 0;
+  uint32_t ShadowTagMaskInt = 0x0F0F0F0FUL;
+
+  uint64_t TagLong = 0;
+  uint64_t ShadowTagLong = 0;
+  uint64_t ShadowTagMaskLong = 0x0F0F0F0F0F0F0F0FUL;
+
+  switch (LogSize) {
+    case 0: /*byte*/
+      if (UNLIKELY(tag && ShadowTag && tag != ShadowTag))
+        SigTrap<EA, AT, LogSize>(p);
+      break;
+    case 1: /*2 bytes*/
+      TagShort = (tag << 8) ^ tag;
+      ShadowTagShort = *(uint16_t*)shadow_addr & ShadowTagMaskShort;
+      if (UNLIKELY(TagShort && ShadowTagShort && (TagShort != ShadowTagShort)))
+        SigTrap<EA, AT, LogSize>(p);
+      break;
+    case 2: /*4 bytes*/
+      TagInt = (tag << 24) ^ (tag << 16) ^ (tag << 8) ^ tag;
+      ShadowTagInt = *(uint32_t*)shadow_addr & ShadowTagMaskInt;
+      if (UNLIKELY(TagInt && ShadowTagInt && (TagInt != ShadowTagInt)))
+        SigTrap<EA, AT, LogSize>(p);
+      break;
+    case 3: /*8 bytes*/
+      TagLong = ((uint64_t)tag << 56) ^ ((uint64_t)tag << 48) ^
+                ((uint64_t)tag << 40) ^ ((uint64_t)tag << 32) ^
+                ((uint64_t)tag << 24) ^ ((uint64_t)tag << 16) ^
+                ((uint64_t)tag << 8) ^ (uint64_t)tag;
+      ShadowTagLong = *(uint64_t*)shadow_addr & ShadowTagMaskLong;
+      if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong)))
+        SigTrap<EA, AT, LogSize>(p);
+      break;
+    case 4: /*16 bytes*/
+      TagLong = ((uint64_t)tag << 56) ^ ((uint64_t)tag << 48) ^
+                ((uint64_t)tag << 40) ^ ((uint64_t)tag << 32) ^
+                ((uint64_t)tag << 24) ^ ((uint64_t)tag << 16) ^
+                ((uint64_t)tag << 8) ^ (uint64_t)tag;
+      ShadowTagLong = *(uint64_t*)shadow_addr & ShadowTagMaskLong;
+      if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong)))
+        SigTrap<EA, AT, LogSize>(p);
+      else {
+        ShadowTagLong = *(uint64_t*)(shadow_addr + 8) & ShadowTagMaskLong;
+        if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong)))
+          SigTrap<EA, AT, LogSize>(p);
+      }
+      break;
+  }
 }
 
 }  // end namespace __hwasan

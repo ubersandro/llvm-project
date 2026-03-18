@@ -26,6 +26,7 @@
 #include "TargetInfo.h"
 #include "clang/AST/OSLog.h"
 #include "clang/AST/StmtVisitor.h"
+#include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Frontend/FrontendDiagnostic.h"
 #include "llvm/IR/InlineAsm.h"
@@ -4405,7 +4406,12 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     Value *SizeVal = EmitScalarExpr(E->getArg(2));
     EmitArgCheck(TCK_Store, Dest, E->getArg(0), 0);
     EmitArgCheck(TCK_Load, Src, E->getArg(1), 1);
+    // include attribute FSAN UNTAG in ARGUMENT
     auto *I = Builder.CreateMemCpy(Dest, Src, SizeVal, false);
+    auto *MD = MDNode::get(getLLVMContext(),
+                           MDString::get(getLLVMContext(), "FSANTAG"));
+    I->setMetadata("fsan.instrument", MD);
+    // // NOTE: this is as brittle as associating metadata to NEW!
     addInstToNewSourceAtom(I, nullptr);
     if (BuiltinID == Builtin::BImempcpy ||
         BuiltinID == Builtin::BI__builtin_mempcpy)
@@ -4505,6 +4511,9 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     EmitNonNullArgCheck(Dest, E->getArg(0)->getType(),
                         E->getArg(0)->getExprLoc(), FD, 0);
     auto *I = Builder.CreateMemSet(Dest, ByteVal, SizeVal, false);
+    auto *MD = MDNode::get(getLLVMContext(),
+                           MDString::get(getLLVMContext(), "FSANTAG"));
+    I->setMetadata("fsan.instrument", MD);
     addInstToNewSourceAtom(I, ByteVal);
     return RValue::get(Dest, *this);
   }

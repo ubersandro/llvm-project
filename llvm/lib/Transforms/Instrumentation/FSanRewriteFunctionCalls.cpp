@@ -20,6 +20,14 @@
 #include <sys/types.h>
 
 using namespace llvm;
+#include "llvm/ADT/Statistic.h"
+// number of tagged chunks
+#define DEBUG_TYPE "fsan"
+STATISTIC(NumCallsRewritten, "Number of function calls rewritten");
+
+static cl::opt<bool> ClInstrumentHeap("fsan-instrument-heap",
+                                      cl::desc("instrument heap"), cl::Hidden,
+                                      cl::init(true));
 
 // TODO: turn these into ct llvm flags
 bool tagNew = true;
@@ -78,10 +86,10 @@ CallBase *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
   bool hasAlignment = false;
   // errs() << "Rewriting call to " << formerAllocatorName << "\n";
   // CI->dump();
-  
+
   // inline std::set<std::string> allocFunctions = {
-  //     "malloc",        "realloc",        "calloc", "reallocarray", "memalign",
-  //     "aligned_alloc", "posix_memalign", "valloc", "pvalloc"};
+  //     "malloc",        "realloc",        "calloc", "reallocarray",
+  //     "memalign", "aligned_alloc", "posix_memalign", "valloc", "pvalloc"};
   // extract size, n, former ptr
   if (formerAllocatorName == "malloc") {
     allocSize = CI->getArgOperand(0);
@@ -254,6 +262,7 @@ CallBase *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
   // formerCall->setCallingConv(CallingConv::C);
   CI->replaceAllUsesWith(formerCall);
   CI->eraseFromParent();
+  NumCallsRewritten++;
   return formerCall;
 }
 
@@ -499,7 +508,8 @@ u_int8_t *computeTags(StructType *Ty, Module &M) {
         //          sonSize
         //          << "\n";
         if (sonSize == 1 && isLastFieldOfStruct) {
-          // errs() << "[FieldArmor] Detected possible flexible array at offset "
+          // errs() << "[FieldArmor] Detected possible flexible array at offset
+          // "
           //        << sonOffset << " of struct " << *Ty << ", memsetting "
           //        << remainingSizeOfStruct << " bytes to 0\n";
           // detect possible flexible array and memset remaining part of
@@ -667,9 +677,7 @@ bool FSanRewriteFunctionCallsPass::RewriteCallToTypedAllocator(CallBase *CI,
   bool changed = true;
 
   // errs() << "\t[IR] REWRITING OK: " << *newCI << "\n";
-  if (allocType && !dontTag) {
-    // DO THE TAGGING
-    // TODO: handle flex members at the end -> cannot tag them with the same tag as the padding!
+  if (allocType && !dontTag && ClInstrumentHeap) {
     IRBuilder<> IRB(newCI->getNextNonDebugInstruction());
 
     Value *ArraySize =
@@ -690,7 +698,8 @@ bool FSanRewriteFunctionCallsPass::RewriteCallToTypedAllocator(CallBase *CI,
                    {IRB.CreatePointerCast(newCI, PtrTy),
                     IRB.CreatePointerCast(TagVector, PtrTy),
                     ConstantInt::get(Int64Ty, tSize), ArraySize});
-    // llvm::errs() << "[FieldArmor] DYNAMIC TAGGING SUCCESS on malloc-like:\n\t"
+    // llvm::errs() << "[FieldArmor] DYNAMIC TAGGING SUCCESS on
+    // malloc-like:\n\t"
     //              << *newCI
     //              << "\n\t\tstruct type: " << allocType->getStructName()
     //              << "\n\t\tARRAY SIZE: " << *ArraySize << "\n";
@@ -793,13 +802,15 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
             // llvm::errs() << "\t\t[IR-DBG] LAST PARAM IS NOT STRING: "
             //              << *lastArg << "\n";
             auto *type = lastArg->getType();
-            // llvm::errs() << "\t\t[IR-DBG] LAST PARAM TYPE: " << *type << "\n";
+            // llvm::errs() << "\t\t[IR-DBG] LAST PARAM TYPE: " << *type <<
+            // "\n";
             if (PHINode *phi = dyn_cast<PHINode>(lastArg)) {
               // llvm::errs() << "\t\t[IR-DBG] LAST PARAM IS PHI NODE, dumping "
               //                 "incoming values:\n";
               // for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
               //   Value *incoming = phi->getIncomingValue(i);
-              //   // llvm::errs() << "\t\t\tINCOMING VALUE: " << *incoming << "\n";
+              //   // llvm::errs() << "\t\t\tINCOMING VALUE: " << *incoming <<
+              //   "\n";
               // }
               auto *name = phi->getIncomingValue(0);
               if (Constant *nameConst = dyn_cast<Constant>(name)) {
@@ -809,7 +820,8 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
                     StringRef structNameRef = dataArray->getAsString();
                     std::string structName =
                         structNameRef.str().substr(0, structNameRef.size() - 1);
-                    // llvm::errs() << "\t\t[IR-DBG] PHI NODE INCOMING VALUE IS "
+                    // llvm::errs() << "\t\t[IR-DBG] PHI NODE INCOMING VALUE IS
+                    // "
                     //                 "STRING CONST: "
                     //              << structName << "\n";
                     if (allocType = StructType::getTypeByName(
@@ -834,7 +846,8 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
                                     &needsOffsetForCookie);
       // errs() << "\t\t[IR] REWRITING OK: " << *NewCI << "\n";
       // if (needsOffsetForCookie) {
-      //   errs() << "[IR] NEW OPERATOR CALL WITH COOKIE, will offset tagging by "
+      //   errs() << "[IR] NEW OPERATOR CALL WITH COOKIE, will offset tagging by
+      //   "
       //             "8 bytes\n";
       // }
 
@@ -846,7 +859,7 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
       }
 
       { // do the tagging
-        if (allocType && allocType->isStructTy()) {
+        if (allocType && allocType->isStructTy() && ClInstrumentHeap) {
           // llvm::errs() << "[FieldArmor] TYPE TO TAG: "
           //              << allocType->getStructName() << "\n";
           Instruction *InsertPt = nullptr;
@@ -894,7 +907,8 @@ bool processNewOperatorCalls(CallBase *I, Module &M) {
           // array
 
           if (isNewArray && needsOffsetForCookie) {
-            // errs() << "\t\t[IR] NEW[] WITH COOKIE, OFFSETTING TAGGING POINTER "
+            // errs() << "\t\t[IR] NEW[] WITH COOKIE, OFFSETTING TAGGING POINTER
+            // "
             //           "BY 8 "
             //           "BYTES\n";
             Value *Offset =
@@ -971,14 +985,15 @@ FSanRewriteFunctionCallsPass::run(Module &M, ModuleAnalysisManager &MAM) {
   bool changed = false;
   llvm::errs() << "[IR] Running FSanRewriteFunctionCallsPass on module: "
                << M.getName() << "\n";
-
+  llvm::errs() << "[FSAN] HEAP INSTRUMENTATION: " << (ClInstrumentHeap ? "ON" : "OFF")
+               << "\n";
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
     // Collect calls first to avoid iterator invalidation
     std::set<CallBase *> typedMallocLikeToRewrite;
     std::set<CallBase *> typedNewOperatorToRewrite;
-
+    
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         if (CallBase *CB = dyn_cast<CallBase>(&I)) {
