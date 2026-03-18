@@ -278,7 +278,7 @@ private:
 PreservedAnalyses LoopIdiomRecognizePass::run(Loop &L, LoopAnalysisManager &AM,
                                               LoopStandardAnalysisResults &AR,
                                               LPMUpdater &) {
-  // if (DisableLIRP::All)
+  if (DisableLIRP::All)
     return PreservedAnalyses::all();
 
   const auto *DL = &L.getHeader()->getDataLayout();

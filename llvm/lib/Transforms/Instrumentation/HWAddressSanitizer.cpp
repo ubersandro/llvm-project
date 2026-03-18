@@ -10,7 +10,7 @@
 /// This file is a part of HWAddressSanitizer, an address basic correctness
 /// checker based on tagged addressing.
 //===----------------------------------------------------------------------===//
-#define TRANS_CONSTANT 0x400000000000ULL // 1<<46
+#define TRANS_CONSTANT 0x400000000000ULL // 1<<46, 0x400000000000
 #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -86,7 +86,7 @@ static const size_t kNumberOfAccessSizes = 5;
 
 static const size_t kDefaultShadowScale = 0; // 1 to 1 mapping in shadow memory
 
-static const unsigned kShadowBaseAlignment = 32; // TODO: why is this unused?
+static const unsigned kShadowBaseAlignment = 32;
 
 namespace {
 enum class OffsetKind {
@@ -96,10 +96,6 @@ enum class OffsetKind {
   kTls,
 };
 }
-/**
- * SW compatibility is a concern. When using un-instrumented code (e.g libs),
- * tagged pointers might wreak havoc.
- */
 
 static cl::opt<std::string>
     ClMemoryAccessCallbackPrefix("hwasan-memory-access-callback-prefix",
@@ -111,10 +107,41 @@ static cl::opt<bool> ClKasanMemIntrinCallbackPrefix(
     cl::desc("Use prefix for memory intrinsics in KASAN mode"), cl::Hidden,
     cl::init(false));
 
+// FSAN KNOBS
+bool ptrTagging = true;
+static cl::opt<bool>
+    ClFSAN_GEP("fsan-instrument-geps",
+               cl::desc("instrument getelementptr instructions"), cl::Hidden,
+               cl::init(ptrTagging));
+
+static cl::opt<bool> ClFSAN_BOP("fsan-instrument-bops",
+                                cl::desc("instrument binary op instructions"),
+                                cl::Hidden, cl::init(false));
+
+static cl::opt<bool> ClFSAN_CMP("fsan-instrument-cmp",
+                                cl::desc("instrument compare instructions"),
+                                cl::Hidden, cl::init(ptrTagging));
+
+static cl::opt<bool> ClFSAN_stack("fsan-instrument-stack",
+                                  cl::desc("instrument stack allocations"),
+                                  cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClFSAN_globals("fsan-instrument-globals",
+                                    cl::desc("Instrument globals"), cl::Hidden,
+                                    cl::init(true));
+// TODO: for heap, see FSanRewrite...
+static cl::opt<bool> ClFSAN_memAccesses("fsan-instrument-mem-accesses",
+                                        cl::desc("instrument memory accesses"),
+                                        cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClFSAN_memIntr("fsan-instrument-mem-intrinsics",
+                                    cl::desc("instrument memory intrinsics"),
+                                    cl::Hidden, cl::init(true));
+// FSAN KNOBS
 static cl::opt<bool> ClInstrumentWithCalls(
     "hwasan-instrument-with-calls",
     cl::desc("instrument reads and writes with callbacks"), cl::Hidden,
-    cl::init(true)); // HWAsanIO does this, no idea why - maybe debugging?
+    cl::init(true));
 
 static cl::opt<bool> ClInstrumentReads("hwasan-instrument-reads",
                                        cl::desc("instrument read instructions"),
@@ -139,38 +166,16 @@ static cl::opt<bool> ClRecover(
     "hwasan-recover", cl::desc("Enable recovery mode (continue-after-error)."),
     cl::Hidden, cl::init(false)); // TODO: extend this with ignore_pc a la ASAN
 
-static cl::opt<bool> ClInstrumentStack("hwasan-instrument-stack",
-                                       cl::desc("instrument stack (allocas)"),
-                                       cl::Hidden, cl::init(true));
-
-static cl::opt<bool> ClInstrumentGEPs(
-    "fieldarmor-instrument-geps",
-    cl::desc("instrument getelementptr instructions to untag results"),
-    cl::Hidden, cl::init(true));
-
-static cl::opt<bool> ClInstrumentBOPs(
-    "fieldarmor-instrument-bop",
-    cl::desc("instrument binary op instructions to untag operands"), cl::Hidden,
-    cl::init(true));
-
 static cl::opt<bool>
     ClUseStackSafety("hwasan-use-stack-safety", cl::Hidden, cl::init(true),
                      cl::Hidden, cl::desc("Use Stack Safety analysis results"),
-                     cl::Optional);
+                     cl::Optional); // TODO: does this remove UB?
 
 static cl::opt<size_t> ClMaxLifetimes(
     "hwasan-max-lifetimes-for-alloca", cl::Hidden, cl::init(3),
     cl::ReallyHidden,
     cl::desc("How many lifetime ends to handle for a single alloca."),
     cl::Optional);
-
-static cl::opt<bool> ClGenerateTagsWithCalls(
-    "hwasan-generate-tags-with-calls",
-    cl::desc("generate new tags with runtime library calls"), cl::Hidden,
-    cl::init(false));
-
-static cl::opt<bool> ClGlobals("hwasan-globals", cl::desc("Instrument globals"),
-                               cl::Hidden, cl::init(true));
 
 static cl::opt<int> ClMatchAllTag(
     "hwasan-match-all-tag",
@@ -203,41 +208,20 @@ static cl::opt<bool>
                    cl::desc("Use ring buffer for stack allocations"),
                    cl::Hidden);
 
-static cl::opt<int> ClHotPercentileCutoff("hwasan-percentile-cutoff-hot",
-                                          cl::desc("Hot percentile cutoff."));
-
 STATISTIC(NumTotalFuncs, "Number of total funcs");
 STATISTIC(NumInstrumentedFuncs, "Number of instrumented funcs");
 STATISTIC(NumNoProfileSummaryFuncs, "Number of funcs without PS");
 STATISTIC(LiteralStructs,
           "Number of literal structs encountered, doubly counted though");
-// STATISTIC(NumTotalGEPs, "Number of total GEP instructions");
-STATISTIC(
-    NumUntaggedGEPResults,
-    "Number of untagged GEP results"); // proxy for how many checks we skip
 STATISTIC(NumInstrumentedGEPs, "Number of instrumented GEP instructions");
-// STATISTIC(NumIgnoredGEPs, "Number of ignored GEP instructions");
-
 STATISTIC(NumInstrumentedGlobals, "Number of instrumented global variables");
 STATISTIC(NumDefinedTagVectors, "Number of defined tag vectors (same as the "
                                 "number of totally identified struct types.)");
 STATISTIC(NumInstrumentedCMPs, "Number of instrumented CMP instructions");
-// STATISTIC(NumEmbeddedUnions, "Number of unions embedded in other structs");
-// STATISTIC(NumLiteralStructs, "Number of literal structs encountered");
-// STATISTIC(NumLiteralStructsEmbedded,
-//           "Number of literal structs embedded in other structs");
-
-// STATISTIC(NumInstrumentedArithmeticOps,
-//           "Number of instrumented arithmetic instructions");
-// STATISTIC(
-//     NumChecksOnUntaggedPtrs,
-//     "Number of checks skipped on untagged pointers"); // TODO: find a way of
-//                                                       // implementing this.
-//                                                       It's
-//                                                       // impossible to get it
-//                                                       // from the LOAD/STORE
-//                                                       // instruction itself
 STATISTIC(NumInstrumentedMemAccesses, "Number of instrumented memory accesses");
+STATISTIC(NumMemAccessesInlined, "Number of memory accesses inlined");
+STATISTIC(NumMemAccessesNotInlined, "Number of memory accesses not inlined");
+STATISTIC(NumInstrumentedIntrinsics, "Number of instrumented intrinsics");
 // Mode for selecting how to insert frame record info into the stack ring
 // buffer.
 
@@ -252,21 +236,6 @@ enum RecordStackHistoryMode {
   // Add a call to __hwasan_add_frame_record in the runtime.
   libcall,
 };
-static cl::opt<RecordStackHistoryMode> ClRecordStackHistory(
-    "hwasan-record-stack-history",
-    cl::desc("Record stack frames with tagged allocations in a thread-local "
-             "ring buffer"),
-    cl::values(clEnumVal(none, "Do not record stack ring history"),
-               clEnumVal(instr, "Insert instructions into the prologue for "
-                                "storing into the stack ring buffer directly"),
-               clEnumVal(libcall, "Add a call to __hwasan_add_frame_record for "
-                                  "storing into the stack ring buffer")),
-    cl::Hidden, cl::init(instr));
-
-static cl::opt<bool>
-    ClInstrumentMemIntrinsics("hwasan-instrument-mem-intrinsics",
-                              cl::desc("instrument memory intrinsics"),
-                              cl::Hidden, cl::init(true));
 
 static cl::opt<bool>
     ClInstrumentLandingPads("hwasan-instrument-landing-pads",
@@ -275,16 +244,7 @@ static cl::opt<bool>
 
 static cl::opt<bool> ClInstrumentPersonalityFunctions(
     "hwasan-instrument-personality-functions",
-    cl::desc("instrument personality functions"),
-    cl::Hidden); // ALE: why would I use this?
-
-static cl::opt<bool> ClInlineAllChecks("hwasan-inline-all-checks",
-                                       cl::desc("inline all checks"),
-                                       cl::Hidden, cl::init(false));
-
-static cl::opt<bool> ClInlineFastPathChecks("hwasan-inline-fast-path-checks",
-                                            cl::desc("inline all checks"),
-                                            cl::Hidden, cl::init(false));
+    cl::desc("instrument personality functions"), cl::Hidden, cl::init(false));
 
 namespace {
 
@@ -292,9 +252,7 @@ template <typename T> T optOr(cl::opt<T> &Opt, T Other) {
   return Opt.getNumOccurrences() ? Opt : Other;
 }
 
-bool shouldInstrumentStack(const Triple &TargetTriple) {
-  return ClInstrumentStack;
-}
+bool shouldInstrumentStack(const Triple &TargetTriple) { return ClFSAN_stack; }
 
 bool shouldInstrumentWithCalls(const Triple &TargetTriple) {
   return optOr(ClInstrumentWithCalls, TargetTriple.getArch() == Triple::x86_64);
@@ -339,45 +297,19 @@ private:
   };
 
   // FieldArmor addenda
-  // u_int64_t TagBits = 7; // for later use
   u_int64_t RPTag = 0x0LU;
-  // it seems that setting RPTag to 0x80/0x40 breaks things in the C++ stdlib
-  // TODO: look more into this -> there still things that do not make much
-  // sense. For instance, GEPs and arithmetic clash
-  // TODO: dump all the malloc happening, see if the size is influenced by GEPs
-  // being tagged (and it will be for sure)
-  // u_int64_t TagMask = 0b01111111Lu; // mask to apply to get T+L+R
-  u_int64_t R_Mask = 0b01000000Lu;
-  u_int64_t L_Mask = 0b00110000Lu;
-  u_int64_t T_Mask = 0b00001111Lu;
-
-  Value *T_Mask_value = nullptr;
-  Value *L_Mask_value = nullptr;
-  Value *R_Mask_value = nullptr;
-
   void InstrumentGEP(GetElementPtrInst *GEPI);
   void InstrumentBOP(BinaryOperator *BOP);
   StructType *getStructTypeFromDbgInfo(GlobalVariable *GV, int *numElements,
                                        bool *isUnion);
   void InstrumentStoreOfFunctionArg(StoreInst *SI);
   Type *figureOutInheritance(const std::set<Type *> &structTypes);
-
-  void ReconstructAllocTypeAndTag(
-      CallBase *CI,
-      const std::string &DemangledName); // FieldArmor - legacy
-  void InstrumentAllocWithType(CallBase *CI, StructType *AllocType,
-                               Value *ArraySize);
-  // void HandleNewOperator(CallInst *CI,
-  //                        const std::string &DemangledName); // FieldArmor
-  void RewriteCallToTypedAllocator(CallBase *CI); // FieldArmor
   Value *GetArraySize(CallBase *CI, StructType *t,
                       IRBuilder<> &IRB); // FieldArmor
   void handleGEP2operands(GetElementPtrInst *GEPI);
   void InstrumentCMP(CmpInst *CI);
-  void InstrumentPtrToInt(PtrToIntInst *PI);
-  void InstrumentArithmetic(BinaryOperator *BO);
-  void InstrumentConstGEP(ConstantExpr *GEPI);
-  Value *getRPTag(IRBuilder<> &IRB); // FieldArmor
+  void InstrumentConstGEP(ConstantExpr *GEPI); // TODO
+  Value *getRPTag(IRBuilder<> &IRB);           // FieldArmor
   Value *ApplyRLT(IRBuilder<> &IRB, Instruction *AI, Type *rootType,
                   const DataLayout &DL); // TODO: refactor remove DL
 
@@ -385,9 +317,6 @@ private:
   void createTagVectors();                          // FieldArmor
   void createTagVector(StructType *t);              // FieldArmor
   Value *RetrieveOrCreateTagVector(StructType *Ty); // FieldArmor
-  bool potentiallyBlacklistFunction(Function &F);   // FieldArmor
-  void HandleMallocLikeCall(CallBase *CI);
-  void HandleNewCall(CallInst *CI);
   // END FieldArmor
 
   bool selectiveInstrumentationShouldSkip(Function &F,
@@ -407,9 +336,8 @@ private:
   Value *memToShadow(Value *Shadow, IRBuilder<> &IRB);
 
   int64_t getAccessInfo(bool IsWrite, unsigned AccessSizeIndex);
-  ShadowTagCheckInfo insertShadowTagCheck(
-      Value *Ptr, Instruction *InsertBefore, DomTreeUpdater &DTU,
-      LoopInfo *LI); // this is for fast checking ... TODO Look into it
+  ShadowTagCheckInfo insertShadowTagCheck(Value *Ptr, Instruction *InsertBefore,
+                                          DomTreeUpdater &DTU, LoopInfo *LI);
   void instrumentMemAccessOutline(Value *Ptr, bool IsWrite,
                                   unsigned AccessSizeIndex,
                                   Instruction *InsertBefore,
@@ -435,6 +363,7 @@ private:
   void untagAlloca(IRBuilder<> &IRB, AllocaInst *AI, const DataLayout &DL);
   Value *tagPointer(IRBuilder<> &IRB, Type *Ty, Value *PtrLong, Value *Tag);
   Value *untagPointer(IRBuilder<> &IRB, Value *PtrLong);
+  Value *untagPointerIntrinsic(IRBuilder<> &IRB, Value *Ptr);
   bool instrumentStack(memtag::StackInfo &Info, const DominatorTree &DT,
                        const PostDominatorTree &PDT, const LoopInfo &LI,
                        const DataLayout &DL);
@@ -444,9 +373,6 @@ private:
   Value *getHwasanThreadSlotPtr(IRBuilder<> &IRB);
   Value *applyTagMask(IRBuilder<> &IRB, Value *OldTag);
   unsigned retagMask(unsigned AllocaNo);
-
-  // void emitPrologue(IRBuilder<> &IRB, bool WithFrameRecord); // for UAR
-
   void instrumentGlobal(GlobalVariable *GV);
 
   void instrumentGlobals();
@@ -730,7 +656,20 @@ void HWAddressSanitizer::initializeModule() {
 
   InstrumentWithCalls = shouldInstrumentWithCalls(TargetTriple);
   InstrumentStack = shouldInstrumentStack(TargetTriple);
+  errs() << "[FSAN] MEM ACCESS" << (ClFSAN_memAccesses ? " ON\n" : " OFF\n");
+  errs() << "[FSAN] MEM INTRIN" << (ClFSAN_memIntr ? " ON\n" : " OFF\n");
+  errs() << "[FSAN] STACK" << (ClFSAN_stack ? " ON\n" : " OFF\n");
+  errs() << "[FSAN] GLOBALS " << (ClFSAN_globals ? " ON\n" : " OFF\n");
+  errs() << "[FSAN] BOP " << (ClFSAN_BOP ? " ON\n" : " OFF\n");
+  errs() << "[FSAN] CMP " << (ClFSAN_CMP ? " ON\n" : " OFF\n");
+  errs() << "[FSAN] GEP " << (ClFSAN_GEP ? " ON\n" : " OFF\n");
 
+  unsigned PtrBits = M.getDataLayout().getPointerTypeSizeInBits(PtrTy);
+  Type *MaskTy = IntegerType::get(M.getContext(), PtrBits);
+  Function *PtrMask =
+      Intrinsic::getDeclaration(&M, Intrinsic::ptrmask, {PtrTy, MaskTy});
+  errs() << "[FSAN] PointerMask intrinsic: "
+         << (PtrMask ? "FOUND\n" : "NOT FOUND\n");
   PointerTagShift = IsX86_64 ? 57 : 56;
   TagMaskByte = IsX86_64 ? 0x3F : 0xFF;
   // errs() << "[DBGDBG] PointerTagShift: " << PointerTagShift
@@ -748,13 +687,14 @@ void HWAddressSanitizer::initializeModule() {
   bool NewRuntime =
       !TargetTriple.isAndroid() || !TargetTriple.isAndroidVersionLT(30);
 
-  OutlinedChecks = (TargetTriple.isAArch64() || TargetTriple.isRISCV64()) &&
-                   TargetTriple.isOSBinFormatELF() &&
-                   !optOr(ClInlineAllChecks, Recover);
+  // OutlinedChecks = (TargetTriple.isAArch64() || TargetTriple.isRISCV64()) &&
+  //                  TargetTriple.isOSBinFormatELF() &&
+  //                  !optOr(ClInlineAllChecks, Recover);
 
   // These platforms may prefer less inlining to reduce binary size.
-  InlineFastPath = optOr(ClInlineFastPathChecks, !(TargetTriple.isAndroid() ||
-                                                   TargetTriple.isOSFuchsia()));
+  // InlineFastPath = optOr(ClInlineFastPathChecks, !(TargetTriple.isAndroid()
+  // ||
+  //                                                  TargetTriple.isOSFuchsia()));
 
   if (ClMatchAllTag.getNumOccurrences()) {
     if (ClMatchAllTag != -1) {
@@ -766,20 +706,20 @@ void HWAddressSanitizer::initializeModule() {
   UseMatchAllCallback = !CompileKernel && MatchAllTag.has_value();
 
   // If we don't have personality function support, fall back to landing pads.
-  InstrumentLandingPads = optOr(ClInstrumentLandingPads, !NewRuntime);
+  InstrumentLandingPads = optOr(ClInstrumentLandingPads, true); // DEBUG
 
-  InstrumentGlobals = !CompileKernel && optOr(ClGlobals, NewRuntime);
+  InstrumentGlobals = optOr(ClFSAN_globals, true);
 
   if (!CompileKernel) {
     createHwasanCtorComdat(); // creates the routine ctor with a call into the
                               // runtime function __hwasan_init
 
     createTagVectors();
-    // TODO: look into this, maybe it's causing issues on x86?
-    // TODO: explore code model issues, address space is different on x86
-    // can performance downgrade result from AS being compressed?
-    if (InstrumentGlobals)
+    if (InstrumentGlobals) {
+      errs() << "[FSAN] GLOBAL ON\n";
       instrumentGlobals();
+    } else
+      errs() << "[FSAN] GLOBAL OFF\n";
 
     bool InstrumentPersonalityFunctions =
         optOr(ClInstrumentPersonalityFunctions, NewRuntime);
@@ -797,9 +737,6 @@ void HWAddressSanitizer::initializeModule() {
       return GV;
     });
   }
-  T_Mask_value = ConstantInt::get(Type::getInt64Ty(M.getContext()), T_Mask);
-  L_Mask_value = ConstantInt::get(Type::getInt64Ty(M.getContext()), L_Mask);
-  R_Mask_value = ConstantInt::get(Type::getInt64Ty(M.getContext()), R_Mask);
 }
 
 void HWAddressSanitizer::initializeCallbacks(Module &M) {
@@ -974,6 +911,7 @@ void HWAddressSanitizer::getInterestingMemoryOperands(
     const TargetLibraryInfo &TLI,
     SmallVectorImpl<InterestingMemoryOperand> &Interesting) {
   // Skip memory accesses inserted by another instrumentation.
+  // TODO : try and retrofit this
   if (I->hasMetadata(LLVMContext::MD_nosanitize))
     return;
 
@@ -1050,14 +988,6 @@ void HWAddressSanitizer::untagPointerOperand(Instruction *I, Value *Addr) {
 }
 
 Value *HWAddressSanitizer::memToShadow(Value *Mem, IRBuilder<> &IRB) {
-  // Mem >> Scale NOT ANYMORE
-  // Value *Shadow = IRB.CreateLShr(Mem, Mapping.scale());
-  // if (Mapping.isFixed() && Mapping.offset() == 0)
-  //   return IRB.CreateIntToPtr(Shadow, PtrTy);
-  // // (Mem >> Scale) + Offset
-  // return IRB.CreatePtrAdd(ShadowBase, Shadow);
-  // NEW
-  // CURRENT: mem ^ 0x400000000000 // 1<<46
   Value *XorVal =
       IRB.CreateXor(Mem, ConstantInt::get(IntptrTy, TRANS_CONSTANT));
   return IRB.CreateIntToPtr(XorVal, PtrTy);
@@ -1075,33 +1005,7 @@ int64_t HWAddressSanitizer::getAccessInfo(bool IsWrite,
 
 HWAddressSanitizer::ShadowTagCheckInfo
 HWAddressSanitizer::insertShadowTagCheck(Value *Ptr, Instruction *InsertBefore,
-                                         DomTreeUpdater &DTU, LoopInfo *LI) {
-  ShadowTagCheckInfo R;
-
-  IRBuilder<> IRB(InsertBefore);
-
-  R.PtrLong = IRB.CreatePointerCast(Ptr, IntptrTy);
-  R.PtrTag =
-      IRB.CreateTrunc(IRB.CreateLShr(R.PtrLong, PointerTagShift), Int8Ty);
-  R.AddrLong = untagPointer(IRB, R.PtrLong);
-  Value *Shadow = memToShadow(R.AddrLong, IRB);
-  R.MemTag = IRB.CreateLoad(Int8Ty, Shadow);
-  Value *TagMismatch = IRB.CreateICmpNE(R.PtrTag, R.MemTag);
-
-  if (MatchAllTag.has_value()) {
-    LLVM_DEBUG(dbgs() << "Inserting match-all tag check for tag="
-                      << (unsigned)(*MatchAllTag) << "\n");
-    Value *TagNotIgnored = IRB.CreateICmpNE(
-        R.PtrTag, ConstantInt::get(R.PtrTag->getType(), *MatchAllTag));
-    TagMismatch = IRB.CreateAnd(TagMismatch, TagNotIgnored);
-  }
-
-  R.TagMismatchTerm = SplitBlockAndInsertIfThen(
-      TagMismatch, InsertBefore, false,
-      MDBuilder(*C).createUnlikelyBranchWeights(), &DTU, LI);
-
-  return R;
-}
+                                         DomTreeUpdater &DTU, LoopInfo *LI) {}
 
 void HWAddressSanitizer::instrumentMemAccessOutline(Value *Ptr, bool IsWrite,
                                                     unsigned AccessSizeIndex,
@@ -1110,16 +1014,8 @@ void HWAddressSanitizer::instrumentMemAccessOutline(Value *Ptr, bool IsWrite,
                                                     LoopInfo *LI) {
 
   const int64_t AccessInfo = getAccessInfo(IsWrite, AccessSizeIndex);
-  LLVM_DEBUG(dbgs() << "REMOVING INLINE CHECKS SINCE THEY BREAK EVERYTHING\n");
-
-  // if (InlineFastPath) // @ale: this function short circuits checks if
-  // inlineFastPath is true
-  //   InsertBefore =
-  //       insertShadowTagCheck(Ptr, InsertBefore, DTU, LI).TagMismatchTerm; //
-  //       DONT DONT DONT
-
   IRBuilder<> IRB(InsertBefore);
-  bool UseFixedShadowIntrinsic = false; // TODO: properly fix this @ale
+  bool UseFixedShadowIntrinsic = false;
   // The memaccess fixed shadow intrinsic is only supported on AArch64,
   // which allows a 16-bit immediate to be left-shifted by 32.
   // Since kShadowBaseAlignment == 32, and Linux by default will not
@@ -1133,7 +1029,7 @@ void HWAddressSanitizer::instrumentMemAccessOutline(Value *Ptr, bool IsWrite,
         static_cast<uint64_t>(OffsetShifted) << 32 == Mapping.offset();
   }
 
-  if (UseFixedShadowIntrinsic) { /* THIS IS STILL A MISTERY TO DATE */
+  if (UseFixedShadowIntrinsic) {
     IRB.CreateIntrinsic(Intrinsic::hwasan_check_memaccess_fixedshadow,
                         {Ptr, ConstantInt::get(Int32Ty, AccessInfo),
                          ConstantInt::get(Int64Ty, Mapping.offset())});
@@ -1149,43 +1045,114 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
                                                    Instruction *InsertBefore,
                                                    DomTreeUpdater &DTU,
                                                    LoopInfo *LI) {
+  ShadowTagCheckInfo R;
+  // Accesses sizes are powers of two: 1, 2, 4, 8, 16.
 
-  const int64_t AccessInfo = getAccessInfo(IsWrite, AccessSizeIndex);
+  IRBuilder<> IRB(InsertBefore);
+  R.PtrLong = IRB.CreatePointerCast(Ptr, IntptrTy);
+  auto *Int128Ty = IntegerType::get(*C, 128);
+  auto *Int16Ty = IntegerType::get(*C, 16);
 
-  ShadowTagCheckInfo TCI = insertShadowTagCheck(Ptr, InsertBefore, DTU, LI);
+  R.PtrTag = IRB.CreateTrunc(IRB.CreateLShr(R.PtrLong, PointerTagShift),
+                             Int8Ty); // INT8
 
-  IRBuilder<> IRB(TCI.TagMismatchTerm);
-  Value *OutOfShortGranuleTagRange =
-      IRB.CreateICmpUGT(TCI.MemTag, ConstantInt::get(Int8Ty, 15));
-  Instruction *CheckFailTerm = SplitBlockAndInsertIfThen(
-      OutOfShortGranuleTagRange, TCI.TagMismatchTerm, !Recover,
+  Value *Shadow = memToShadow(R.PtrLong, IRB);
+  R.MemTag = nullptr;
+  Value *TagMismatch = nullptr;
+
+  // extend ptr tag
+  switch (AccessSizeIndex) {
+  case 0:
+    // errs() << "[FSAN] 1B access \n";
+    // InsertBefore->dump();
+    // errs() << "\n";
+    R.MemTag = IRB.CreateLoad(R.PtrTag->getType(), Shadow);
+
+    TagMismatch = IRB.CreateICmpNE(
+        R.PtrTag,
+        IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(), 0x0FUL)));
+    break;
+  case 1:
+    // errs() << "[FSAN] 2B access \n";
+    // InsertBefore->dump();
+    // errs() << "\n";
+    R.PtrTag = IRB.CreateZExt(R.PtrTag, Int16Ty);
+    R.PtrTag = IRB.CreateMul(R.PtrTag, ConstantInt::get(Int16Ty, 0x0101UL));
+    R.MemTag = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
+    TagMismatch = IRB.CreateICmpNE(
+        R.PtrTag, IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(),
+                                                           0x0F0FUL)));
+    break;
+  case 2:
+    // errs() << "[FSAN] 4B access \n";
+    // InsertBefore->dump();
+    // errs() << "\n";
+    R.PtrTag = IRB.CreateZExt(R.PtrTag, Int32Ty);
+    R.PtrTag = IRB.CreateMul(R.PtrTag, ConstantInt::get(Int32Ty, 0x01010101UL));
+    R.MemTag = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
+    TagMismatch = IRB.CreateICmpNE(
+        R.PtrTag, IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(),
+                                                           0x0F0F0F0FUL)));
+    break;
+  case 3:
+    // errs() << "[FSAN] 8B access \n";
+    // InsertBefore->dump();
+    // errs() << "\n";
+    R.PtrTag = IRB.CreateZExt(R.PtrTag, Int64Ty);
+    R.PtrTag = IRB.CreateMul(R.PtrTag,
+                             ConstantInt::get(Int64Ty, 0x0101010101010101ULL));
+    R.MemTag = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
+    TagMismatch = IRB.CreateICmpNE(
+        R.PtrTag,
+        IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(),
+                                                 0x0F0F0F0F0F0F0F0FULL)));
+    break;
+  case 4:
+    // errs() << "[FSAN] 16B access \n";
+    // InsertBefore->dump();
+    // errs() << "\n";
+    R.PtrTag = IRB.CreateZExt(R.PtrTag, Int128Ty);
+    // Int128Ty already defined earlier:
+    auto *Int128Ty = IntegerType::get(*C, 128);
+
+    // Build a 128-bit APInt from a hex string (no "0x" prefix).
+    APInt ExtendPattern(128, "01010101010101010101010101010101", 16);
+    R.PtrTag =
+        IRB.CreateMul(R.PtrTag, ConstantInt::get(Int128Ty, ExtendPattern));
+    R.MemTag = IRB.CreateLoad(R.PtrTag->getType(), Shadow);
+    APInt MaskPattern(128, "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F", 16);
+    R.MemTag = IRB.CreateAnd(R.MemTag, ConstantInt::get(Int128Ty, MaskPattern));
+    TagMismatch = IRB.CreateICmpNE(R.PtrTag, R.MemTag);
+    break;
+  }
+  assert(R.MemTag && "MemTag should have been set in the switch statement");
+  // R.MemTag->setName("fsan.memtag");
+
+  Value *MemoryIsTagged =
+      IRB.CreateICmpNE(R.MemTag, ConstantInt::get(R.MemTag->getType(), 0x0UL));
+  // MemoryIsTagged->setName("fsan.memory_is_tagged");
+  Value *PtrIsTagged =
+      IRB.CreateICmpNE(R.PtrTag, ConstantInt::get(R.PtrTag->getType(), 0x0UL));
+  // PtrIsTagged->setName("fsan.ptr_is_tagged");
+  // set mem op as volatile
+
+  Value *AllConditions = IRB.CreateAnd(PtrIsTagged, MemoryIsTagged);
+  AllConditions = IRB.CreateAnd(AllConditions, TagMismatch);
+  // AND: if (tag mismatch && memory is tagged && pointer is tagged)
+  // Q: does
+  R.TagMismatchTerm = SplitBlockAndInsertIfThen(
+      AllConditions, InsertBefore, false,
       MDBuilder(*C).createUnlikelyBranchWeights(), &DTU, LI);
 
-  IRB.SetInsertPoint(TCI.TagMismatchTerm);
-  Value *PtrLowBits = IRB.CreateTrunc(IRB.CreateAnd(TCI.PtrLong, 15), Int8Ty);
-  PtrLowBits = IRB.CreateAdd(
-      PtrLowBits, ConstantInt::get(Int8Ty, (1 << AccessSizeIndex) - 1));
-  Value *PtrLowBitsOOB = IRB.CreateICmpUGE(PtrLowBits, TCI.MemTag);
-  SplitBlockAndInsertIfThen(PtrLowBitsOOB, TCI.TagMismatchTerm, false,
-                            MDBuilder(*C).createUnlikelyBranchWeights(), &DTU,
-                            LI, CheckFailTerm->getParent());
+  IRB.SetInsertPoint(R.TagMismatchTerm);
 
-  IRB.SetInsertPoint(TCI.TagMismatchTerm);
-  Value *InlineTagAddr = IRB.CreateOr(TCI.AddrLong, 15);
-  InlineTagAddr = IRB.CreateIntToPtr(InlineTagAddr, PtrTy);
-  Value *InlineTag = IRB.CreateLoad(Int8Ty, InlineTagAddr);
-  Value *InlineTagMismatch = IRB.CreateICmpNE(TCI.PtrTag, InlineTag);
-  SplitBlockAndInsertIfThen(InlineTagMismatch, TCI.TagMismatchTerm, false,
-                            MDBuilder(*C).createUnlikelyBranchWeights(), &DTU,
-                            LI, CheckFailTerm->getParent());
-
-  IRB.SetInsertPoint(CheckFailTerm);
   InlineAsm *Asm;
+  const int64_t AccessInfo = getAccessInfo(IsWrite, AccessSizeIndex);
   switch (TargetTriple.getArch()) {
   case Triple::x86_64:
     // The signal handler will find the data address in rdi.
     Asm = InlineAsm::get(
-        FunctionType::get(VoidTy, {TCI.PtrLong->getType()}, false),
+        FunctionType::get(VoidTy, {R.PtrLong->getType()}, false),
         "int3\nnopl " +
             itostr(0x40 + (AccessInfo & HWASanAccessInfo::RuntimeMask)) +
             "(%rax)",
@@ -1196,7 +1163,7 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
   case Triple::aarch64_be:
     // The signal handler will find the data address in x0.
     Asm = InlineAsm::get(
-        FunctionType::get(VoidTy, {TCI.PtrLong->getType()}, false),
+        FunctionType::get(VoidTy, {R.PtrLong->getType()}, false),
         "brk #" + itostr(0x900 + (AccessInfo & HWASanAccessInfo::RuntimeMask)),
         "{x0}",
         /*hasSideEffects=*/true);
@@ -1204,7 +1171,7 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
   case Triple::riscv64:
     // The signal handler will find the data address in x10.
     Asm = InlineAsm::get(
-        FunctionType::get(VoidTy, {TCI.PtrLong->getType()}, false),
+        FunctionType::get(VoidTy, {R.PtrLong->getType()}, false),
         "ebreak\naddiw x0, x11, " +
             itostr(0x40 + (AccessInfo & HWASanAccessInfo::RuntimeMask)),
         "{x10}",
@@ -1213,10 +1180,7 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
   default:
     report_fatal_error("unsupported architecture");
   }
-  IRB.CreateCall(Asm, TCI.PtrLong);
-  if (Recover)
-    cast<BranchInst>(CheckFailTerm)
-        ->setSuccessor(0, TCI.TagMismatchTerm->getParent());
+  IRB.CreateCall(Asm, R.PtrLong); // TODO: bring back
 }
 
 bool HWAddressSanitizer::ignoreMemIntrinsic(OptimizationRemarkEmitter &ORE,
@@ -1230,66 +1194,26 @@ bool HWAddressSanitizer::ignoreMemIntrinsic(OptimizationRemarkEmitter &ORE,
   return false;
 }
 
+bool memcpyIsOOB(MemTransferInst *MTI, const DataLayout &DL) {
+  // return true if statically sized memcpy calls write past the bounds of a
+  // field
+  // TODO
+  return false;
+}
+
 void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
   bool untag_first = false;
-  errs() << "[FieldArmor] Instrumenting memory intrinsic: " << *MI << "\n";
+  auto arg0 = MI->getOperand(0);
+  auto arg1 = MI->getOperand(1);
+  if (!MI->getMetadata("fsan.instrument"))
+    return;
+  // NOTE: the above may introduce FNs
+  // NO FPs observed on SPEC though
+
   IRBuilder<> IRB(MI);
+
+  // TODO: memmove
   if (isa<MemTransferInst>(MI)) { /*memcpy, memmove*/
-    auto arg0 = MI->getOperand(0);
-    auto arg1 = MI->getOperand(1);
-    arg0->dump();
-    arg1->dump();
-    bool arg0isStructField = dyn_cast<GetElementPtrInst>(arg0);
-    bool arg1isStructField = dyn_cast<GetElementPtrInst>(arg1);
-
-    auto sizeofthecopy = IRB.CreateIntCast(MI->getOperand(2), IntptrTy, false);
-    if (arg0isStructField || arg1isStructField) {
-      if (ConstantInt *CI = dyn_cast<ConstantInt>(sizeofthecopy)) {
-        uint64_t copySize = CI->getZExtValue();
-        uint64_t structFieldSize = -1;
-        errs() << "[FieldArmor] Copy size: " << copySize << "\n";
-        arg0->dump();
-        arg1->dump();
-        if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(arg0)) {
-          if (StructType *structTy =
-                  dyn_cast<StructType>(GEP->getSourceElementType())) {
-            auto structLayout = M.getDataLayout().getStructLayout(structTy);
-            auto noperands = GEP->getNumOperands();
-
-            if (noperands >= 3) {
-              int64_t fieldIndex =
-                  dyn_cast<ConstantInt>(GEP->getOperand(2))->getZExtValue();
-              if (fieldIndex < 0)
-                errs() << "[FieldArmor] DBG: negative field index in GEP\n";
-              else
-              if (fieldIndex + 1 < structTy->getNumElements())
-                structFieldSize =
-                    structLayout->getElementOffset(fieldIndex + 1) -
-                    structLayout->getElementOffset(fieldIndex);
-              else
-                structFieldSize = structLayout->getSizeInBytes() -
-                                  structLayout->getElementOffset(fieldIndex);
-            }
-          }
-        }
-        if (structFieldSize > 0 && copySize > structFieldSize) {
-          errs() << "[FieldArmor] WARNING: memcpy violates the C std!\n";
-          MI->dump();
-          untag_first = true;
-        }
-      } // if constant size
-    }
-
-    if (untag_first) {
-      auto arg0long = untagPointer(IRB, IRB.CreatePointerCast(arg0, IntptrTy));
-      auto arg1long = untagPointer(IRB, IRB.CreatePointerCast(arg1, IntptrTy));
-      arg0 = IRB.CreateIntToPtr(arg0long, arg0->getType());
-      arg0->setName("untagged_dest");
-      arg1 = IRB.CreateIntToPtr(arg1long, arg1->getType());
-      arg1->setName("untagged_src");
-      // errs() << "[FieldArmor] Untagging memcpy/memmove arguments\n";
-    }
-
     SmallVector<Value *, 4> Args{
         arg0, arg1, IRB.CreateIntCast(MI->getOperand(2), IntptrTy, false)};
 
@@ -1306,6 +1230,44 @@ void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
     IRB.CreateCall(HwasanMemset, Args);
   }
   MI->eraseFromParent();
+  NumInstrumentedIntrinsics++;
+} // instrumentMemIntrinsic
+
+bool canBeSkipped(InterestingMemoryOperand &O, const DataLayout &DL) {
+  // TODO: debug, might be removing too many checks
+  if (AllocaInst *AI = dyn_cast<AllocaInst>(O.getPtr())) {
+    if (AI->getAllocatedType()->isPointerTy() ||
+        AI->getAllocatedType()->isIntegerTy() ||
+        AI->getAllocatedType()->isFloatingPointTy()) {
+      return true;
+    }
+  } // it's alloca
+  // skip on globals with no "instrument" metadata
+  if (GlobalVariable *GV = dyn_cast<GlobalVariable>(O.getPtr())) {
+    if (!GV->getMetadata("fsan.instrument")) {
+      return true;
+    }
+  }
+
+  // if (GetElementPtrInst *I = dyn_cast<GetElementPtrInst>(O.getPtr())) {
+  //   auto *MD_node = I->getMetadata("fsan.instrument");
+  //   if (!MD_node) {
+  //     // errs() << "[FSAN] Skipping instrumentation of GEP with no "
+  //     //           "'instrument' metadata: "
+  //     //        << *I << "\n";
+  //     return true;
+  //   }
+  //   // else
+  //   //   errs() << "[FSAN] Instrumenting ADDR with 'fsan.instrument'
+  //   metadata: "
+  //   //          << *I << "\n";
+  // }
+  // it could be a function argument, example: pTHX_ AV **const avp
+  // we are not interested in accesses to ptr vars that are not in structs but
+  // there is no way of telling them apart.per il
+
+  // NOTE: DONT SKIP PTR LOADS!
+  return false;
 }
 
 bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
@@ -1326,16 +1288,19 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
   llvm::KnownBits Known(DL.getPointerTypeSizeInBits(Addr->getType()));
   llvm::computeKnownBits(Addr, Known, DL);
   if (Known.isZero()) {
-    // errs() << "[FieldArmor] Skipping instrumentation of null pointer
-    // access\n"; errs() << "\t\t\tInstruction: " << *(O.getInsn()) << "\n";
     return false;
   }
 
   if (O.MaybeMask)
     return false; // FIXME
-  // WHAT IS THIS?
 
-  IRBuilder<> IRB(O.getInsn());
+  Instruction *I = O.getInsn();
+
+  // might be UNSAFE?
+  if (canBeSkipped(O, DL))
+    return false;
+
+  IRBuilder<> IRB(I);
   if (!O.TypeStoreSize.isScalable() && isPowerOf2_64(O.TypeStoreSize) &&
       (O.TypeStoreSize / 8 <= (1ULL << (kNumberOfAccessSizes - 1))) &&
       (!O.Alignment || *O.Alignment >= Mapping.getObjectAlignment() ||
@@ -1345,6 +1310,8 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
     SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
     IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
                    Args);
+    // instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, I, DTU, LI);
+    // NumMemAccessesInlined++;
 
   } else {
     SmallVector<Value *, 3> Args{
@@ -1352,9 +1319,9 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
         IRB.CreateUDiv(IRB.CreateTypeSize(IntptrTy, O.TypeStoreSize),
                        ConstantInt::get(IntptrTy, 8))};
     IRB.CreateCall(HwasanMemoryAccessCallbackSized[O.IsWrite], Args);
+    NumMemAccessesNotInlined++;
   }
-  // untagPointerOperand(O.getInsn(),
-  //                     Addr); // TODO: this looks like bullshit
+
   NumInstrumentedMemAccesses++;
   return true;
 }
@@ -1415,7 +1382,7 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
   } // StructType
 
   else if (VectorType *VT = dyn_cast<VectorType>(AI->getAllocatedType())) {
-    errs() << "[FieldArmor] WARNING: Alloca of VectorType for RLT not yet "
+    errs() << "[FSAN] WARNING: Alloca of VectorType for RLT not yet "
               "supported: "
            << *(VT) << "\n";
   } // VectorType
@@ -1434,7 +1401,7 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
 
     else if (elementType->isArrayTy()) {
       // NOTE: SPEC2017 does not use arrays of arrays, apparently
-      // errs() << "[FieldArmor] Alloca of array of arrays "
+      // errs() << "[FSAN] Alloca of array of arrays "
       //  << *(AI->getAllocatedType()) << "\n";
       for (u_int64_t el = 0; el < AT->getNumElements(); el++) {
         auto *ElementPtr =
@@ -1442,7 +1409,7 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
         // this points to an array
         GetElementPtrInst *i_th_array = cast<GetElementPtrInst>(ElementPtr);
         ArrayType *innerArrayType = cast<ArrayType>(elementType);
-        auto int_n = innerArrayType->getNumElements();
+        uint64_t int_n = innerArrayType->getNumElements();
         for (uint64_t el_int = 0; el_int < int_n; el_int++) {
           auto *innerElementPtr =
               IRB.CreateGEP(innerArrayType->getElementType(), i_th_array,
@@ -1456,7 +1423,7 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
   } // ArrayType
   else {
     // SPEC2017 never hits this case
-    errs() << "[FieldArmor] WARNING: Alloca of unsupported type for RLT: "
+    errs() << "[FSAN] WARNING: Alloca of unsupported type for RLT: "
            << *(AI->getAllocatedType()) << "\n";
     errs() << "Is vector? " << AI->getAllocatedType()->isVectorTy() << "\n";
     errs() << "Is struct? " << AI->getAllocatedType()->isStructTy() << "\n";
@@ -1516,19 +1483,24 @@ Value *HWAddressSanitizer::tagPointer(IRBuilder<> &IRB, Type *Ty,
 inline Value *HWAddressSanitizer::untagPointer(IRBuilder<> &IRB,
                                                Value *PtrLong) {
 
-  Value *UntaggedPtrLong;
-  if (CompileKernel) {
-    // Kernel addresses have 0xFF in the most significant byte.
-    UntaggedPtrLong =
-        IRB.CreateOr(PtrLong, ConstantInt::get(PtrLong->getType(),
-                                               TagMaskByte << PointerTagShift));
-  } else {
-    // Userspace addresses have 0x00.
-    UntaggedPtrLong = IRB.CreateAnd(
-        PtrLong, ConstantInt::get(PtrLong->getType(),
-                                  ~(TagMaskByte << PointerTagShift)));
-  }
+  uint64_t mask = ~(TagMaskByte << PointerTagShift);
+  Value *UntaggedPtrLong =
+      IRB.CreateAnd(PtrLong, ConstantInt::get(PtrLong->getType(), mask));
   return UntaggedPtrLong;
+}
+
+inline Value *HWAddressSanitizer::untagPointerIntrinsic(IRBuilder<> &IRB,
+                                                        Value *Ptr) {
+
+  Type *PtrTy = Ptr->getType();
+  unsigned PtrBits = M.getDataLayout().getPointerTypeSizeInBits(PtrTy);
+  Type *MaskTy = IntegerType::get(M.getContext(), PtrBits);
+  Value *MaskVal = ConstantInt::get(MaskTy, ~(TagMaskByte << PointerTagShift));
+  // SIGNATURE: declare ptrty llvm.ptrmask(ptrty %ptr, intty %mask) speculatable
+  // memory(none)
+  Function *PtrMask =
+      Intrinsic::getDeclaration(&M, Intrinsic::ptrmask, {PtrTy, MaskTy});
+  return IRB.CreateCall(PtrMask, {Ptr, MaskVal});
 }
 
 Value *HWAddressSanitizer::getHwasanThreadSlotPtr(IRBuilder<> &IRB) {
@@ -1567,56 +1539,21 @@ Value *HWAddressSanitizer::getFrameRecordInfo(IRBuilder<> &IRB) {
 bool HWAddressSanitizer::instrumentLandingPads(
     SmallVectorImpl<Instruction *> &LandingPadVec) {
   for (auto *LP : LandingPadVec) {
-    IRBuilder<> IRB(LP->getNextNonDebugInstruction());
-    IRB.CreateCall(
-        HwasanHandleVfork,
-        {memtag::readRegister(
-            IRB, (TargetTriple.getArch() == Triple::x86_64) ? "rsp" : "sp")});
+    // errs() << "[FSAN] Instrumenting landing pad: " << *LP << "\n";
+    // if (LandingPadInst *LPI = dyn_cast<LandingPadInst>(LP)) {
+    //   // dump ptr and int
+    //   LPI->dump();
+    // }
+    // IRBuilder<> IRB(LP->getNextNonDebugInstruction());
+    // IRB.CreateCall(
+    //     HwasanHandleVfork,
+    //     {memtag::readRegister(
+    //         IRB, (TargetTriple.getArch() == Triple::x86_64) ? "rsp" :
+    //         "sp")});
   }
   return true;
 }
 
-// // the recall of the following methods is bad, but at least SPEC does not
-// crash!
-// /** Filter out GEPs on structs based on the type of the struct. */
-// bool shouldBlocklistGEP(GetElementPtrInst *GEPI) {
-//   auto fatherType = GEPI->getSourceElementType();
-//   if (fatherType->isStructTy()) {
-//     StructType *ST = dyn_cast<StructType>(fatherType);
-//     if (!ST->isLiteral())
-//       // return (ST->getName().str().find("union.") != std::string::npos)
-//       ||
-//       //        (ST->getName().str().find("std::") != std::string::npos);
-//       // NOTE: the above introduces FPs in some benchmarks while fixing
-//       others return (ST->getName().str().find("class.std::") !=
-//       std::string::npos ||
-//               ST->getName().str().find("struct.std::") !=
-//               std::string::npos);
-//     // NOTE: assuming std types are safe just because are in the std lib is
-//     bad.
-//     // They are (mis)used all over SPEC benchmarks.
-//   }
-//   return false;
-// }
-
-// bool shouldSkipAlloca(Type *t) {
-//   if (t->isStructTy()) {
-
-//     StructType *ST = dyn_cast<StructType>(t);
-//     if (!ST->isLiteral())
-//       // return (ST->getName().str().find("union.") != std::string::npos)
-//       ||
-//       //        (ST->getName().str().find("std::") != std::string::npos) ||
-//       //        (ST->getName().str().find("int2type") != std::string::npos)
-//       ||
-//       //        (ST->getName().str().find("std::_List_iterator") !=
-//       //         std::string::npos);
-//       return (ST->getName().str().find("union.") != std::string::npos) ||
-//              (ST->getName().str().find("std::") != std::string::npos);
-//   }
-//   return false;
-// }
-// __attribute__((noinline))
 bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
                                          const DominatorTree &DT,
                                          const PostDominatorTree &PDT,
@@ -1654,8 +1591,6 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
             StructType *ST_internal_l2 = dyn_cast<StructType>(innerElementType);
             if (ST_internal_l2->isLiteral()) {
               LiteralStructs++;
-              // errs() << "[FieldArmor] STACK: Alloca of 2D array of literal "
-              //        << *(AI->getAllocatedType()) << "\n";
               continue;
             }
 
@@ -1683,9 +1618,6 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
         // it's a struct
         StructType *ST = dyn_cast<StructType>(allocatedType);
         if (ST->isLiteral()) {
-          // errs() << "[FieldArmor] STACK: Alloca of literal struct "
-          //        << *(AI->getAllocatedType()) << "\n";
-          // LiteralStructs++;
           continue;
         } else if (ST->getName().str().find("union.") == 0) {
           continue;
@@ -1695,20 +1627,13 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     else
       assert(false && "Allocas must be AllocaInsts");
 
-    // AT THIS POINT, IT'S EITHER A STRUCT, A 1d ARRAY OF STRUCTS, OR A 2d
-    // ARRAY OF STRUCTS
     IRBuilder<> IRB(AI->getNextNonDebugInstruction());
-    if (!Tag)
-      Tag = getRPTag(IRB);
-    Value *AILong = IRB.CreatePointerCast(AI, IntptrTy);
-    Value *AINoTagLong = untagPointer(IRB, AILong);
-    Value *Replacement = tagPointer(IRB, AI->getType(), AINoTagLong, Tag);
-    std::string Name =
-        AI->hasName() ? AI->getName().str() : "alloca." + itostr(N);
-    Replacement->setName(Name + ".fieldarmor");
+    // NOTE: since root pointers are not tagged, no need for replacing the
+    // pointer to the alloca with a tagged version.
     size_t Size = memtag::getAllocaSizeInBytes(*AI);
     Value *AICast = IRB.CreatePointerCast(AI, PtrTy);
 
+    // TODO: in my case, this can go!
     auto HandleLifetime = [&](IntrinsicInst *II) {
       II->setArgOperand(0, ConstantInt::get(Int64Ty, Size));
       II->setArgOperand(1, AICast);
@@ -1717,16 +1642,19 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     llvm::for_each(Info.LifetimeStart, HandleLifetime);
     llvm::for_each(Info.LifetimeEnd, HandleLifetime);
 
-    tagAlloca(IRB, AI, DL); // insert a call to fieldarmor_tag_memory function
+    tagAlloca(IRB, AI, DL); // insert a call to fieldarmor_tag_memory
+    // function
 
-    AI->replaceUsesWithIf(Replacement, [AICast, AILong](const Use &U) {
-      auto *User = U.getUser();
-      return User != AILong && User != AICast && !isa<LifetimeIntrinsic>(User);
-    });
+    // AI->replaceUsesWithIf(Replacement, [AICast, AILong](const Use &U) {
+    //   auto *User = U.getUser();
+    //   return User != AILong && User != AICast &&
+    //   !isa<LifetimeIntrinsic>(User);
+    // });
 
     auto TagEnd = [&](Instruction *Node) {
       IRB.SetInsertPoint(Node);
       untagAlloca(IRB, AI, DL);
+      // NOTE: we still need to untag
     };
 
     for (auto *RI : SInfo.RetVec)
@@ -1762,32 +1690,6 @@ static void emitRemark(const Function &F, OptimizationRemarkEmitter &ORE,
   }
 }
 
-bool HWAddressSanitizer::selectiveInstrumentationShouldSkip(
-    Function &F, FunctionAnalysisManager &FAM) const {
-  auto SkipHot = [&]() {
-    if (!ClHotPercentileCutoff.getNumOccurrences())
-      return false;
-    auto &MAMProxy = FAM.getResult<ModuleAnalysisManagerFunctionProxy>(F);
-    ProfileSummaryInfo *PSI =
-        MAMProxy.getCachedResult<ProfileSummaryAnalysis>(*F.getParent());
-    if (!PSI || !PSI->hasProfileSummary()) {
-      ++NumNoProfileSummaryFuncs;
-      return false;
-    }
-    return PSI->isFunctionHotInCallGraphNthPercentile(
-        ClHotPercentileCutoff, &F, FAM.getResult<BlockFrequencyAnalysis>(F));
-  };
-
-  bool Skip = SkipHot();
-  emitRemark(F, FAM.getResult<OptimizationRemarkEmitterAnalysis>(F), Skip);
-  return Skip;
-}
-
-// BS
-bool HWAddressSanitizer::potentiallyBlacklistFunction(Function &F) {
-  return false;
-}
-
 void HWAddressSanitizer::sanitizeFunction(Function &F,
                                           FunctionAnalysisManager &FAM) {
   if (&F == HwasanCtorFunction)
@@ -1807,8 +1709,6 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   OptimizationRemarkEmitter &ORE =
       FAM.getResult<OptimizationRemarkEmitterAnalysis>(F);
 
-  // if (selectiveInstrumentationShouldSkip(F, FAM))
-  //   return;
   NumInstrumentedFuncs++;
 
   SmallVector<InterestingMemoryOperand, 16> OperandsToInstrument;
@@ -1855,27 +1755,18 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     if (CmpInst *CI = dyn_cast<CmpInst>(&Inst)) {
       CMPsToInstrument.push_back(CI);
     }
-    // TODO: sub between ptrs has weird result
-    // TODO: compiler can decide to statically fold some arithmetics to wrong
-    // result -> InstCombiner does this, replacing the wrong value
-    // TODO: compare how many typed allocations you see here and how many at
-    // the end
-
-    // collect arithmetic ops that have PtrToInt operands
     if (auto *BO = dyn_cast<BinaryOperator>(&Inst)) {
       if (BO->getOpcode() == Instruction::Sub) {
-        // is this comprehensive?
-        for (auto &Op : BO->operands()) {
-          if (dyn_cast<PtrToIntInst>(Op.get())) {
-            BOPsToInstrument.push_back(BO);
-            break;
-          }
-        }
+        // NOTE: only subs, because adding ptrs should be against the standard
+        // NOTE: ptr subtractions make sense only if the two pointers point to
+        // (parts of) the same object. Ow they are just undefined behavior.
+        BOPsToInstrument.push_back(BO);
       }
     }
 
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(&Inst)) {
       if (CE->getOpcode() == Instruction::GetElementPtr) {
+        // TODO: get rid of this and check at the store/load operand level.
         ConstGEPsToInstrument.push_back(CE);
       }
     }
@@ -1911,13 +1802,12 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
    * 6) BOPs with PtrToInt operands
    * the type of the struct they point to)
    */
-  
+
   if (!SInfo.AllocasToInstrument.empty()) {
     const DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
     const PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
     const LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
-    // TODO x86: stack inst causes SEGV on Cpp -> may be a shadow memory corruption issue?
-    instrumentStack(SInfo, DT, PDT, LI, F.getDataLayout());
+    instrumentStack(SInfo, DT, PDT, LI, F.getDataLayout()); // KNOB
   }
 
   // If we split the entry block, move any allocas that were originally in the
@@ -1933,52 +1823,40 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     }
   }
 
-  /** NOTE: in this LLVM version, at O2, ConstGEPs do not seem to be there in
-   * SPEC2017.
-   * TODO: act at operand level, this is pointless */
-  // for (auto &CE : ConstGEPsToInstrument) {
-  //   InstrumentConstGEP(CE);
-  // }
+  // TODO: filter out checks.
 
-  // TODO: remove checks on ".untagged" pointers.
+  if (ClFSAN_memIntr && !IntrinToInstrument.empty()) {
+    for (auto *Inst : IntrinToInstrument)
+      instrumentMemIntrinsic(Inst); // KNOB
+  }
+
+  if (ClFSAN_GEP) {
+    for (auto &GEPI : GEPsToInstrument) {
+      InstrumentGEP(GEPI); // KNOB
+    }
+  }
+
+  if (ClFSAN_BOP) {
+    for (auto &BOP : BOPsToInstrument) {
+      InstrumentBOP(BOP); // KNOB
+    }
+  }
+
+  if (ClFSAN_CMP) {
+    for (auto &CMPI : CMPsToInstrument) {
+      InstrumentCMP(CMPI); // KNOB
+    }
+  }
+
   DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
   PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
   LoopInfo *LI = FAM.getCachedResult<LoopAnalysis>(F);
   DomTreeUpdater DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy);
   const DataLayout &DL = F.getDataLayout();
-  // TODO: fix mem access instrumentation, it's causing problems on exceptions
-  // management on x86
-  // TODO :explore moving threads MD around, maybe it's that being a problem in Cpp
-  for (auto &Operand : OperandsToInstrument)
-    instrumentMemAccess(Operand, DTU, LI, DL);
-  DTU.flush();
-
-  /** NOTE: keeping the DomTree up-to-date might be necessary even for the
-   * above transformations. TODO: implement and test.*/
-
-  // TODO: some SEGV look like the ones on ARM where compiler was hoisting
-  // constants
-  // NOTE: observed SEGV when handling exc, SEGV when initializing
-  // BOP & CMP cause SEGV in Unwind_Resume?
-  // TODO: FPs on x86 -> same strategy as AARCH64 does not seem to work
-  // TODO: current memIntr instrumentation untags -> next: remove checks AT ALL!
-  if (ClInstrumentMemIntrinsics && !IntrinToInstrument.empty()) {
-    for (auto *Inst : IntrinToInstrument)
-      instrumentMemIntrinsic(Inst);
-  }
-
-  for (auto &GEPI : GEPsToInstrument) {
-    InstrumentGEP(GEPI);
-  }
-
-  for (auto &BOP : BOPsToInstrument) {
-    InstrumentBOP(BOP);
-  }
-
-  for (auto &CMPI : CMPsToInstrument) {
-    InstrumentCMP(CMPI);
-  }
-
+  if (ClFSAN_memAccesses)
+    for (auto &Operand : OperandsToInstrument)
+      instrumentMemAccess(Operand, DTU, LI, DL); // KNOB
+  DTU.flush(); // TODO: does this have an interplay with optimizations?
   ShadowBase = nullptr;
 }
 
@@ -2019,19 +1897,12 @@ Value *HWAddressSanitizer::GetArraySize(CallBase *CI, StructType *t,
           ? demangle(CI->getCalledFunction()->getName().str())
           : "";
   if (demangledName == "") {
-    // errs()
-    //     << "[FieldArmor] WARNING: could not demangle function name for call:
-    //     "
-    //     << *CI << "\n";
     return 0;
   }
 
   uint64_t typeSize = M.getDataLayout().getTypeAllocSize(t);
 
   if (typeSize == 0) {
-    // errs() << "[FieldArmor] WARNING: could not get type size for struct: ";
-    // t->print(errs());
-    // errs() << "SIZED?" << t->isSized() << "\n";
     return nullptr;
   }
 
@@ -2059,7 +1930,7 @@ Value *HWAddressSanitizer::GetArraySize(CallBase *CI, StructType *t,
     }
   }
 
-  errs() << "[FieldArmor] WARNING: allocator not handled for size "
+  errs() << "[FSAN] WARNING: allocator not handled for size "
             "reconstruction: "
          << demangledName << "\n";
   return nullptr;
@@ -2109,298 +1980,342 @@ Value *HWAddressSanitizer::RetrieveOrCreateTagVector(StructType *t) {
 }
 
 void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
-  // auto GEPResultType = GEPI->getResultElementType();
-  // TODO: look into this. How's vector implemented?
-  if (GEPI->getType()->isStructTy() && !GEPI->getType()->isVectorTy()) {
-    // errs() << "[HWASAN] Instrumenting 2-operands GEP into struct: ";
-    // GEPI->print(errs());
-    // errs() << "\n";
-    // GEPI->getType()->print(errs());
-    // errs() << "\n";
-    IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
-    Value *resultLong =
-        IRB.CreatePointerCast(GEPI, IntptrTy); // this breaks for some GEPs
+  // EXAMPLE: GEP on ptr array
+  // TODO: if necessary, tag RPs. For now, it's not needed.
+  // if (GEPI->getType()->isStructTy() && !GEPI->getType()->isVectorTy()) {
+  //   IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
+  //   Value *resultLong =
+  //       IRB.CreatePointerCast(GEPI, IntptrTy); // this breaks for some GEPs
 
-    Value *untaggedResLong = untagPointer(IRB, resultLong);
-    Value *taggedPointer =
-        tagPointer(IRB, GEPI->getType(), untaggedResLong,
-                   ConstantInt::get(IntptrTy, RPTag)); // set RP bit
-    std::string Name = GEPI->hasName() ? GEPI->getName().str()
-                                       : "gep." + itostr(NumInstrumentedGEPs);
-    taggedPointer->setName(Name + ".fieldarmor.struct");
-    GEPI->replaceUsesWithIf(taggedPointer, [resultLong](const Use &U) {
-      auto *User = U.getUser();
-      return User != resultLong && !isa<LifetimeIntrinsic>(User);
-    });
-    NumInstrumentedGEPs++;
-    return;
-  }
+  //   Value *untaggedResLong = untagPointer(IRB, resultLong);
+  //   Value *taggedPointer =
+  //       tagPointer(IRB, GEPI->getType(), untaggedResLong,
+  //                  ConstantInt::get(IntptrTy, RPTag)); // set RP bit
+  //   std::string Name = GEPI->hasName() ? GEPI->getName().str()
+  //                                      : "gep." +
+  //                                      itostr(NumInstrumentedGEPs);
+  //   taggedPointer->setName(Name + ".fieldarmor.struct");
+  //   GEPI->replaceUsesWithIf(taggedPointer, [resultLong](const Use &U) {
+  //     auto *User = U.getUser();
+  //     return User != resultLong && !isa<LifetimeIntrinsic>(User);
+  //   });
+  //   NumInstrumentedGEPs++;
+  //   return;
+  // }
 }
 
-// instrument all ptr subs
+// instrument all ptr subs -> each and every BOP sub is passed to this, method.
+// TODO: FILTER!
 void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
-  // errs() << "[FSAN] BINARY OP: " << *BOP << "\n";
+  auto DL = M.getDataLayout();
+  errs() << " INSTRUMENTING BOP: ";
+  BOP->print(errs());
+  errs() << "\n";
+  auto *retType = BOP->getType();
+  auto bopUsers = BOP->users();
+
   auto *OP1 = BOP->getOperand(0);
+  Value *PtrOperand1 = nullptr, *PtrOperand2 = nullptr;
+  if (PtrToIntInst *PTI = dyn_cast<PtrToIntInst>(OP1)) {
+    PtrOperand1 = PTI->getOperand(0);
+  }
   auto *OP2 = BOP->getOperand(1);
-  IRBuilder<> IRB(BOP);
-  auto *untaggedOp1Long =
-      untagPointer(IRB, IRB.CreatePointerCast(OP1, IntptrTy));
-  auto *untaggedOp2Long =
-      untagPointer(IRB, IRB.CreatePointerCast(OP2, IntptrTy));
-  BOP->setOperand(0, IRB.CreateIntToPtr(untaggedOp1Long, OP1->getType()));
-  BOP->setOperand(1, IRB.CreateIntToPtr(untaggedOp2Long, OP2->getType()));
+  if (PtrToIntInst *PTI = dyn_cast<PtrToIntInst>(OP2)) {
+    PtrOperand2 = PTI->getOperand(0);
+  }
+
+  /** A BAD EXAMPLE OF UB:
+ BOP:   %sub.ptr.sub.i29.i326 = sub i64 %sub.ptr.lhs.cast.i.i316,
+                                        %sub.ptr.rhs.cast.i28.i325
+        >> PtrToInt 1:   %90 = load ptr, ptr %_M_finish.i.i314.fsan.scalar,
+ align 8
+        >> PtrToInt 2:   %add.ptr.i324.fsan.struct = call ptr
+ @llvm.ptrmask.p0.i64(ptr %add.ptr.i324, i64 -9079256848778919937), !dbg !5273
+*/
+  // FIRST CHECK: if FSAN-untagged for sure, skip
+  bool skip1 = true, skip2 = true;
+  skip1 &= (OP1->hasName() &&
+            OP1->getName().str().find(".fsan.struct") != std::string::npos);
+  skip2 &= (OP2->hasName() &&
+            OP2->getName().str().find(".fsan.struct") != std::string::npos);
+  // SECOND CHECK: if the hypothetic ptrtoint operand has "fsan.scalar" in the
+  // name, untag!
+  skip1 &=
+      !(PtrOperand1 && PtrOperand1->hasName() &&
+        PtrOperand1->getName().str().find(".fsan.scalar") != std::string::npos);
+  skip2 &=
+      !(PtrOperand2 && PtrOperand2->hasName() &&
+        PtrOperand2->getName().str().find(".fsan.scalar") != std::string::npos);
+  // THIRD CHECK: whatever comes from a load ptr must be untagged, cannot be
+  // skipped
+  skip1 &= !(PtrOperand1 && isa<LoadInst>(PtrOperand1));
+  skip2 &= !(PtrOperand2 && isa<LoadInst>(PtrOperand2));
+
+  // FOURTH CHECK: whatever comes from a ptrmask is already untagged
+  if (PtrOperand1)
+    if (CallInst *CI = dyn_cast<CallInst>(PtrOperand1)) {
+      auto *callee = CI->getCalledFunction();
+      auto demangledName =
+          callee && callee->hasName() ? demangle(callee->getName().str()) : "";
+      bool isPtrMask =
+          (callee && callee->hasName() &&
+           callee->getName().str().find("llvm.ptrmask") != std::string::npos);
+      if (isPtrMask)
+        skip1 = true;
+      errs() << ">> PtrOperand1 is call: " << *PtrOperand1
+             << ", isPtrMask: " << isPtrMask << "\n";
+    }
+  // FIFTH CHECK: if ptr is null, skip
+  // skip1 &= !(PtrOperand1 && isa<ConstantPointerNull>(PtrOperand1));
+  // skip2 &= !(PtrOperand2 && isa<ConstantPointerNull>(PtrOperand2));
+  
+  // NOTE: this is still unsafe when PHIs are there, just my hunch
+  if (PtrOperand2)
+    if (CallInst *CI = dyn_cast<CallInst>(PtrOperand2)) {
+      auto *callee = CI->getCalledFunction();
+      auto demangledName =
+          callee && callee->hasName() ? demangle(callee->getName().str()) : "";
+      bool isPtrMask =
+          (callee && callee->hasName() &&
+           callee->getName().str().find("llvm.ptrmask") != std::string::npos);
+      if (isPtrMask)
+        skip2 = true;
+
+      errs() << ">> PtrOperand2 is call: " << *PtrOperand2
+             << ", isPtrMask: " << isPtrMask << "\n";
+    }
+
+  if (skip1 && skip2) {
+    // if either of the above is false, you must not untag
+    return;
+  }
+
+  // NOTE: this could open up to some FNs if the PtrToInt is reused in an
+  // IntToPtr. Alternatively, create a new PtrToInt and use that one as operand
+  // in the BOP.
+  // TODO: optimize even more.
+  if (!skip1 && PtrOperand1) {
+    PtrToIntInst *PTI1 = dyn_cast<PtrToIntInst>(OP1);
+    errs() << ">> PtrOperand1 " << *PtrOperand1 << "\n";
+    llvm::KnownBits Known(DL.getPointerTypeSizeInBits(PtrOperand1->getType()));
+    llvm::computeKnownBits(PtrOperand1, Known, DL);
+    if (Known.isConstant() || Known.isAllOnes() || Known.isZero()) {
+      errs() << ">> PtrOperand1 is constant, skipping untagging\n";
+      return;
+    }
+    IRBuilder<> IRB(PTI1);
+    auto *untaggedOP1 = untagPointerIntrinsic(IRB, PtrOperand1);
+    PTI1->setOperand(0, untaggedOP1);
+  }
+
+  if (!skip2 && PtrOperand2) {
+    PtrToIntInst *PTI2 = dyn_cast<PtrToIntInst>(OP2);
+    errs() << ">> PtrOperand2 " << *PtrOperand2 << "\n";
+    llvm::KnownBits Known(DL.getPointerTypeSizeInBits(PtrOperand2->getType()));
+    llvm::computeKnownBits(PtrOperand2, Known, DL);
+    if (Known.isConstant() || Known.isAllOnes() || Known.isZero()) {
+      errs() << ">> PtrOperand2 is constant, skipping untagging\n";
+      return;
+    }
+    IRBuilder<> IRB(PTI2);
+    auto *untaggedOP2 = untagPointerIntrinsic(IRB, PtrOperand2);
+    PTI2->setOperand(0, untaggedOP2);
+  }
 }
 
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
-  // NOTE: new corner case: pointer passed to a function and function stores
-  // it
-
-  // Q: can I tell GEPs on globals/stack apart from heap?
-  // Q: what if some global pointer is stored in a stack variable and then
-  // GEPed? Do I see a store?
   auto nOperands = GEPI->getNumOperands();
-  // if(GEPI->hasName() && GEPI->getName().str().find("untagged") !=
-  // std::string::npos){
-  //   errs() << "[FSan] Skipping GEP on untagged pointer: ";
-  //   GEPI->print(errs());
-  //   errs() << "\n";
-  //   return;
-  // }
-  // NOTE: this check never fails if un-squashing the GEPs in the frontend.
   assert(nOperands <= 3);
-  if (nOperands != 3) {
-    handleGEP2operands(GEPI);
-    return;
-  }
-
   auto fatherType = GEPI->getSourceElementType();
   auto sonType = GEPI->getResultElementType();
   auto gepName = GEPI->hasName() ? GEPI->getName().str()
                                  : "gep." + itostr(NumInstrumentedGEPs);
 
+  if (GEPI->getType()->isVectorTy()) {
+    // NOTE: if loops are being vectorized, this will happen
+    errs() << "[FSAN] WARNING: GEP with vector result type not handled, "
+              "skipping instrumentation for this GEP: ";
+    GEPI->print(errs());
+    errs() << "\n";
+    return;
+  }
   IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
+
   Value *resultLong = IRB.CreatePointerCast(GEPI, IntptrTy);
-  Value *untaggedResLong = untagPointer(IRB, resultLong);
-  Value *untaggedResLongPtr =
-      IRB.CreateIntToPtr(untaggedResLong, GEPI->getType());
-
-  // Value *fullFatherTag = IRB.CreateLShr(
-  //     IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x7FLu <<
-  //     56Lu)), PointerTagShift);
-
-  // Value *fatherT = IRB.CreateAnd(fullFatherTag, T_Mask_value);
-
-  // Value *fatherT = IRB.CreateLShr(
-  //     IRB.CreateAnd(resultLong, ConstantInt::get(IntptrTy, 0x0FLu <<
-  //     56Lu)), PointerTagShift);
-
-  // fatherT->setName("fatherT");
   std::string endResultName = "";
   Value *taggedPointer = nullptr;
+  bool isScalar = false;
+  bool setMetadata = true;
 
-  if (GEPI->hasName() &&
-      GEPI->getName().str().find("invariant") != std::string::npos) {
-    // NOTE: this removes some false positives for now.
-    // TODO: find smarter solution to force GEPs to be there.
-    taggedPointer = untaggedResLongPtr;
-    endResultName = gepName + ".invariant.untagged";
-  }
-
-  else if (fatherType->isArrayTy()) {
-    if (!sonType->isStructTy()) {
-      // Preserve tag is GEP returns a) array, b) scalar.
-      // NOTE: this assumes the pointer to the array is tagged.
-      /* TODO: enforce this at allocation time using RPTag for everything or
-       * do it here */
-      return;
-    } // GEP array -> <scalar, array>
-
-    else { /** GEP into array of structs */
-      // StructType *sonTypeCast = dyn_cast<StructType>(sonType);
-      // GEP into non-literal struct array
-      taggedPointer =
-          tagPointer(IRB, GEPI->getType(), untaggedResLong,
-                     ConstantInt::get(IntptrTy, RPTag)); // set RP bit
-      endResultName = gepName + ".fieldarmor.struct";
-
+  if (fatherType->isArrayTy()) {
+    if (sonType->isAggregateType()) { /** GEP into array of aggregates */
+      // NOTE: this should trigger whenever gepping into array of structs, and
+      // array of arrays
+      Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
+      taggedPointer = untaggedResult;
+      endResultName = gepName + ".fsan.array.struct";
+      // setMetadata = false;
     } // GEP into array of non-literal structs
+
+    // else LEAVE THE PTR TAGGED!
+    //
   } // GEP from array type
-  else if (fatherType->isVectorTy()) {
-    if (!sonType->isStructTy()) {
-      return;
-    }
-  }
-  // FATHER IS STRUCT for sure now
-  else if (fatherType->isStructTy()) {
-    Value *sonTag = nullptr;
-    auto sonIsScalar = !sonType->isStructTy();
-    if (sonIsScalar) {
-      auto sonIdx = IRB.CreateAnd(
-          IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
-                        ConstantInt::get(IntptrTy, 0x1Lu)),
-          ConstantInt::get(IntptrTy, T_Mask)); // modulo 16
-      // NOTE: this add was a remnant of old fieldarmor scheme RLT
-      // TODO:
-      // Value *sonT = IRB.CreateAnd(IRB.CreateAdd(fatherT, sonIdx),
-      //                             ConstantInt::get(IntptrTy, T_Mask));
-      Value *sonT = IRB.CreateAnd(sonIdx, ConstantInt::get(IntptrTy, T_Mask));
-      // NOTE: tags might be 0 after this operation. TODO: prevent it from
-      // happening
+  else { /** father is not array */
+    if (fatherType->isStructTy()) {
+      StructType *ST = dyn_cast<StructType>(fatherType);
+      if (ST && !ST->hasName()) {
+        // UNNAMED STRUCT -> SKIP
+        //
+        // Clang emits hoisted struct representations for structs that result in
+        // GEPs on anon structs on x86.
+        // This probably introduces FNs.
+        // errs() << " SKIPPING GEP ANON STRUCT ";
+        // GEPI->print(errs());
+        // errs() << "\n";
+        return;
+      }
+      if (ST && ST->getName().str().find("union.") == 0) {
+        // UNION SKIP
+        // errs() << " SKIPPING GEP UNION ";
+        // GEPI->print(errs());
+        // errs() << "\n";
+        auto *UnionNode = MDNode::get(
+            *C, ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 1)));
+        // GEPI->setMetadata("fsan.noinstrument", UnionNode); // TODO
+        return;
+      }
 
-      sonTag = sonT;
-      // sonTag->setName("sonTag");
-      taggedPointer = tagPointer(IRB, GEPI->getType(), untaggedResLong, sonTag);
-      endResultName = gepName + ".fieldarmor.scalar";
-    } // GEP struct -> scalar
+      Value *sonTag = nullptr;
+      auto sonIsScalar = !sonType->isStructTy() && !sonType->isVectorTy();
+      bool sonIsArrayOfAggregates =
+          sonType->isArrayTy() &&
+          sonType->getArrayElementType()->isAggregateType();
 
-    else { /** GEP struct -> struct */
-      StructType *SonTy = dyn_cast<StructType>(sonType);
-      if (SonTy->isOpaque()) {
-        // Opaque structs are not tagged, they might be passed to the uninstr
-        // lib
-        taggedPointer = untaggedResLongPtr;
-        NumUntaggedGEPResults++;
-        endResultName =
-            (GEPI->hasName() ? GEPI->getName().str()
-                             : "gep." + itostr(NumInstrumentedGEPs)) +
-            ".untagged";
-      } else {
-        sonTag = ConstantInt::get(IntptrTy, RPTag);
-        endResultName = gepName + ".fieldarmor.struct";
+      if (sonIsScalar) {
+        // GEP struct -> scalar
+        auto op2 = GEPI->getOperand(2);
+
+        auto sonIdx = IRB.CreateAnd(
+            IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
+                          ConstantInt::get(IntptrTy, 0x1Lu)),
+            ConstantInt::get(IntptrTy, 0b1111UL)); // modulo 16
+        Value *sonT =
+            IRB.CreateAnd(sonIdx, ConstantInt::get(IntptrTy, 0b1111UL));
+        // NOTE: tags might be 0 after this operation.
+        // TODO: prevent nulltag
+        sonTag = sonT;
+
+        Value *untaggedResLong = untagPointer(IRB, resultLong);
         taggedPointer =
             tagPointer(IRB, GEPI->getType(), untaggedResLong, sonTag);
-      }
-    } // GEP struct -> struct
-  } // FATHER IS STRUCT
+        endResultName = gepName + ".fsan.scalar";
+        isScalar = true;
+      } // GEP struct -> scalar
+      else {
+        if (sonType->isStructTy()) {
+          Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
+          taggedPointer = untaggedResult;
+          endResultName = gepName + ".fsan.struct";
+          // setMetadata = false;
+        } // son is a struct
+        else if (sonIsArrayOfAggregates) {
+          Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
+          taggedPointer = untaggedResult;
+          endResultName = gepName + ".fsan.array.struct";
+          // setMetadata = false;
+        } // son is array of aggregates
+      } // else - son is not scalar
 
-  // assert(taggedPointer != nullptr && "taggedPointer cannot be null here");
-  if (taggedPointer == nullptr) {
-    // This should not happens
-    errs() << "[HWASAN] Error: taggedPointer is null in GEP instrumentation!\n";
-    GEPI->print(errs());
-    GEPI->getSourceElementType()->print(errs());
-    errs() << "\n";
-    GEPI->getOperand(0)->print(errs());
-    errs() << "\n";
-    GEPI->getResultElementType()->print(errs());
-    errs() << "\n";
-    GEPI->getType()->print(errs());
-    errs() << "\n";
-    GEPI->getOperand(2)->print(errs());
+    } // FATHER IS STRUCT
+    else {
+      // GEP type might be i8, i32, ptr etc.
+      // NOTE: in these cases, we choose not to tag
+      // NOTE: something fishy happens with vtables
+      // errs() << "[FSAN] SKIPPING : GEP from UNK TYPE: ";
+      // GEPI->print(errs());
+      // errs() << "\n";
+      return;
+    }
+  } // else - father is not an array
 
-    errs() << "\n";
-    assert(taggedPointer != nullptr && "taggedPointer cannot be null here");
-  }
+  if (!taggedPointer)
+    return; // TODO: handle corner cases
+
   taggedPointer->setName(endResultName);
-  GEPI->replaceUsesWithIf(taggedPointer, [resultLong, GEPI](const Use &U) {
+  auto *MD_node =
+      MDNode::get(*C, ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 1)));
+  // if (setMetadata)
+  //   dyn_cast<Instruction>(taggedPointer)
+  //       ->setMetadata("fsan.instrument", MD_node);
+
+  GEPI->replaceUsesWithIf(taggedPointer, [resultLong, GEPI, isScalar, sonType,
+                                          setMetadata, MD_node](const Use &U) {
     auto *User = U.getUser();
-    bool safe = User != resultLong && !isa<LifetimeIntrinsic>(User);
-    // NOTE: don't store tagged pointers that might be used by uninstrumented
-    // code Q: can this fail with maps where something is stored with ptr key
-    // and retrieved with tagged/untagged ptr? Q: how much detection power do
-    // we lose, if any?
-    // if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
-    //   if (SI->getValueOperand() == GEPI) {
-    //     safe = false;
-    //   }
-    // }
+    // TODO: I think this is BS
+    bool isCallToMaskPtr = false;
+    if (CallBase *CB = dyn_cast<CallBase>(User)) {
+      if (CB->getCalledFunction() && CB->getCalledFunction()->hasName() &&
+          CB->getCalledFunction()->getName().find("llvm.ptrmask") !=
+              std::string::npos) {
+        isCallToMaskPtr = true;
+      }
+    }
 
-    // TODO: this is too much, but how do we handle it?
-    // else if (ReturnInst *RI = dyn_cast<ReturnInst>(User)) {
-    //   if (RI->getReturnValue() == GEPI) {
-    //     safe = false;
-    //     // TODO: remove this crap
-    //   }
-    // } else if (CallInst *CI = dyn_cast<CallInst>(User)) {
-    //   auto *callee = CI->getCalledFunction();
-    //   if (!callee) {
-    //     // indirect call, be conservative
-    //     safe = false;
-    //   } else {
-    //     auto nargs = callee->arg_size();
-    //     for (unsigned i = 0; i < nargs; i++) {
-    //       if (CI->getArgOperand(i) == GEPI) {
-    //         safe = false;
-    //       }
-    //     }
-    //   }
+    bool safe =
+        User != resultLong && !isa<LifetimeIntrinsic>(User) && !isCallToMaskPtr;
+    if (isScalar) {
+      // when used on a widened load, this produces FPs.
+      // widened loads are produced right away by the FrontEnd
+      // they are by-design FPs
+      auto DL = GEPI->getModule()->getDataLayout();
+      uint64_t fieldSize = DL.getTypeAllocSize(sonType);
+      if (LoadInst *LI = dyn_cast<LoadInst>(User)) {
+        // TODO: these have to be triaged
+        auto loadSize = DL.getTypeAllocSize(LI->getType());
+        if (loadSize > fieldSize) {
+          errs() << "UNSAFE LOAD USER";
+          LI->print(errs());
+          errs() << "\n";
+        }
+        safe = safe && (fieldSize >= loadSize);
+      } else if (PHINode *PHI = dyn_cast<PHINode>(User)) {
+        // TODO: these have to be triaged
+        auto PHIUsers = PHI->users();
+        for (auto *PHIUser : PHIUsers) {
+          if (LoadInst *LI = dyn_cast<LoadInst>(PHIUser)) {
+            auto loadSize = DL.getTypeAllocSize(LI->getType());
+            if (loadSize > fieldSize) {
+              errs() << "UNSAFE LOAD USER";
+              LI->print(errs());
+              errs() << "\n";
+            }
+            safe = safe && (fieldSize >= loadSize);
+          }
+        }
+      }
+    }
+    // if (safe && setMetadata) {
+    //   GEPI->setMetadata("fsan.instrument", MD_node);
     // }
-
-    // NOTE: the above prevents tagged pointers from being returned, but it's
-    // just a makeshift solution for a weird behavior present inside libstdc++
-    // else errs() << "[HWASAN] GEP instrumentation: checking use in
-    // instruction: " << *User
-    //            << "\n\t resultLong: " << *resultLong << "\n\t GEPI: " <<
-    //            *GEPI
-    //            << "\n";
     return safe;
   });
   NumInstrumentedGEPs++;
-  // NOTE: instrumented might also mean untagged
 } // InstrumentGEP
 
 void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
-  // EXAMPLE
-  /**
-   * %fImpl = getelementptr inbounds nuw
-   * %"class.xercesc_2_7::DOM_NodeIterator", ptr %this, i32 0, i32 0, !dbg
-   * !402 %0 = load ptr, ptr %fImpl, align 8, !dbg !402, !tbaa !325 %fImpl2 =
-   * getelementptr inbounds nuw
-   * %"class.xercesc_2_7::DOM_NodeIterator", ptr %other, i32 0, i32 0, !dbg
-   * !403 %1 = load ptr, ptr %fImpl2, align 8, !dbg !403, !tbaa !325 %cmp =
-   * icmp eq ptr %0, %1, !dbg !404
-   */
-
-  // NOTE: if one of the operands is null, no need to untag
+  /** Instrumenting CMPs with no filters */
   auto op1 = CI->getOperand(0);
   auto cmpType = op1->getType();
   auto op2 = CI->getOperand(1);
-  // auto cmpType2 = op2->getType();
-  // auto oneIsNull =
-  //     isa<ConstantPointerNull>(op1) || isa<ConstantPointerNull>(op2);
-  // if (oneIsNull)
-  //   return;
-  // NOTE: dont do this, it breaks 502.gcc_r. There is a tagged nullptr being
-  // dereferenced.
-
-  // NOTE CMP between pointers looks like this "icmp eq ptr %0, %1"
   if (cmpType->isPointerTy()) {
     IRBuilder<> IRB(CI);
-    auto untaggedop1long = untagPointer(IRB, IRB.CreatePtrToInt(op1, IntptrTy));
-    auto untaggedop2long = untagPointer(IRB, IRB.CreatePtrToInt(op2, IntptrTy));
-    Value *untaggedPtr1 = IRB.CreateIntToPtr(untaggedop1long, cmpType);
-    Value *untaggedPtr2 = IRB.CreateIntToPtr(untaggedop2long, cmpType);
-
-    untaggedPtr1->setName("cmp_op1_untagged");
-    untaggedPtr2->setName("cmp_op2_untagged");
-
-    // Mark as volatile to prevent optimization folding --> this is not
-    // verified if (Instruction *I1 = dyn_cast<Instruction>(untaggedPtr1))
-    //   I1->setMetadata(LLVMContext::MD_mem_parallel_loop_access,
-    //           MDNode::get(I1->getContext(), {}));
-    // if (Instruction *I2 = dyn_cast<Instruction>(untaggedPtr2))
-    //   I2->setMetadata(LLVMContext::MD_mem_parallel_loop_access,
-    //           MDNode::get(I2->getContext(), {}));
-
+    Value *untaggedPtr1 = untagPointerIntrinsic(IRB, op1);
     CI->replaceUsesOfWith(op1, untaggedPtr1);
+    Value *untaggedPtr2 = untagPointerIntrinsic(IRB, op2);
     CI->replaceUsesOfWith(op2, untaggedPtr2);
     NumInstrumentedCMPs++;
-    // DEBUG
-    // FunctionType *PrintfTy = FunctionType::get(
-    //     Type::getInt32Ty(M.getContext()),
-    //     {PointerType::getUnqual(Type::getInt8Ty(M.getContext()))}, true);
-    // FunctionCallee printfFunc = M.getOrInsertFunction("printf", PrintfTy);
-    // IRBuilder<> IRBprintf(CI);
-    // Value *formatStr = IRBprintf.CreateGlobalStringPtr(
-    //     "[HWASAN][DEBUG] Instrumented CMP: %p vs %p -- %p %p\n");
-    // Value *ptr1 = IRBprintf.CreatePointerCast(
-    //     op1, PointerType::getUnqual(Type::getInt8Ty(M.getContext())));
-    // Value *ptr2 = IRBprintf.CreatePointerCast(
-    //     op2, PointerType::getUnqual(Type::getInt8Ty(M.getContext())));
-    // IRBprintf.CreateCall(printfFunc, {formatStr, ptr1, ptr2, untaggedPtr1,
-    // untaggedPtr2}); DEBUG END
   }
-}
+} // InstrumentCMP
 
 StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
                                                          int *numElements,
@@ -2408,12 +2323,9 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
   auto *MDNode = GV->getMetadata("dbg");
   int depth = 0;
   if (!MDNode) {
-    // this is very uncommon on 502
-    // errs() << "[FieldArmor] No debug metadata for GV " << GV->getName() <<
-    // "\n";
     return nullptr;
   }
-  // errs() << "[FieldArmor] DBG INFO FOR GV " << GV->getName() << "\n";
+  // errs() << "[FSAN] DBG INFO FOR GV " << GV->getName() << "\n";
   DIGlobalVariableExpression *DIE =
       dyn_cast<DIGlobalVariableExpression>(MDNode);
 
@@ -2450,10 +2362,10 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
           std::string typeName = baseType->getName().str();
           errs() << "\t\tSTRUCT TYPE : " << typeName << "\n";
           ret = StructType::getTypeByName(*C, "struct." + typeName);
-          if (ret)
-            ret->dump();
-          else
-            errs() << "\t\t\tNO TYPE: " << typeName << "\n";
+          // if (ret)
+          //   ret->dump();
+          // else
+          //   errs() << "\t\t\tNO TYPE: " << typeName << "\n";
           /**
            * Structs can be defined and instantiated on the fly
            * EXAMPLE of a corner case:
@@ -2472,13 +2384,13 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
           auto *derived = dyn_cast<DIDerivedType>(baseType);
           auto bt = derived->getBaseType();
           // errs() << "\t\tBASE TYPE (TYPEDEF): ";
-          bt->dump();
+          // bt->dump();
           if (bt->getTag() == dwarf::DW_TAG_structure_type) {
             std::string typeName = bt->getName().str();
             // errs() << "\t\tSTRUCT TYPE (TYPEDEF): " << typeName << "\n";
             ret = StructType::getTypeByName(*C, "struct." + typeName);
-            if (ret)
-              ret->dump();
+            // if (ret)
+            //   ret->dump();
             // else
             // errs() << "\t\t\tNO TYPE: " << typeName << "\n";
           } else if (bt->getTag() == dwarf::DW_TAG_union_type) {
@@ -2499,20 +2411,19 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
 /** Only expect structs, arrays of structs, matrices of structs */
 void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   bool isGVArray = GV->getValueType()->isArrayTy();
-
   Constant *Initializer = GV->getInitializer();
   Type *type = GV->getValueType(); // this is a lie!
-  // errs() << "[FieldArmor] Instrumenting global variable: " << GV->getName()
+  // errs() << "[FSAN] Instrumenting global variable: " << GV->getName()
   //        << ", type: " << *type << "\n";
-  std::string TypeStr;
-  raw_string_ostream RSO(TypeStr);
-  type->print(RSO);
-  // errs() << "[FieldArmor] Type: " << RSO.str() << ", isVector: " <<
+  // std::string TypeStr;
+  // raw_string_ostream RSO(TypeStr);
+  // type->print(RSO);
+  // errs() << "[FSAN] Type: " << RSO.str() << ", isVector: " <<
   // type->isVectorTy() << ", isArray: " << type->isArrayTy() << ", isStruct: "
   // << type->isStructTy() << ", is GVARRAY: " << isGVArray << "\n";
 
   assert(type->isAggregateType() &&
-         "[FieldArmor] Expected only aggregate types to be instrumented");
+         "[FSAN] Expected only aggregate types to be instrumented");
   StructType *TYPE = nullptr;
   bool isStruct = type->isStructTy();
   bool isArrayOfStructs =
@@ -2577,7 +2488,7 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     Type *elementType = type->getArrayElementType();
     StructType *STA = dyn_cast<StructType>(elementType);
 
-    // errs() << "[FieldArmor] Instrumenting global variable with array of "
+    // errs() << "[FSAN] Instrumenting global variable with array of "
     //           "structs: "
     //        << GV->getName() << "\n";
     if (STA->isLiteral()) {
@@ -2600,7 +2511,7 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     Type *elementType = dyn_cast<ArrayType>(type)->getElementType();
     Type *structType = dyn_cast<ArrayType>(elementType)->getElementType();
     StructType *STM = dyn_cast<StructType>(structType);
-    // errs() << "[FieldArmor] Instrumenting global variable with matrix of "
+    // errs() << "[FSAN] Instrumenting global variable with matrix of "
     //           "structs: "
     //        << GV->getName() << "\n";
     if (STM->isLiteral()) {
@@ -2620,7 +2531,7 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   }
 
   if (is3DMatrixOfStructs) {
-    // errs() << "[FieldArmor] Instrumenting global 3D array of structs: "
+    // errs() << "[FSAN] Instrumenting global 3D array of structs: "
     //        << GV->getName() << "\n";
     Type *elementType = dyn_cast<ArrayType>(type)->getElementType();
     Type *innerArrayType = dyn_cast<ArrayType>(elementType)->getElementType();
@@ -2630,8 +2541,6 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
       if (tmp) {
         STM = tmp;
-        // errs() << "BOOM got struct type from dbg info: " << STM->getName()
-        //        << "\n";
       }
 
       else
@@ -2643,7 +2552,7 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   }
 
   if (isUnion) {
-    // errs() << "[FieldArmor] Skipping union/aggregate of unions GV: "
+    // errs() << "[FSAN] Skipping union/aggregate of unions GV: "
     //        << GV->getName() << "\n";
     return;
   }
@@ -2651,12 +2560,18 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   uint64_t SizeInBytes =
       M.getDataLayout().getTypeAllocSize(Initializer->getType());
 
+  // errs() << "[FSAN] Instrumenting global variable: " << GV->getName()
+  //        << ", is array: " << isGVArray << "\n";
   auto *NewGV = new GlobalVariable(M, Initializer->getType(), GV->isConstant(),
                                    GlobalValue::ExternalLinkage, Initializer,
                                    GV->getName() + ".hwasan");
   NewGV->copyAttributesFrom(GV);
   NewGV->setLinkage(GlobalValue::PrivateLinkage);
   NewGV->copyMetadata(GV, 0);
+  auto *MD_node =
+      MDNode::get(*C, ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 1)));
+  NewGV->setMetadata("fsan.instrument", MD_node);
+
   NewGV->setAlignment(
       std::max(GV->getAlign().valueOrOne(), Mapping.getObjectAlignment()));
 
@@ -2706,7 +2621,7 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       createTagVector(TYPE);
       TagVector = M.getGlobalVariable(struct_name + ".fieldarmor.tagvec", true);
       // NOTE: this fails for arrays of pairs
-      // errs() << "[FieldArmor] Error: Tag vector global not found for struct:
+      // errs() << "[FSAN] Error: Tag vector global not found for struct:
       // "
       //        << struct_name << "\n";
       // errs() << *GV << "\n";
@@ -2734,14 +2649,10 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
         ConstantExpr::getSub(ConstantExpr::getPtrToInt(TagVector, Int64Ty),
                              ConstantExpr::getPtrToInt(Descriptor, Int64Ty)),
         Int32Ty);
-    // auto *arraySize = ConstantInt::get(
-    //     Int32Ty, 0x1); // fix to this value for now!!! TODO :REMOVE
     Constant *arraySize = nullptr;
     if (isStruct) {
       // single struct
-      arraySize = ConstantInt::get(
-          Int32Ty, 0x1); // fix to this value for now!!! TODO :REMOVE
-      ;
+      arraySize = ConstantInt::get(Int32Ty, 0x1);
     } else {
       // array of structs
       if (isMatrixOfStructs) {
@@ -2801,15 +2712,12 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       ConstantExpr::getAdd(
           ConstantExpr::getPtrToInt(NewGV, Int64Ty),
           ConstantInt::get(Int64Ty, (uint64_t)(Tag) << PointerTagShift)),
-      GV->getType()); // NOTE: this does not work!!!!! Ptrs cannot be tagged
-                      // this way because it breaks global references
+      GV->getType());
   auto *Alias = GlobalAlias::create(GV->getValueType(), GV->getAddressSpace(),
                                     GV->getLinkage(), "", Aliasee, &M);
   Alias->setVisibility(GV->getVisibility());
   Alias->takeName(GV);
-  GV->replaceAllUsesWith(Alias); /// WRONG!
-  // uses must be replaced with tag only if they are not in some arithmetic
-  // instruction
+  GV->replaceAllUsesWith(Alias);
   GV->eraseFromParent();
   NumInstrumentedGlobals++;
 } // instrumentGlobal
@@ -2997,7 +2905,7 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
   std::string TagVecName = t->getStructName().str() + ".fieldarmor.tagvec";
   auto *TagVec = M.getGlobalVariable(TagVecName, true);
   if (TagVec) {
-    // errs() << "[FieldArmor] Tag vector " << TagVecName
+    // errs() << "[FSAN] Tag vector " << TagVecName
     //        << " already exists, skipping creation.\n";
     return;
   }
@@ -3007,7 +2915,7 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
   bool isLiteral = t->isLiteral();
   // if (isLiteral) {
   //   LiteralStructs++;
-  //   // errs() << "[FieldArmor] StructType " << *t << " is literal!\n";
+  //   // errs() << "[FSAN] StructType " << *t << " is literal!\n";
   // }
 
   bool isUnion =
@@ -3034,25 +2942,25 @@ void HWAddressSanitizer::createTagVector(StructType *t) {
       M, TagArrayType, true, GlobalVariable::PrivateLinkage, Init, TagVecName);
   NewTagVector_global->setSection("porcodiddio"); // is this necessary?
   appendToCompilerUsed(M, NewTagVector_global);
-  // errs() << "[FieldArmor] Created tag vector " << TagVecName << "\n";
+  // errs() << "[FSAN] Created tag vector " << TagVecName << "\n";
   NumDefinedTagVectors++;
 }
 
 void HWAddressSanitizer::createTagVectors() {
   auto identifiedStructTypes = M.getIdentifiedStructTypes();
   for (auto t : identifiedStructTypes)
-    // errs() << "[FieldArmor] Identified StructType: " << *t << ", is literal
+    // errs() << "[FSAN] Identified StructType: " << *t << ", is literal
     // "
     //        << (t->isLiteral() ? "yes" : "no") << "\n";
 
     for (auto t : identifiedStructTypes) {
       StructType *ty = dyn_cast<StructType>(t);
-      // errs() << "[FieldArmor] Creating tag vector for StructType " << *t <<
+      // errs() << "[FSAN] Creating tag vector for StructType " << *t <<
       // "\n";
       /** NOTE: opaque types are not sized. */
       if (!ty->isSized()) {
         // Q: what is the solution to this?
-        // errs() << "[FieldArmor] StructType " << *t << " is not sized!\n";
+        // errs() << "[FSAN] StructType " << *t << " is not sized!\n";
         continue;
       }
 
@@ -3082,7 +2990,7 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
   uint16_t sonIdx = 1; // NOTE: 2^^16 max number of fields because tag on 4 bits
   if (levelZeroFieldsOffsets.size() >= (1 << 16) - 1) {
     /** Too many fields :( */
-    errs() << "[FieldArmor] Struct " << *Ty
+    errs() << "[FSAN] Struct " << *Ty
            << " has too many fields to be tagged properly.\n";
     return nullptr;
   }
@@ -3340,25 +3248,13 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
             DL.getTypeAllocSize(sonType); // USE ARRAY SIZE INSTEAD
         uint64_t nElems = dyn_cast<ArrayType>(sonType)->getNumElements();
         uint64_t remainingSizeOfStruct = DL.getTypeAllocSize(Ty) - (sonOffset);
-        // TODO: if size is 1 byte and field is the last field of the struct,
-        // detect possible flexible array and memset remaining part of tagVector
-        // to 0 to avoid FPs
         bool isLastFieldOfStruct =
             (sonIdx) ==
             Ty->getNumContainedTypes(); // NOTEL sonIdx is adj to be 1-based
-        // if (isLastFieldOfStruct)
-        //   errs() << "[FieldArmor] Detected possible flexible array of size 0
-        //   "
-        //             "at offset "
-        //          << sonOffset << " of struct " << *Ty << ", sonSize " <<
-        //          sonSize
-        //          << "\n";
         if (nElems == 1 && isLastFieldOfStruct) {
-          errs() << "[FieldArmor] Detected possible flexible array at offset "
+          errs() << "[FSAN] Detected possible flexible array at offset "
                  << sonOffset << " of struct " << *Ty << ", memsetting "
                  << remainingSizeOfStruct << " bytes to 0\n";
-          // detect possible flexible array and memset remaining part of
-          // tagVector to 0 to avoid FPs
           memset(&tags[sonOffset], 0x00, remainingSizeOfStruct);
 
         } else
@@ -3391,22 +3287,3 @@ u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
 
   return tags;
 } // computeTags
-
-/**
- * TODO: ConstGEPs are instruction operands, they do not exist as instructions.
- * FIX THIS.
- */
-void HWAddressSanitizer::InstrumentConstGEP(ConstantExpr *GEPI) {
-  errs() << "[FieldArmor] Instrumenting CONST GEP: ";
-  GEPI->print(errs());
-  errs() << "\n";
-
-  auto nOperands = GEPI->getNumOperands();
-  assert(nOperands <= 3); // I expect 3 at most
-  if (nOperands == 2) {
-    errs() << "[FieldArmor] WARNING: CONST GEP with 2 operands found: ";
-    GEPI->print(errs());
-    errs() << "\n";
-    return;
-  }
-} // instrumentConstGEP

@@ -17,6 +17,8 @@ struct FSanRewriteFunctionCallsPass
 private:
   bool isTypedMallocLike(CallBase *CB);
   bool isTypedNewOperator(CallBase *CB);
+  bool InstrumentBOP(BinaryOperator *BOP);
+  bool InstrumentCMP(CmpInst *CI);
   bool RewriteCallToTypedAllocator(CallBase *CB, Module &M);
 };
 
