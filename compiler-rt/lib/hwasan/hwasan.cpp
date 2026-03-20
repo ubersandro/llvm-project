@@ -223,13 +223,16 @@ void UpdateMemoryUsage() {}
 
 void HwasanAtExit() {
   // Printf("FSAN: %llu TOTAL checks\n",
-  //        (unsigned long long)atomic_load(&total_checks, memory_order_relaxed));
+  //        (unsigned long long)atomic_load(&total_checks,
+  //        memory_order_relaxed));
   // Printf("FSAN: %llu checks on uninitialized shadow\n",
   //        (unsigned long long)atomic_load(&checks_on_uninited_shadow,
   //                                        memory_order_relaxed));
   // Printf("FSAN: %llu checks on untagged pointers\n",
   //        (unsigned long long)atomic_load(&checks_on_untagged_ptr,
-  //                                        memory_order_relaxed));  
+  //                                        memory_order_relaxed));
+  // create a file called "hwasan_report.txt" in the current directory with the
+  // report
   if (common_flags()->print_module_map)
     DumpProcessMap();
   if (flags()->print_stats && (flags()->atexit || hwasan_report_count > 0))

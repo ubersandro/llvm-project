@@ -48,14 +48,17 @@
 #endif
 
 typedef u8 tag_t;
+#  ifdef HWASAN_ALIASING_MODE
+#    undef HWASAN_ALIASING_MODE
+#  endif
 
 #if defined(HWASAN_ALIASING_MODE)
 #  if !defined(__x86_64__)
 #    error Aliasing mode is only supported on x86_64
 #  endif
 // Tags are done in middle bits using userspace aliasing.
-constexpr unsigned kAddressTagShift = 39;
-constexpr unsigned kTagBits = 3;
+// constexpr unsigned kAddressTagShift = 39;
+// constexpr unsigned kTagBits = 3;
 
 // The alias region is placed next to the shadow so the upper bits of all
 // taggable addresses matches the upper bits of the shadow base.  This shift
@@ -65,6 +68,7 @@ constexpr unsigned kTagBits = 3;
 // simpler/faster shadow calculation.
 constexpr unsigned kTaggableRegionCheckShift =
     __sanitizer::Max(kAddressTagShift + kTagBits + 1U, 44U);
+
 #elif defined(__x86_64__)
 // Tags are done in upper bits using Intel LAM.
 constexpr unsigned kAddressTagShift = 57;
@@ -92,12 +96,12 @@ const unsigned kRecordFPLShift = 4;
 const unsigned kRecordFPModulus = 1 << (64 - kRecordFPShift + kRecordFPLShift);
 
 static inline bool InTaggableRegion(uptr addr) {
-#if defined(HWASAN_ALIASING_MODE)
-  // Aliases are mapped next to shadow so that the upper bits match the shadow
-  // base.
-  return (addr >> kTaggableRegionCheckShift) ==
-         (__hwasan::GetShadowOffset() >> kTaggableRegionCheckShift);
-#endif
+// #if defined(HWASAN_ALIASING_MODE)
+//   // Aliases are mapped next to shadow so that the upper bits match the shadow
+//   // base.
+//   return (addr >> kTaggableRegionCheckShift) ==
+//          (__hwasan::GetShadowOffset() >> kTaggableRegionCheckShift);
+// #endif
   return true;
 }
 

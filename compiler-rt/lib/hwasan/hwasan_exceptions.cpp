@@ -53,7 +53,8 @@ __hwasan_personality_wrapper(int version, _Unwind_Action actions,
   // required by AAPCS but is a requirement for HWASAN instrumented functions.
   if ((actions & _UA_CLEANUP_PHASE) && rc == _URC_CONTINUE_UNWIND) {
 #if defined(__x86_64__)
-    uptr fp = get_gr(context, 6); // rbp
+    uptr fp = get_gr(context, 6);  // rbp
+    VPrintf(1, "real personality is %p\n", (void*)real_personality);
 #elif defined(__aarch64__)
     uptr fp = get_gr(context, 29); // x29
 #elif SANITIZER_RISCV64
@@ -62,8 +63,12 @@ __hwasan_personality_wrapper(int version, _Unwind_Action actions,
 #error Unsupported architecture
 #endif
     uptr sp = get_cfa(context);
-    TagMemory(UntagAddr(sp), UntagAddr(fp) - UntagAddr(sp),
-              GetTagFromPointer(sp));
+    VPrintf(1, "HWASan: EXCP: SP %p\n",
+            (void*)sp);
+    VPrintf(1, "HWASan: EXCP: FP %p\n",
+            (void*)fp);
+    // TagMemory(UntagAddr(sp), UntagAddr(fp) - UntagAddr(sp),
+    //           GetTagFromPointer(sp));
   }
 
   return rc;

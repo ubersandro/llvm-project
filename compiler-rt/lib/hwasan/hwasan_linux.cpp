@@ -77,21 +77,23 @@ static void PrintRange(uptr start, uptr end, const char* name) {
 }
 
 static void PrintAddressSpaceLayout() {
+  // CHECKS are disabled because x86 switches LOW <-> HIGH shadow mem!
   PrintRange(kHighMemStart, kHighMemEnd, "HighMem");
-  if (kHighShadowEnd + 1 < kHighMemStart)
-    PrintRange(kHighShadowEnd + 1, kHighMemStart - 1, "ShadowGap");
-  else
-    CHECK_EQ(kHighShadowEnd + 1, kHighMemStart);
-  PrintRange(kHighShadowStart, kHighShadowEnd, "HighShadow");
-  if (kLowShadowEnd + 1 < kHighShadowStart)
-    PrintRange(kLowShadowEnd + 1, kHighShadowStart - 1, "ShadowGap");
-  else
-    CHECK_EQ(kLowMemEnd + 1, kHighShadowStart);
+  // if (kHighShadowEnd + 1 < kHighMemStart)
+  //   PrintRange(kHighShadowEnd + 1, kHighMemStart - 1, "ShadowGap");
+  // else
+  //   CHECK_EQ(kHighShadowEnd + 1, kHighMemStart);
+
+  // if (kLowShadowEnd + 1 < kHighShadowStart)
+  //   PrintRange(kLowShadowEnd + 1, kHighShadowStart - 1, "ShadowGap");
+  // else
+  //   CHECK_EQ(kLowMemEnd + 1, kHighShadowStart);
   PrintRange(kLowShadowStart, kLowShadowEnd, "LowShadow");
-  if (kLowMemEnd + 1 < kLowShadowStart)
-    PrintRange(kLowMemEnd + 1, kLowShadowStart - 1, "ShadowGap");
-  else
-    CHECK_EQ(kLowMemEnd + 1, kLowShadowStart);
+  PrintRange(kHighShadowStart, kHighShadowEnd, "HighShadow");
+  // if (kLowMemEnd + 1 < kLowShadowStart)
+  //   PrintRange(kLowMemEnd + 1, kLowShadowStart - 1, "ShadowGap");
+  // else
+  //   CHECK_EQ(kLowMemEnd + 1, kLowShadowStart);
   PrintRange(kLowMemStart, kLowMemEnd, "LowMem");
   CHECK_EQ(0, kLowMemStart);
 }
@@ -119,7 +121,8 @@ static void InitializeShadowBaseAddress(uptr shadow_size_bytes) {
       CHECK(MemoryRangeIsAvailable(beg, end));
     }
   } else {
-    __hwasan_shadow_memory_dynamic_address = 0x400000000000;
+    // on x86, this is start of the lowest portion of shadow memory
+    __hwasan_shadow_memory_dynamic_address = kHighShadowStart;
   }
 }
 
@@ -147,12 +150,19 @@ static bool CanUseTaggingAbi() {
   //
   // arch_prctl(ARCH_GET_MAX_TAG_BITS, &bits) returns the maximum number of tag
   // bits the user can request, or zero if LAM is not supported by the hardware.
-  if (internal_iserror(internal_arch_prctl(ARCH_GET_MAX_TAG_BITS,
-                                           reinterpret_cast<uptr>(&num_bits))))
+  if (internal_iserror(internal_arch_prctl(
+          ARCH_GET_MAX_TAG_BITS, reinterpret_cast<uptr>(&num_bits)))) {
+    VPrintf(1, "HWASan: Failed to get max tag bits: %d\n", errno);
     return false;
+  }
+
   // The platform must provide enough bits for HWASan tags.
-  if (num_bits < kTagBits)
+  if (num_bits < kTagBits) {
+    VPrintf(1, "HWASan: Not enough tag bits available: %lu < %d\n", num_bits,
+            kTagBits);
     return false;
+  }
+
   return true;
 #  else
   // Check for ARM TBI support.
@@ -169,8 +179,13 @@ static bool EnableTaggingAbi() {
   // arch_prctl(ARCH_GET_UNTAG_MASK, &mask) returns the mask of significant
   // address bits. It is ~0ULL if either LAM is disabled for the process or LAM
   // is not supported by the hardware.
-  if (internal_iserror(internal_arch_prctl(ARCH_ENABLE_TAGGED_ADDR, kTagBits)))
+  auto rc = internal_arch_prctl(ARCH_ENABLE_TAGGED_ADDR, kTagBits);
+  if (internal_iserror(rc)) {
+    VPrintf(1, "HWASan: Failed to enable tagged address ABI: %d\n", errno);
     return false;
+  }
+  VPrintf(1, "HWASan: Enabled tagged address ABI with %d tag bits.\n",
+          kTagBits);
   unsigned long mask = 0;
   // Make sure the tag bits are where we expect them to be.
   if (internal_iserror(internal_arch_prctl(ARCH_GET_UNTAG_MASK,
@@ -201,6 +216,7 @@ void InitializeOsSupport() {
   bool has_abi = CanUseTaggingAbi();
 
   if (!has_abi) {
+    VPrintf(0, "ERROR: HWASan is not supported on this system.\n");
 #  if SANITIZER_ANDROID || defined(HWASAN_ALIASING_MODE)
     // Some older Android kernels have the tagged pointer ABI on
     // unconditionally, and hence don't have the tagged-addr prctl while still
@@ -229,20 +245,19 @@ void InitializeOsSupport() {
 
 bool InitShadow() {
   // Define the entire memory range.
-  kHighMemEnd = GetHighMemEnd();
   // Determine shadow memory base offset.
-  InitializeShadowBaseAddress(MemToShadowSize(kHighMemEnd) >>
-                              1);  // @ale: shrink shadow memory size
-  VPrintf(1, "HWASan hardcoded shadow base address: %p\n",
-          (void*)__hwasan_shadow_memory_dynamic_address);
-  uptr sizeOfInterval = 0x3fffffffffff + 1;
-  kLowMemStart = 0;
-  kLowMemEnd = sizeOfInterval - 1;
-  kLowShadowStart = sizeOfInterval;
-  kLowShadowEnd = kLowShadowStart + sizeOfInterval - 1;
-  kHighShadowStart = 0xb00000000000;  // @ale: create a gap
-  kHighShadowEnd = kHighShadowStart + sizeOfInterval - 1;
-  kHighMemStart = 0xf00000010000;
+  int k = 44;
+  kLowMemStart = 0x0;
+  kLowMemEnd = (1ULL << k) - 1ULL;
+  kHighShadowStart = kLowMemEnd + 1;
+  kHighShadowEnd = kHighShadowStart + (1ULL << k) - 1ULL;
+  kLowShadowStart = kHighShadowEnd + 1;  // FIX
+  kLowShadowEnd = kLowMemEnd ^ TRANS_CONSTANT;
+  kHighMemStart = kHighShadowStart ^ TRANS_CONSTANT;
+  kHighMemEnd = GetHighMemEnd();    // 1<<48 -1
+  InitializeShadowBaseAddress(-1);  // @ale: shrink shadow memory size
+  // VPrintf(1, ">>__hwasan_shadow_memory_dynamic_address: %p\n",
+  //         (void*)__hwasan_shadow_memory_dynamic_address);
 
   // Check the sanity of the defined memory ranges (there might be gaps).
   CHECK_EQ(kHighMemStart % GetMmapGranularity(), 0);
@@ -277,26 +292,33 @@ bool InitShadow() {
 #    define FINISH
 void __attribute__((destructor)) __hwasan_finish() {
   // enable on need
-  // Printf(
-  //     "FSAN: %llu checks, %llu on untagged ptrs, %llu on uninitialized
-  //     shadow. Overflows %llu\n", atomic_load(&total_checks,
-  //     memory_order_relaxed), atomic_load(&checks_on_untagged_ptr,
-  //     memory_order_relaxed), atomic_load(&checks_on_uninited_shadow,
-  //     memory_order_relaxed), atomic_load(&overflows, memory_order_relaxed));
+  Printf(
+      "FSAN: %llu checks, %llu on untagged ptrs, %llu on uninitialized shadow. "
+      "Overflows %llu\n",
+      atomic_load(&total_checks, memory_order_relaxed),
+      atomic_load(&checks_on_untagged_ptr, memory_order_relaxed),
+      atomic_load(&checks_on_uninited_shadow, memory_order_relaxed),
+      atomic_load(&overflows, memory_order_relaxed));
 }
 #  endif
 
 void InitThreads() {
   CHECK(__hwasan_shadow_memory_dynamic_address);
   uptr guard_page_size = GetMmapGranularity();
-  uptr thread_space_start =
-      __hwasan_shadow_memory_dynamic_address - (1ULL << kShadowBaseAlignment);
-  uptr thread_space_end =
-      __hwasan_shadow_memory_dynamic_address - guard_page_size;
+  VPrintf(1, "kShadowBaseAlignment: %d\n", kShadowBaseAlignment);
+  uptr base = 0x100000000000ULL;
+  uptr thread_space_start = base - (1ULL << kShadowBaseAlignment);
+  uptr thread_space_end = base - guard_page_size;
+  VPrintf(1, "HWASan thread metadata range: [%p, %p]\n",
+          (void*)thread_space_start, (void*)thread_space_end);
+  // VPrintf(1, "HWASan thread stack range: [%p, %p]\n", (void*)kHighMemStart,
+  //         (void*)kHighMemEnd);
+  VPrintf(1, "Guard page size: %zu\n", guard_page_size);
   ReserveShadowMemoryRange(thread_space_start, thread_space_end - 1,
                            "hwasan threads", /*madvise_shadow*/ false);
   ProtectGap(thread_space_end,
              __hwasan_shadow_memory_dynamic_address - thread_space_end);
+  ProtectGap(thread_space_start - guard_page_size, guard_page_size);
   InitThreadList(thread_space_start, thread_space_end - thread_space_start);
   hwasanThreadList().CreateCurrentThread();
 }
@@ -513,26 +535,30 @@ uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector, uptr array_size) {
   uptr perElementSize = size / array_size;
   // TODO: enforce correctness of the division
   u_int8_t* ptr = (u_int8_t*)tag_vector;
-  const char* whatIsIt = (tag_vector ? "TAGGING" : "UNTAGGING");
+  bool tagging = tag_vector != 0;
   VPrintf(1,
-          "[FieldArmor] TagMemory_mod : %s -> P: %p size: %p tag_vector: "
-          "%p, array_size: %p, perElementSize: %p\n",
-          whatIsIt, (void*)p, (void*)size, (void*)tag_vector, (void*)array_size,
-          (void*)perElementSize);
+          "[FSAN] TagMemory_mod: p: %p, shadow_p: %p, size: %zu, tag_vector: "
+          "%p, array_size: %zu\n",
+          (void*)p, (void*)MemToShadow(p), size, (void*)tag_vector, array_size);
   uptr tagged = AddTagToPointer(p, RPTag);  // TODO: handle array case!
 
   for (u_int64_t x = 0; x < array_size; x++) {
-    for (uptr i = 0; i < perElementSize; i++) {
-      u_int8_t tag = ptr ? ptr[i] : 0;
-      VPrintf(2,
-              "\t\t[FieldArmor] TagMemory_mod: A: %p shadow[A]  -> T: 0x%02x\n",
-              (void*)(p + i), tag);
-      *(char*)(MemToShadow(p + (i + x * perElementSize))) = tag;
-    }
-    if (array_size == 1)
-      break;
-    VPrintf(2, "\t\t[FieldArmor] TagMemory_mod: NEXT ELEMENT in array, x: %d\n",
-            x + 1);
+    // LEGACY
+    // for (uptr i = 0; i < perElementSize; i++) {
+    //   u_int8_t tag = ptr ? ptr[i] : 0;
+    //   // VPrintf(2,
+    //   //         "\t\t[FieldArmor] TagMemory_mod: A: %p shadow[A]  -> T:
+    //   //         0x%02x\n", (void*)(p + i), tag);
+    //   *(char*)(MemToShadow(p + (i + x * perElementSize))) = tag;
+    // }
+    // LEGACY
+
+    if (tagging)
+      internal_memcpy((void*)(MemToShadow(p + x * perElementSize)), (void*)ptr,
+                      perElementSize);
+    else
+      internal_memset((void*)(MemToShadow(p + x * perElementSize)), 0,
+                      perElementSize);
   }
   return ptr ? tagged : p;
 }
@@ -549,6 +575,13 @@ uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
   uptr threshold = common_flags()->clear_shadow_mmap_threshold;
   if (SANITIZER_LINUX &&
       UNLIKELY(page_end >= page_start + threshold && tag == 0)) {
+    // VPrintf(0, "HWASan: TagMemoryAligned: Clearing shadow memory for "
+    //          "large allocation at %p of size %p\n",
+    //          (void*)p, (void*)size);
+    // VPrintf(0, "page end: %p, page start: %p, shadow start: %p, shadow size:
+    // %p\n",
+    //         (void*)page_end, (void*)page_start, (void*)shadow_start,
+    //         (void*)shadow_size);
     internal_memset((void*)shadow_start, tag, page_start - shadow_start);
     internal_memset((void*)page_end, tag,
                     shadow_start + shadow_size - page_end);
@@ -559,8 +592,8 @@ uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
     internal_memset((void*)shadow_start, tag, shadow_size);
   }
   uptr tagged = AddTagToPointer(p, tag);
-  VPrintf(1, "[FieldArmor] TagMemoryAligned: return %p, untagged %p \n",
-          (void*)tagged, (void*)p);
+  // VPrintf(1, "\t\t[FieldArmor] TagMemoryAligned: return %p, untagged %p \n",
+  //         (void*)tagged, (void*)p);
   return tagged;
 }
 

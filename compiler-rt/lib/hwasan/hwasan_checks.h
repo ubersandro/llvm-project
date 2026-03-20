@@ -171,7 +171,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   tag_t ptr_tag = GetTagFromPointer(p);
 
   if (UNLIKELY(ptr_tag == 0)) {
-    // atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
+    atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
     return;
   }
 
@@ -181,14 +181,14 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   // NOTE: do check on first byte, catch the smallest read possible
 
   if (UNLIKELY(memIsNull)) {
-    // atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
+    atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
     return;
   }
 
   unsigned int size = (unsigned int)sz;
   unsigned int chunks8B = size / 8;
   unsigned int remainder = size % 8;
-  uint64_t ptr_tag_8B = ptr_tag * 0x0101010101010101UL;
+  uint64_t ptr_tag_8B = ptr_tag * 0x0101010101010101ULL;
 
   // uint64_t extendedMemTag;
   // for (unsigned int i = 0; i < chunks8B; i++) {
@@ -221,7 +221,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
 template <ErrorAction EA, AccessType AT, unsigned LogSize>
 __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   if (!InTaggableRegion(p))
-  return;
+    return;
   // NOTE: levels are masked for now, but they could be removed to make this
   // check even faster
 
@@ -229,10 +229,30 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   uptr untagged_ptr = UntagAddr(p);             // this could be avoided
   uptr shadow_addr = MemToShadow(untagged_ptr);
   uint8_t ShadowTag = getT(*(uint8_t*)shadow_addr);
+  // DEBUG
+  if (UNLIKELY(ShadowTag == 0)) {
+    atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
+
+    if (atomic_load(&checks_on_uninited_shadow, memory_order_relaxed) == 0) {
+      // overflow detected
+      VPrintf(1,
+              "FSAN: overflow detected in checks_on_uninited_shadow counter\n");
+    }
+    return;
+  }
+  if (UNLIKELY(GetTagFromPointer(p) == 0)) {
+    atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
+    if (atomic_load(&checks_on_untagged_ptr, memory_order_relaxed) == 0) {
+      // overflow detected
+      VPrintf(1, "FSAN: overflow detected in checks_on_untagged_ptr counter\n");
+    }
+    return;
+  }
+  return;
+  // DEBUG
   uint16_t TagShort = 0;
   uint16_t ShadowTagShort = 0;
   uint16_t ShadowTagMaskShort = 0x0F0FUL;  // only get T bits
-
   uint32_t TagInt = 0;
   uint32_t ShadowTagInt = 0;
   uint32_t ShadowTagMaskInt = 0x0F0F0F0FUL;
