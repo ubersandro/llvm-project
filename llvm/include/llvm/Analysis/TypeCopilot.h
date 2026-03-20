@@ -93,15 +93,15 @@ public:
 
   ~TypeSet() { types.clear(); }
 
-  void dump() const {
-    // iterate types and print them with a comma
-    auto it = types.begin();
-    for (; it != types.end(); it++) {
-      errs() << *it;
-      if (it != types.end())
-        errs() << ", ";
-    }
-  }
+  // void dump() const {
+  //   // iterate types and print them with a comma
+  //   auto it = types.begin();
+  //   for (; it != types.end(); it++) {
+  //     errs() << *it;
+  //     if (it != types.end())
+  //       errs() << ", ";
+  //   }
+  // }
 
   void insert(std::string type) {
     types.insert(type);
@@ -357,9 +357,9 @@ public:
       // filter out ptr* type
       // FIXME delete stale debug stuff
       if (DEBUG && to_add->count("ptr**")) {
-        key->dump();
-        errs() << "current type: ";
-        old->dump();
+        // key->dump();
+        // errs() << "current type: ";
+        // old->dump();
         errs() << "\n";
 
         errs() << "stack trace:\n";
@@ -432,9 +432,9 @@ public:
     if (old) {
       // filter out ptr* type
       if (DEBUG && value == "ptr**") {
-        key->dump();
+        // key->dump();
         errs() << "current type: ";
-        old->dump();
+        // old->dump();
         errs() << "\n";
 
         errs() << "stack trace:\n";

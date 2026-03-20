@@ -566,11 +566,6 @@ GlobalVariable *retrieveTV(StructType *t, Module &M) {
 // TODO: reuse for the NEW as well
 bool FSanRewriteFunctionCallsPass::RewriteCallToTypedAllocator(CallBase *CI,
                                                                Module &M) {
-  // errs() << "\t[IR] REWRITING MALLOC-LIKE CALL: " << *CI << "\n";
-  // errs() << "\t\t SRC LOCATION: ";
-  // if (DILocation *Loc = CI->getDebugLoc()) {
-  //   errs() << Loc->getFilename() << ":" << Loc->getLine() << "\n";
-  // }
   auto Int64Ty = Type::getInt64Ty(M.getContext());
   PointerType *PtrTy = PointerType::getUnqual(M.getContext());
   StructType *allocType = nullptr;
@@ -583,8 +578,6 @@ bool FSanRewriteFunctionCallsPass::RewriteCallToTypedAllocator(CallBase *CI,
 
   auto nArgs = CI->arg_size();
   if (nArgs < 3) {
-    // errs() << "\t\t[IR] Not enough arguments for typed allocator call, "
-    //           "skipping.\n";
     return false;
   }
 
@@ -608,7 +601,7 @@ bool FSanRewriteFunctionCallsPass::RewriteCallToTypedAllocator(CallBase *CI,
            << ", arraySize: " << (arraySize ? "present" : "null")
            << ", formerFunction: " << (formerFunction ? "present" : "null")
            << "\n";
-    CI->dump();
+    // CI->dump();
     assert(false &&
            "Failed to extract necessary arguments for typed allocator call");
   }
@@ -673,7 +666,9 @@ bool FSanRewriteFunctionCallsPass::RewriteCallToTypedAllocator(CallBase *CI,
 
   CallInst *newCI = dyn_cast<CallInst>(formerCall);
   assert(newCI && "Expected the rewritten call to be an instruction");
-  newCI->setName(CI->getName() + ".fieldarmor.rewrite");
+  auto oldName = newCI->getName();
+  errs() << oldName << " REWRITTEN TO CALL: " << *newCI << "\n";
+  newCI->setName(oldName + ".fieldarmor.rewrite");
   bool changed = true;
 
   // errs() << "\t[IR] REWRITING OK: " << *newCI << "\n";

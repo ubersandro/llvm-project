@@ -1735,10 +1735,8 @@ void CodeGenFunction::EmitDeclStmt(const DeclStmt &S) {
         const Expr *Init = VD->getInit()->IgnoreParenImpCasts();
         if (const auto *Call = dyn_cast<CallExpr>(Init)) {
           if (FSAN::isAllocCall(Call)) {
-            llvm::errs() << "EmitDeclStmt:- ALLOC SITE FOUND " << VD->getName() << ", SRC LOC: " << VD->getLocation().printToString(getContext().getSourceManager()) << "\n";
             QualType LHSTy = VD->getType();
             if(!PendingTypeIsValid){
-              llvm::errs() << "[DBG] Setting pending alloc type: " << LHSTy.getAsString() << "\n";
               FSanPendingAllocType = LHSTy;
               PendingTypeIsValid = true;
             }
