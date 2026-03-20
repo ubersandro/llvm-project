@@ -667,7 +667,7 @@ bool FSanRewriteFunctionCallsPass::RewriteCallToTypedAllocator(CallBase *CI,
   CallInst *newCI = dyn_cast<CallInst>(formerCall);
   assert(newCI && "Expected the rewritten call to be an instruction");
   auto oldName = newCI->getName();
-  errs() << oldName << " REWRITTEN TO CALL: " << *newCI << "\n";
+  // errs() << oldName << " REWRITTEN TO CALL: " << *newCI << "\n";
   newCI->setName(oldName + ".fieldarmor.rewrite");
   bool changed = true;
 

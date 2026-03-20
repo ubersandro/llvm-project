@@ -2301,7 +2301,7 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
       if (baseType) {
         if (baseType->getTag() == dwarf::DW_TAG_structure_type) {
           std::string typeName = baseType->getName().str();
-          errs() << "\t\tSTRUCT TYPE : " << typeName << "\n";
+          // errs() << "\t\tSTRUCT TYPE : " << typeName << "\n";
           ret = StructType::getTypeByName(*C, "struct." + typeName);
           // if (ret)
           //   ret->dump();
