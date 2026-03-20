@@ -1343,9 +1343,6 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
   auto calleeName = CalleeDecl->getQualifiedNameAsString();
   bool isEnabled = CGF.SanOpts.has(SanitizerKind::HWAddress); 
   if (isEnabled && calleeName.find("operator new") != std::string::npos) {
-    // llvm::errs() << "\tEmitNewDeleteCall: Callee for NEW "
-    //              << (typeName.empty() ? "_EMPTY_" : typeName) << ": "
-    //              << *CalleeDecl << ", CalleeName: " << calleeName << " \n";
     auto &ctx = CGF.getContext();
     if (!typeName.empty()) {
       llvm::Value *typeNamePtr =
@@ -1674,11 +1671,6 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   // Q: what is the min type of elements? -> mark this as TODO for future work
   llvm::Value *allocSize = EmitCXXNewAllocSize(
       *this, E, minElements, numElements, allocSizeWithoutCookie);
-  // llvm::errs() << "\t[DBG-FE] Alloc size: ";
-  // allocSize->dump();
-  // llvm::errs() << "\t[DBG-FE] Alloc size w/ cookie: ";
-  allocSizeWithoutCookie->dump();
-  // llvm::errs() << "[DBG-FE] Type size: ";
   auto type = getContext().getTypeSizeInChars(allocType).getQuantity();
   // llvm::errs() << "[DBG-FE] Alloc Type Size: " << type << "\n";
   bool cookie = false;

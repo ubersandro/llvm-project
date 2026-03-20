@@ -4,6 +4,7 @@
 #include "clang/AST/ParentMapContext.h"
 #include "clang/Basic/SourceManager.h"
 #include "llvm/IR/InstrTypes.h"
+// #include "llvm/Support/Casting.h"
 
 namespace FSAN {
 
@@ -17,18 +18,18 @@ inline std::set<std::string> fullsetOfAllocFunctions = {
     "malloc",        "realloc",        "calloc", "reallocarray", "memalign",
     "aligned_alloc", "posix_memalign", "valloc", "pvalloc"};
 
-inline void printExprLocation(const clang::Expr *E, clang::SourceManager &SM) {
-  auto SL = E->getExprLoc();
-  // auto &SM = CGF.getContext().getSourceManager();
-  if (SL.isValid()) {
-    auto P = SM.getPresumedLoc(SL);
-    if (P.isInvalid())
-      P = SM.getPresumedLoc(SM.getSpellingLoc(SL));
-    if (!P.isInvalid())
-      llvm::errs() << "[DBG]:- EXPRESSION DUMP, SRC LOC: " << P.getFilename()
-                   << ":" << P.getLine() << ":" << P.getColumn() << "\n";
-  }
-}
+// inline void printExprLocation(const clang::Expr *E, clang::SourceManager &SM) {
+//   auto SL = E->getExprLoc();
+//   // auto &SM = CGF.getContext().getSourceManager();
+//   if (SL.isValid()) {
+//     auto P = SM.getPresumedLoc(SL);
+//     if (P.isInvalid())
+//       P = SM.getPresumedLoc(SM.getSpellingLoc(SL));
+//     if (!P.isInvalid())
+//       llvm::errs() << "[DBG]:- EXPRESSION DUMP, SRC LOC: " << P.getFilename()
+//                    << ":" << P.getLine() << ":" << P.getColumn() << "\n";
+//   }
+// }
 
 inline bool isAllocCall(const clang::CallExpr *Call) {
   if (!Call)
@@ -50,18 +51,18 @@ inline bool isAllocCall(const clang::CallExpr *Call) {
     return matchesAllocFn(FD);
 
   // Case 2: macro-wrapped call
-  if (const auto *DRE = dyn_cast<clang::DeclRefExpr>(
+  if (const auto *DRE = llvm::dyn_cast<clang::DeclRefExpr>(
           Call->getCallee()->IgnoreParenImpCasts())) {
-    if (const auto *FD = dyn_cast<clang::FunctionDecl>(DRE->getDecl()))
+    if (const auto *FD = llvm::dyn_cast<clang::FunctionDecl>(DRE->getDecl()))
       return matchesAllocFn(FD);
   }
 
   // Case 3: __builtin_malloc etc.
   // TODO: debug this case eventually
-  // if (const auto *CE = dyn_cast<clang::ImplicitCastExpr>(Call->getCallee()))
+  // if (const auto *CE = llvm::dyn_cast<clang::ImplicitCastExpr>(Call->getCallee()))
   // {
-  //   if (const auto *DRE = dyn_cast<clang::DeclRefExpr>(CE->getSubExpr())) {
-  //     if (const auto *FD = dyn_cast<clang::FunctionDecl>(DRE->getDecl())) {
+  //   if (const auto *DRE = llvm::dyn_cast<clang::DeclRefExpr>(CE->getSubExpr())) {
+  //     if (const auto *FD = llvm::dyn_cast<clang::FunctionDecl>(DRE->getDecl())) {
   //       const clang::IdentifierInfo *II = FD->getIdentifier();
   //       if (!II)
   //         return false;
@@ -94,10 +95,10 @@ inline bool isAllocFD(const clang::FunctionDecl *FD) {
 
   // Case 3: __builtin_malloc etc.
   // TODO: debug this case eventually
-  // if (const auto *CE = dyn_cast<clang::ImplicitCastExpr>(Call->getCallee()))
+  // if (const auto *CE = llvm::dyn_cast<clang::ImplicitCastExpr>(Call->getCallee()))
   // {
-  //   if (const auto *DRE = dyn_cast<clang::DeclRefExpr>(CE->getSubExpr())) {
-  //     if (const auto *FD = dyn_cast<clang::FunctionDecl>(DRE->getDecl())) {
+  //   if (const auto *DRE = llvm::dyn_cast<clang::DeclRefExpr>(CE->getSubExpr())) {
+  //     if (const auto *FD = llvm::dyn_cast<clang::FunctionDecl>(DRE->getDecl())) {
   //       const clang::IdentifierInfo *II = FD->getIdentifier();
   //       if (!II)
   //         return false;
@@ -233,17 +234,17 @@ TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
   llvm::Type *SrcTy = Src->getType();
 
   if (DestTy->isPointerType()) {
-    if (auto *Call = dyn_cast<llvm::CallBase>(Src)) {
-      if (llvm::CallBase *CI = dyn_cast<llvm::CallBase>(Call)) {
+    if (auto *Call = llvm::dyn_cast<llvm::CallBase>(Src)) {
+      if (llvm::CallBase *CI = llvm::dyn_cast<llvm::CallBase>(Call)) {
 
-        llvm::Function *Callee = dyn_cast<llvm::Function>(
+        llvm::Function *Callee = llvm::dyn_cast<llvm::Function>(
             CI->getCalledOperand()->stripPointerCasts());
         // if (!Callee) {
         //   llvm::Value *V = CI->getCalledOperand()->stripPointerCasts();
-        //   Callee = dyn_cast<llvm::Function>(V);
+        //   Callee = llvm::dyn_cast<llvm::Function>(V);
         if (Callee && Callee->getName() == "typed_allocation") {
 
-          CI->dump();
+          // CI->dump();
           auto nArgs = CI->arg_size();
           auto typeStrArgIdx = nArgs - 3; // NOT THERE YET
           auto typeStr = CI->getArgOperand(typeStrArgIdx);
@@ -252,9 +253,9 @@ TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
                        << " -  DestTy: " << DestTy << "\n";
           // typeStr->dump();
           std::string typeStrToStr;
-          if (llvm::Constant *name = dyn_cast<llvm::Constant>(typeStr)) {
+          if (llvm::Constant *name = llvm::dyn_cast<llvm::Constant>(typeStr)) {
             if (llvm::ConstantDataArray *dataArray =
-                    dyn_cast<llvm::ConstantDataArray>(name->getOperand(0))) {
+                    llvm::dyn_cast<llvm::ConstantDataArray>(name->getOperand(0))) {
               if (dataArray->isString()) {
                 // llvm::errs() << "\t\tTYPE STR: "
                 //              << dataArray->getAsString() << "\n";
@@ -282,7 +283,7 @@ TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
                 CGF.Builder.CreateGlobalString(IRPointeeTyName);
             CI->setArgOperand(typeStrArgIdx, NewTypeStr);
             llvm::errs() << "Updated call instruction: ";
-            CI->dump();
+            // CI->dump();
           } //
         }
         // }
@@ -302,26 +303,26 @@ TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
                                         : "scalar";
           // TODO: literal structs should be "scalar" -> CHECK
           llvm::StringRef IRPointeeTyName(IRTyNameStr);
-          llvm::errs() << "\t\tBITCAST: SRC: " << *SrcTy << " -  DestTy: ";
-          llvm::errs() << IRPointeeTyName << "\n";
-          Call->dump();
+          // llvm::errs() << "\t\tBITCAST: SRC: " << *SrcTy << " -  DestTy: ";
+          // llvm::errs() << IRPointeeTyName << "\n";
+          // Call->dump();
           // also print the src location where this happens
-          llvm::errs() << "\t\t\tBITCAST: Allocation site: ";
+          // llvm::errs() << "\t\t\tBITCAST: Allocation site: ";
           // Try to use LLVM debug location attached to the call instruction.
-          if (auto *Inst = dyn_cast<llvm::Instruction>(Call)) {
-            if (auto DL = Inst->getDebugLoc()) {
-              if (auto *Loc = DL.get()) {
-                llvm::errs() << Loc->getFilename() << ":" << Loc->getLine()
-                             << ":" << Loc->getColumn();
-              } else {
-                llvm::errs() << "unknown-location";
-              }
-            } else {
-              llvm::errs() << "no-debug-location";
-            }
-          } else {
-            llvm::errs() << "non-instruction-value";
-          }
+          // if (auto *Inst = llvm::dyn_cast<llvm::Instruction>(Call)) {
+          //   if (auto DL = Inst->getDebugLoc()) {
+          //     if (auto *Loc = DL.get()) {
+          //       llvm::errs() << Loc->getFilename() << ":" << Loc->getLine()
+          //                    << ":" << Loc->getColumn();
+          //     } else {
+          //       llvm::errs() << "unknown-location";
+          //     }
+          //   } else {
+          //     llvm::errs() << "no-debug-location";
+          //   }
+          // } else {
+          //   llvm::errs() << "non-instruction-value";
+          // }
 
           auto ArraySize = -1;
 
@@ -338,8 +339,8 @@ TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
           // there, I trust it to have the size OW I try and give info about
           // the type, at least.
           if (Call->getMetadata("fsan.alloc")) {
-            llvm::errs() << "BITCAST HANDLER: ALREADY HAS MD! ";
-            Call->getMetadata("fsan.alloc")->dump();
+            // llvm::errs() << "BITCAST HANDLER: ALREADY HAS MD! ";
+            // Call->getMetadata("fsan.alloc")->dump();
             // TODO: if MD type is "porcodiotype", set correct type
             auto MDNode = Call->getMetadata("fsan.alloc");
             auto *MDS = llvm::dyn_cast<llvm::MDString>(MDNode->getOperand(1));
@@ -347,16 +348,16 @@ TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
                 MDS ? MDS->getString().str() : std::string();
             if (TypeStrMD == "porcodiotype") {
               Call->setMetadata("fsan.alloc", FSanMD);
-              llvm::errs() << "BITCAST HANDLER: UPDATING MD! ";
-              Call->getMetadata("fsan.alloc")->dump();
-              Call->dump();
+              // llvm::errs() << "BITCAST HANDLER: UPDATING MD! ";
+              // Call->getMetadata("fsan.alloc")->dump();
+              // Call->dump();
               // rewrite the type arg of the call
             }
 
           } else {
             llvm::errs() << "BITCAST HANDLER: SETTING MD! ";
             Call->setMetadata("fsan.alloc", FSanMD);
-            FSanMD->dump();
+            // FSanMD->dump();
           }
         } // allocation function
 
@@ -423,13 +424,13 @@ extractAssignment(const clang::CallExpr *Call, clang::ASTContext &Ctx) {
   return std::nullopt;
 }
 
-inline void dumpAllocSite(const clang::CallExpr *E, llvm::StringRef FNName,
-                          clang::CodeGen::CodeGenFunction &CGF) {
-  llvm::errs() << "(FE)ALLOCATION SITE: "
-               << E->getExprLoc().printToString(
-                      CGF.getContext().getSourceManager())
-               << ", FUNCTION: " << FNName << "\n";
-}
+// inline void dumpAllocSite(const clang::CallExpr *E, llvm::StringRef FNName,
+//                           clang::CodeGen::CodeGenFunction &CGF) {
+//   llvm::errs() << "(FE)ALLOCATION SITE: "
+//                << E->getExprLoc().printToString(
+//                       CGF.getContext().getSourceManager())
+//                << ", FUNCTION: " << FNName << "\n";
+// }
 
 inline llvm::MDNode *createFSanMD(std::string TyName, int64_t ArraySize,
                                   clang::CodeGen::CodeGenFunction &CGF) {
@@ -458,20 +459,20 @@ inline void TagFromCallSite(const clang::CallExpr *E,
   }
 
   if (FSAN::allocFunctions.count(FNName.str())) {
-    dumpAllocSite(E, FNName, CGF);
+    // dumpAllocSite(E, FNName, CGF);
     auto ArraySize = -1;
     for (const auto *Arg : E->arguments()) {
       if (auto *unaryOperatorArg =
-              dyn_cast<clang::UnaryExprOrTypeTraitExpr>(Arg)) {
+              llvm::dyn_cast<clang::UnaryExprOrTypeTraitExpr>(Arg)) {
         if (unaryOperatorArg->getKind() == clang::UETT_SizeOf) {
           // when the call has 1 sizeof arg, array size is 1
           clang::QualType TypeToSize = unaryOperatorArg->getTypeOfArgument();
           TypeToSize = CGF.getContext().getCanonicalType(TypeToSize);
-          llvm::errs() << "TagFromCallSite: SIZEOF : "
-                       << TypeToSize.getAsString() << ", SRC LOC: "
-                       << Arg->getExprLoc().printToString(
-                              CGF.getContext().getSourceManager())
-                       << "\n";
+          // llvm::errs() << "TagFromCallSite: SIZEOF : "
+          //              << TypeToSize.getAsString() << ", SRC LOC: "
+          //              << Arg->getExprLoc().printToString(
+          //                     CGF.getContext().getSourceManager())
+          //              << "\n";
           clang::QualType PointeeTy = TypeToSize;
           llvm::Type *IRPointeeTy = CGF.ConvertTypeForMem(PointeeTy);
           std::string IRTyNameStr = IRPointeeTy->isStructTy()
@@ -480,33 +481,33 @@ inline void TagFromCallSite(const clang::CallExpr *E,
           llvm::StringRef IRPointeeTyName(IRTyNameStr);
           CGF.FSanPendingAllocType = TypeToSize;
           CGF.PendingTypeIsValid = true;
-          llvm::errs()
-              << "[DBG-FSAN] This is a sizeof operator in the argument! Type: "
-              << TypeToSize.getAsString() << "\n";
+          // llvm::errs()
+          //     << "[DBG-FSAN] This is a sizeof operator in the argument! Type: "
+          //     << TypeToSize.getAsString() << "\n";
 
-          if (auto *Instr = dyn_cast<llvm::Instruction>(Call.getScalarVal())) {
+          if (auto *Instr = llvm::dyn_cast<llvm::Instruction>(Call.getScalarVal())) {
             ArraySize = 1;
             llvm::MDNode *FSanMD =
                 createFSanMD(IRPointeeTyName.str(), ArraySize, CGF);
             Instr->setMetadata("fsan.alloc", FSanMD);
-            llvm::errs()
-                << "\t\t[DBG-FSAN] fsan metadata attached to instruction:\t\t";
-            Instr->dump();
-            llvm::errs() << "\n";
+            // llvm::errs()
+            //     << "\t\t[DBG-FSAN] fsan metadata attached to instruction:\t\t";
+            // Instr->dump();
+            // llvm::errs() << "\n";
           }
         }
-      } else if (auto *binaryoperator = dyn_cast<clang::BinaryOperator>(Arg)) {
+      } else if (auto *binaryoperator = llvm::dyn_cast<clang::BinaryOperator>(Arg)) {
         if (binaryoperator->getOpcode() == clang::BO_Mul) {
-          if (auto *RHS = dyn_cast<clang::UnaryExprOrTypeTraitExpr>(
+          if (auto *RHS = llvm::dyn_cast<clang::UnaryExprOrTypeTraitExpr>(
                   binaryoperator->getRHS())) {
             if (RHS->getKind() == clang::UETT_SizeOf) {
               clang::QualType TypeToSize = RHS->getTypeOfArgument();
-              llvm::errs()
-                  << "RHS: This is a sizeof operator in the argument! Type: "
-                  << TypeToSize.getAsString() << ", SRC LOC: "
-                  << RHS->getExprLoc().printToString(
-                         CGF.getContext().getSourceManager())
-                  << "\n";
+              // llvm::errs()
+              //     << "RHS: This is a sizeof operator in the argument! Type: "
+              //     << TypeToSize.getAsString() << ", SRC LOC: "
+              //     << RHS->getExprLoc().printToString(
+              //            CGF.getContext().getSourceManager())
+              //     << "\n";
 
               //   llvm::LLVMContext &LLVMCtx = CGF.getLLVMContext();
               clang::QualType PointeeTy = TypeToSize;
@@ -519,28 +520,28 @@ inline void TagFromCallSite(const clang::CallExpr *E,
               CGF.PendingTypeIsValid = true;
               // NOTE: we dont care about array size here
               if (auto *Instr =
-                      dyn_cast<llvm::Instruction>(Call.getScalarVal())) {
+                      llvm::dyn_cast<llvm::Instruction>(Call.getScalarVal())) {
                 llvm::MDNode *FSanMD =
                     createFSanMD(IRPointeeTyName.str(), ArraySize, CGF);
                 // must be an instr. TODO: check if this is the case.
                 Instr->setMetadata("fsan.alloc", FSanMD);
-                llvm::errs() << "\t\t[DBG-FSAN] fsan metadata attached to "
-                                "instruction:\t\t";
-                Instr->dump();
-                llvm::errs() << "\n";
+                // llvm::errs() << "\t\t[DBG-FSAN] fsan metadata attached to "
+                //                 "instruction:\t\t";
+                // Instr->dump();
+                // llvm::errs() << "\n";
               }
             }
 
-          } else if (auto *LHS = dyn_cast<clang::UnaryExprOrTypeTraitExpr>(
+          } else if (auto *LHS = llvm::dyn_cast<clang::UnaryExprOrTypeTraitExpr>(
                          binaryoperator->getLHS())) {
             if (LHS->getKind() == clang::UETT_SizeOf) {
               clang::QualType TypeToSize = LHS->getTypeOfArgument();
-              llvm::errs()
-                  << "LHS: This is a sizeof operator in the argument! Type: "
-                  << TypeToSize.getAsString() << ", SRC LOC: "
-                  << LHS->getExprLoc().printToString(
-                         CGF.getContext().getSourceManager())
-                  << "\n";
+              // llvm::errs()
+              //     << "LHS: This is a sizeof operator in the argument! Type: "
+              //     << TypeToSize.getAsString() << ", SRC LOC: "
+              //     << LHS->getExprLoc().printToString(
+              //            CGF.getContext().getSourceManager())
+              //     << "\n";
 
               //   llvm::LLVMContext &LLVMCtx = CGF.getLLVMContext();
               clang::QualType PointeeTy = TypeToSize;
@@ -552,15 +553,15 @@ inline void TagFromCallSite(const clang::CallExpr *E,
               CGF.FSanPendingAllocType = TypeToSize;
               CGF.PendingTypeIsValid = true;
               if (auto *Instr =
-                      dyn_cast<llvm::Instruction>(Call.getScalarVal())) {
+                      llvm::dyn_cast<llvm::Instruction>(Call.getScalarVal())) {
                 // must be an instr. TODO: check if this is the case.
                 llvm::MDNode *FSanMD =
                     createFSanMD(IRPointeeTyName.str(), ArraySize, CGF);
                 Instr->setMetadata("fsan.alloc", FSanMD);
-                llvm::errs() << "\t\t[DBG-FSAN] fsan metadata attached to "
-                                "instruction:\t\t";
-                Instr->dump();
-                llvm::errs() << "\n";
+                // llvm::errs() << "\t\t[DBG-FSAN] fsan metadata attached to "
+                //                 "instruction:\t\t";
+                // Instr->dump();
+                // llvm::errs() << "\n";
               }
 
             } // LHS is sizeof
@@ -571,13 +572,13 @@ inline void TagFromCallSite(const clang::CallExpr *E,
 
     auto info = FSAN::extractAssignment(E, CGF.getContext());
     if (info) {
-      llvm::errs() << "\t\t[FrontEnd] ASSIGNEE TYPE: "
-                   << info->LHSType.getAsString()
-                   << " POINTEE TYPE: " << info->PointeeType.getAsString()
-                   << " IS DECLARATION: " << info->IsDeclaration << "\n";
+      // llvm::errs() << "\t\t[FrontEnd] ASSIGNEE TYPE: "
+      //              << info->LHSType.getAsString()
+      //              << " POINTEE TYPE: " << info->PointeeType.getAsString()
+      //              << " IS DECLARATION: " << info->IsDeclaration << "\n";
 
       if (Call.isScalar()) {
-        Call.getScalarVal()->dump();
+        // Call.getScalarVal()->dump();
         clang::QualType PointeeTy = info->PointeeType;
         llvm::Type *IRPointeeTy = CGF.ConvertTypeForMem(PointeeTy);
         std::string IRTyNameStr = IRPointeeTy->isStructTy()
@@ -594,7 +595,7 @@ inline void TagFromCallSite(const clang::CallExpr *E,
 
         // else return; // you are done if you found it
 
-        // if (auto *Instr = dyn_cast<llvm::Instruction>(Call.getScalarVal())) {
+        // if (auto *Instr = llvm::dyn_cast<llvm::Instruction>(Call.getScalarVal())) {
         //   // must be an instr. TODO: check if this is the case.
         //   llvm::MDNode *FSanMD =
         //       createFSanMD(IRPointeeTyName.str(), ArraySize, CGF);
@@ -606,16 +607,16 @@ inline void TagFromCallSite(const clang::CallExpr *E,
         // LLM BS
       } // if Call is scalar
 
-      else if (Call.isComplex()) {
-        llvm::errs() << "TODO: handle Complex value:\n";
-        // Call.getComplexVal().first->dump();
-        // Call.getComplexVal().second->dump();
-      } else if (Call.isAggregate()) {
-        llvm::errs() << "TODO: handle Aggregate at address: ";
-        // TODO: for later
-        // Call.getAggregateAddress()
-      } else
-        llvm::errs() << "\t\t[FrontEnd] NO ASSIGNEE TYPE FOUND\n";
+      // else if (Call.isComplex()) {
+      //   llvm::errs() << "TODO: handle Complex value:\n";
+      //   // Call.getComplexVal().first->dump();
+      //   // Call.getComplexVal().second->dump();
+      // } else if (Call.isAggregate()) {
+      //   llvm::errs() << "TODO: handle Aggregate at address: ";
+      //   // TODO: for later
+      //   // Call.getAggregateAddress()
+      // } else
+      //   llvm::errs() << "\t\t[FrontEnd] NO ASSIGNEE TYPE FOUND\n";
     } // if info
     else {
       // NO ASSIGNMENT INFO AVAILABLE
@@ -628,22 +629,22 @@ inline void TagFromCallSite(const clang::CallExpr *E,
                                       ? IRPointeeTy->getStructName().str()
                                       : "scalar"; */
       if (!CGF.PendingTypeIsValid) {
-        llvm::errs() << "\t\t[FrontEnd - TagFromCallSite] NoAss and no SizeOf: "
-                        "putting dummmy str for type str\n";
-        // DONT BAIL OUT HERE, put guard value that tells next steps to
-        // intervene
-        llvm::errs() << "\t\t\tAllocation site: "
-                     << E->getExprLoc().printToString(
-                            CGF.getContext().getSourceManager())
-                     << ", in function: " << FNName << "\n";
+        // llvm::errs() << "\t\t[FrontEnd - TagFromCallSite] NoAss and no SizeOf: "
+        //                 "putting dummmy str for type str\n";
+        // // DONT BAIL OUT HERE, put guard value that tells next steps to
+        // // intervene
+        // llvm::errs() << "\t\t\tAllocation site: "
+        //              << E->getExprLoc().printToString(
+        //                     CGF.getContext().getSourceManager())
+        //              << ", in function: " << FNName << "\n";
         IRTyNameStr = dummyPorcodio;
       } // if no pending type
       else {
         // TYPE IS VALID
         clang::QualType PendingTy = CGF.FSanPendingAllocType;
         if (!PendingTy.isNull()) {
-          llvm::errs() << "\t\t[FrontEnd] Applying pending type: "
-                       << PendingTy.getAsString() << "\n";
+          // llvm::errs() << "\t\t[FrontEnd] Applying pending type: "
+          //              << PendingTy.getAsString() << "\n";
           clang::QualType PointeeTy;
           if (PendingTy->isPointerType())
             PointeeTy = PendingTy->getPointeeType();
@@ -651,8 +652,8 @@ inline void TagFromCallSite(const clang::CallExpr *E,
             PointeeTy = PendingTy;
 
           llvm::Type *IRPointeeTy = CGF.ConvertTypeForMem(PointeeTy);
-          llvm::errs() << "\t\t[FrontEnd] Applying pending type, IR type: "
-                       << *IRPointeeTy << "\n";
+          // llvm::errs() << "\t\t[FrontEnd] Applying pending type, IR type: "
+          //              << *IRPointeeTy << "\n";
           IRTyNameStr = IRPointeeTy->isStructTy()
                             ? IRPointeeTy->getStructName().str()
                             : "scalar";
@@ -662,14 +663,14 @@ inline void TagFromCallSite(const clang::CallExpr *E,
 
       llvm::StringRef IRPointeeTyName(IRTyNameStr);
       ArraySize = -1;
-      if (auto *Instr = dyn_cast<llvm::Instruction>(Call.getScalarVal())) {
+      if (auto *Instr = llvm::dyn_cast<llvm::Instruction>(Call.getScalarVal())) {
         // must be an instr. TODO: check if this is the case.
         llvm::MDNode *FSanMD =
             createFSanMD(IRPointeeTyName.str(), ArraySize, CGF);
         Instr->setMetadata("fsan.alloc", FSanMD);
-        llvm::errs() << "\t\tMetadata attached to instruction:\n";
-        Instr->dump();
-        llvm::errs() << "\n";
+        // llvm::errs() << "\t\tMetadata attached to instruction:\n";
+        // Instr->dump();
+        // llvm::errs() << "\n";
       } // if instr
 
     } // when no assignment info

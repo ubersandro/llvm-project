@@ -6463,34 +6463,6 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
   auto CalleeDecl = dyn_cast_or_null<FunctionDecl>(TargetDecl);
   bool enabled = SanOpts.has(SanitizerKind::HWAddress);
   if (enabled && CalleeDecl && FSAN::isAllocFD(CalleeDecl)) {
-    {
-      // llvm::errs() << "FE-DBG: Dumping original callee: ";
-      // CalleeType->dump();
-      // // now dump it in IR type
-      // llvm::errs() << "FE-DBG: Dumping original callee in IR type: ";
-      // llvm::Type *IRFnType = CGM.getTypes().ConvertType(CalleeType);
-      // IRFnType->print(llvm::errs()); // this is the ret type, I need the
-      //                                // delcaration of  the target
-
-      // llvm::errs() << "FE-DBG: Dumping what the callee would look like in IR: ";
-      // llvm::Constant *CalleePtr = CGM.getRawFunctionPointer(CalleeDecl);
-      // llvm::Value *CalleePtrV = llvm::cast<llvm::Value>(CalleePtr);
-      // CalleePtrV->print(llvm::errs());
-      // llvm::errs() << "\n";
-
-      // PresumedLoc PLoc =
-      //     getContext().getSourceManager().getPresumedLoc(E->getExprLoc());
-      // if (PLoc.isValid()) {
-      //   // NOTE: count these to see how many calls are emitted
-      //   llvm::errs() << "FSAN-FE - EmitCall: CALLEE  " << CalleeDecl->getName()
-      //                << ", SRC: " << PLoc.getFilename() << ":" << PLoc.getLine()
-      //                << ":" << PLoc.getColumn() << "\n";
-      // } else {
-      //   llvm::errs() << "FSAN-FE - EmitCall: CALLEE" << CalleeDecl->getName()
-      //                << ", SRC: <invalid>\n";
-      // }
-    }
-
     // NOTE: this is too early for figuring out the assignment as well, because
     // of how the parser works.
     // TODO: enforce that this is set, ow we lose type info!
@@ -6548,20 +6520,12 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
             CGM.getModule().getFunction("typed_allocation")) {
       fn = llvm::FunctionCallee(Existing->getFunctionType(), Existing);
       auto callee = CGCallee::forDirect(fn);
-      // llvm::errs() << "[DBG] FSAN typing allocation: " << *fn.getCallee()
-      //              << "\n";
-
-      // llvm::errs() << "[DBG] FSAN OLD CALL: ";
-      // LocalCallOrInvoke->dump();
       LocalCallOrInvoke = nullptr;
       RValue newCall =
           EmitCall(fnInfo, callee, ReturnValue, args, &LocalCallOrInvoke,
                    E == MustTailCall, E->getExprLoc());
       if (CallOrInvoke)
         *CallOrInvoke = LocalCallOrInvoke;
-      // dump new call
-      // llvm::errs() << "[DBG] FSAN NEW CALL: ";
-      LocalCallOrInvoke->dump();
       // reset FSanPendingAllocType and PendingTypeIsValid
       FSanPendingAllocType = QualType();
       PendingTypeIsValid = false;
