@@ -6485,14 +6485,14 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
     // NOTE: pending type might not be valid!
 
     // extra arg $1 -> type name
-    // llvm::errs() << "FSAN-FE - EmitCall: TY NAME ARG " << IRTyNameStr << "\n";
     llvm::Value *IRTyName = Builder.CreateGlobalString(IRTyNameStr);
     args.add(RValue::get(IRTyName),
              getContext().getPointerType(getContext().CharTy));
 
     // extra arg $2 -> size of the allocated array
-    llvm::Value *NegOne = Builder.getInt32(-1);
-    args.add(RValue::get(NegOne),
+    // TODO: not quite!
+    llvm::Value* ArraySizeArg = FSAN::GetArraySizeFromAlloc(E, *this);
+    args.add(RValue::get(ArraySizeArg),
              getContext().getIntTypeForBitwidth(32, /*isSigned=*/true));
 
     // extra arg $3 -> name of the replace function (e.g. malloc for malloc

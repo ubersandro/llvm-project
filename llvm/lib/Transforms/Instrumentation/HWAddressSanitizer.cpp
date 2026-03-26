@@ -10,69 +10,18 @@
 /// This file is a part of HWAddressSanitizer, an address basic correctness
 /// checker based on tagged addressing.
 //===----------------------------------------------------------------------===//
+#include "llvm/IR/InstIterator.h"
+#include "llvm/Transforms/Instrumentation/RuntimeTaggingSupport.hpp"
 #define TRANS_CONSTANT 0x400000000000ULL // 1<<46, 0x400000000000
-#include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
-#include "llvm/ADT/MapVector.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/Statistic.h"
-#include "llvm/ADT/StringExtras.h"
-#include "llvm/ADT/StringRef.h"
-#include "llvm/Analysis/BlockFrequencyInfo.h"
-#include "llvm/Analysis/DomTreeUpdater.h"
-#include "llvm/Analysis/GlobalsModRef.h"
-#include "llvm/Analysis/OptimizationRemarkEmitter.h"
-#include "llvm/Analysis/PostDominators.h"
-#include "llvm/Analysis/ProfileSummaryInfo.h"
-#include "llvm/Analysis/StackSafetyAnalysis.h"
-#include "llvm/Analysis/TargetLibraryInfo.h"
-#include "llvm/Analysis/TypeCopilot.h"
-#include "llvm/Analysis/ValueTracking.h"
-#include "llvm/BinaryFormat/Dwarf.h"
+#define OFFSET_CONSTANT 0x1000UL
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Demangle/Demangle.h"
-#include "llvm/IR/Attributes.h"
-#include "llvm/IR/BasicBlock.h"
-#include "llvm/IR/Constant.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/DataLayout.h"
-#include "llvm/IR/DerivedTypes.h"
-#include "llvm/IR/Dominators.h"
-#include "llvm/IR/Function.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InlineAsm.h"
-#include "llvm/IR/InstIterator.h"
-#include "llvm/IR/Instruction.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/IntrinsicInst.h"
-#include "llvm/IR/Intrinsics.h"
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/MDBuilder.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/Type.h"
-#include "llvm/IR/Value.h"
-#include "llvm/Support/Casting.h"
-#include "llvm/Support/CommandLine.h"
-#include "llvm/Support/Debug.h"
-#include "llvm/Support/MD5.h"
-#include "llvm/Support/RandomNumberGenerator.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/TargetParser/Triple.h"
-#include "llvm/Transforms/Instrumentation/AddressSanitizerCommon.h"
-#include "llvm/Transforms/Utils/BasicBlockUtils.h"
-#include "llvm/Transforms/Utils/Instrumentation.h"
-#include "llvm/Transforms/Utils/Local.h"
-#include "llvm/Transforms/Utils/MemoryTaggingSupport.h"
-#include "llvm/Transforms/Utils/ModuleUtils.h"
-#include "llvm/Transforms/Utils/PromoteMemToReg.h"
-#include <deque>
-#include <optional>
-#include <random>
+#include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
 
 using namespace llvm;
+using namespace RuntimeTaggingSupport;
 
 #define DEBUG_TYPE "hwasan"
-
 const char kHwasanModuleCtorName[] = "hwasan.module_ctor";
 const char kHwasanNoteName[] = "hwasan.note";
 const char kHwasanInitName[] = "__hwasan_init";
@@ -88,39 +37,10 @@ static const size_t kDefaultShadowScale = 0; // 1 to 1 mapping in shadow memory
 
 static const unsigned kShadowBaseAlignment = 32;
 
-namespace {
-enum class OffsetKind {
-  kFixed = 0,
-  kGlobal,
-  kIfunc,
-  kTls,
-};
-}
-
 static cl::opt<std::string>
     ClMemoryAccessCallbackPrefix("hwasan-memory-access-callback-prefix",
                                  cl::desc("Prefix for memory access callbacks"),
                                  cl::Hidden, cl::init("__hwasan_"));
-
-static cl::opt<bool> ClKasanMemIntrinCallbackPrefix(
-    "hwasan-kernel-mem-intrinsic-prefix",
-    cl::desc("Use prefix for memory intrinsics in KASAN mode"), cl::Hidden,
-    cl::init(false));
-
-// FSAN KNOBS
-bool ptrTagging = true;
-static cl::opt<bool>
-    ClFSAN_GEP("fsan-instrument-geps",
-               cl::desc("instrument getelementptr instructions"), cl::Hidden,
-               cl::init(ptrTagging));
-
-static cl::opt<bool> ClFSAN_BOP("fsan-instrument-bops",
-                                cl::desc("instrument binary op instructions"),
-                                cl::Hidden, cl::init(ptrTagging));
-
-static cl::opt<bool> ClFSAN_CMP("fsan-instrument-cmp",
-                                cl::desc("instrument compare instructions"),
-                                cl::Hidden, cl::init(ptrTagging));
 
 static cl::opt<bool> ClFSAN_stack("fsan-instrument-stack",
                                   cl::desc("instrument stack allocations"),
@@ -192,26 +112,53 @@ static cl::opt<bool>
                     cl::desc("Enable KernelHWAddressSanitizer instrumentation"),
                     cl::Hidden, cl::init(false));
 
-// These flags allow to change the shadow mapping and control how shadow memory
-// is accessed. The shadow mapping looks like:
-//    Shadow = (Mem >> scale) + offset
-
 static cl::opt<uint64_t>
     ClMappingOffset("hwasan-mapping-offset",
                     cl::desc("HWASan shadow mapping offset [EXPERIMENTAL]"),
                     cl::Hidden);
 
+static cl::opt<bool>
+    ClFrameRecords("hwasan-with-frame-record",
+                   cl::desc("Use ring buffer for stack allocations"),
+                   cl::Hidden);
+static cl::opt<bool>
+    ClInstrumentLandingPads("hwasan-instrument-landing-pads",
+                            cl::desc("instrument landing pads"), cl::Hidden,
+                            cl::init(false));
+
+static cl::opt<bool> ClInstrumentPersonalityFunctions(
+    "hwasan-instrument-personality-functions",
+    cl::desc("instrument personality functions"), cl::Hidden, cl::init(false));
+
+static cl::opt<bool> ClKasanMemIntrinCallbackPrefix(
+    "hwasan-kernel-mem-intrinsic-prefix",
+    cl::desc("Use prefix for memory intrinsics in KASAN mode"), cl::Hidden,
+    cl::init(false));
+
+// FSAN KNOBS
+static cl::opt<bool> ClFSAN_PtrTagging("fsan-instrument-ptr-tagging",
+                                       cl::desc("instrument pointer tagging"),
+                                       cl::Hidden, cl::init(true));
+static cl::opt<bool>
+    ClFSAN_GEP("fsan-instrument-geps",
+               cl::desc("instrument getelementptr instructions"), cl::Hidden,
+               cl::init(ClFSAN_PtrTagging));
+
+static cl::opt<bool> ClFSAN_BOP("fsan-instrument-bops",
+                                cl::desc("instrument binary op instructions"),
+                                cl::Hidden, cl::init(ClFSAN_PtrTagging));
+
+static cl::opt<bool> ClFSAN_CMP("fsan-instrument-cmp",
+                                cl::desc("instrument compare instructions"),
+                                cl::Hidden, cl::init(ClFSAN_PtrTagging));
+
+using namespace OffsetPorcodidio;
 static cl::opt<OffsetKind> ClMappingOffsetDynamic(
     "hwasan-mapping-offset-dynamic",
     cl::desc("HWASan shadow mapping dynamic offset location"), cl::Hidden,
     cl::values(clEnumValN(OffsetKind::kGlobal, "global", "Use global"),
                clEnumValN(OffsetKind::kIfunc, "ifunc", "Use ifunc global"),
                clEnumValN(OffsetKind::kTls, "tls", "Use TLS")));
-
-static cl::opt<bool>
-    ClFrameRecords("hwasan-with-frame-record",
-                   cl::desc("Use ring buffer for stack allocations"),
-                   cl::Hidden);
 
 STATISTIC(NumTotalFuncs, "Number of total funcs");
 STATISTIC(NumInstrumentedFuncs, "Number of instrumented funcs");
@@ -230,289 +177,24 @@ STATISTIC(NumInstrumentedIntrinsics, "Number of instrumented intrinsics");
 // Mode for selecting how to insert frame record info into the stack ring
 // buffer.
 
-enum RecordStackHistoryMode {
-  // Do not record frame record info.
-  none,
-
-  // Insert instructions into the prologue for storing into the stack ring
-  // buffer directly.
-  instr,
-
-  // Add a call to __hwasan_add_frame_record in the runtime.
-  libcall,
-};
-
-static cl::opt<bool>
-    ClInstrumentLandingPads("hwasan-instrument-landing-pads",
-                            cl::desc("instrument landing pads"), cl::Hidden,
-                            cl::init(false));
-
-static cl::opt<bool> ClInstrumentPersonalityFunctions(
-    "hwasan-instrument-personality-functions",
-    cl::desc("instrument personality functions"), cl::Hidden, cl::init(false));
-
-namespace {
-
-template <typename T> T optOr(cl::opt<T> &Opt, T Other) {
-  return Opt.getNumOccurrences() ? Opt : Other;
-}
-
-bool shouldInstrumentStack(const Triple &TargetTriple) { return ClFSAN_stack; }
-
-bool shouldInstrumentWithCalls(const Triple &TargetTriple) {
-  return optOr(ClInstrumentWithCalls, TargetTriple.getArch() == Triple::x86_64);
-}
-
-bool mightUseStackSafetyAnalysis(bool DisableOptimization) {
-  return optOr(ClUseStackSafety, !DisableOptimization);
-}
-
-bool shouldUseStackSafetyAnalysis(const Triple &TargetTriple,
-                                  bool DisableOptimization) {
-  return shouldInstrumentStack(TargetTriple) &&
-         mightUseStackSafetyAnalysis(DisableOptimization);
-}
-
-/// An instrumentation pass implementing detection of addressability bugs
-/// using tagged pointers.
-class HWAddressSanitizer {
-public:
-  HWAddressSanitizer(Module &M, bool CompileKernel, bool Recover,
-                     const StackSafetyGlobalInfo *SSI,
-                     const TypeCopilotResult *RetrievedTypes)
-      : M(M), SSI(SSI), RetrievedTypes(RetrievedTypes) {
-    this->Recover = optOr(ClRecover, Recover);
-    this->CompileKernel =
-        optOr(ClEnableKhwasan, CompileKernel); // TODO: remove later
-
-    initializeModule(); // globals are initialized in here at some point.
-    // TODO: introduce new analysis for heap, I need to be able to run it from
-    // whatever LLVM pass at whatever point of the optimization pipeline
-  }
-
-  void sanitizeFunction(Function &F, FunctionAnalysisManager &FAM);
-
-private:
-  struct ShadowTagCheckInfo {
-    Instruction *TagMismatchTerm = nullptr;
-    Value *PtrLong = nullptr;
-    Value *AddrLong = nullptr;
-    Value *PtrTag = nullptr;
-    Value *MemTag = nullptr;
-  };
-
-  // FieldArmor addenda
-  u_int64_t RPTag = 0x0LU;
-  void InstrumentGEP(GetElementPtrInst *GEPI);
-  void InstrumentBOP(BinaryOperator *BOP);
-  void processOperand(Instruction *BOP, Value *OP1, int idx);
-  StructType *getStructTypeFromDbgInfo(GlobalVariable *GV, int *numElements,
-                                       bool *isUnion);
-  void InstrumentStoreOfFunctionArg(StoreInst *SI);
-  Type *figureOutInheritance(const std::set<Type *> &structTypes);
-  Value *GetArraySize(CallBase *CI, StructType *t,
-                      IRBuilder<> &IRB); // FieldArmor
-  void handleGEP2operands(GetElementPtrInst *GEPI);
-  void InstrumentCMP(CmpInst *CI);
-  void InstrumentConstGEP(ConstantExpr *GEPI); // TODO
-  Value *getRPTag(IRBuilder<> &IRB);           // FieldArmor
-  Value *ApplyRLT(IRBuilder<> &IRB, Instruction *AI, Type *rootType,
-                  const DataLayout &DL); // TODO: refactor remove DL
-
-  u_int8_t *computeTags(StructType *t);             // FieldArmor
-  void createTagVectors();                          // FieldArmor
-  void createTagVector(StructType *t);              // FieldArmor
-  Value *RetrieveOrCreateTagVector(StructType *Ty); // FieldArmor
-  // END FieldArmor
-
-  bool selectiveInstrumentationShouldSkip(Function &F,
-                                          FunctionAnalysisManager &FAM) const;
-  void initializeModule();
-  void createHwasanCtorComdat();
-
-  void initializeCallbacks(Module &M);
-
-  Value *getOpaqueNoopCast(IRBuilder<> &IRB,
-                           Value *Val); // TODO: explore why this is needed
-
-  Value *getDynamicShadowIfunc(IRBuilder<> &IRB);
-  Value *getShadowNonTls(IRBuilder<> &IRB);
-
-  void untagPointerOperand(Instruction *I, Value *Addr);
-  Value *memToShadow(Value *Shadow, IRBuilder<> &IRB);
-
-  int64_t getAccessInfo(bool IsWrite, unsigned AccessSizeIndex);
-  ShadowTagCheckInfo insertShadowTagCheck(Value *Ptr, Instruction *InsertBefore,
-                                          DomTreeUpdater &DTU, LoopInfo *LI);
-  void instrumentMemAccessOutline(Value *Ptr, bool IsWrite,
-                                  unsigned AccessSizeIndex,
-                                  Instruction *InsertBefore,
-                                  DomTreeUpdater &DTU, LoopInfo *LI);
-  void instrumentMemAccessInline(Value *Ptr, bool IsWrite,
-                                 unsigned AccessSizeIndex,
-                                 Instruction *InsertBefore, DomTreeUpdater &DTU,
-                                 LoopInfo *LI);
-  bool ignoreMemIntrinsic(OptimizationRemarkEmitter &ORE, MemIntrinsic *MI);
-  void instrumentMemIntrinsic(MemIntrinsic *MI);
-  bool instrumentMemAccess(InterestingMemoryOperand &O, DomTreeUpdater &DTU,
-                           LoopInfo *LI, const DataLayout &DL);
-  bool ignoreAccessWithoutRemark(Instruction *Inst, Value *Ptr);
-  bool ignoreAccess(OptimizationRemarkEmitter &ORE, Instruction *Inst,
-                    Value *Ptr);
-
-  void getInterestingMemoryOperands(
-      OptimizationRemarkEmitter &ORE, Instruction *I,
-      const TargetLibraryInfo &TLI,
-      SmallVectorImpl<InterestingMemoryOperand> &Interesting);
-
-  void tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, const DataLayout &DL);
-  void untagAlloca(IRBuilder<> &IRB, AllocaInst *AI, const DataLayout &DL);
-  Value *tagPointer(IRBuilder<> &IRB, Type *Ty, Value *PtrLong, Value *Tag);
-  Value *untagPointer(IRBuilder<> &IRB, Value *PtrLong);
-  Value *untagPointerIntrinsic(IRBuilder<> &IRB, Value *Ptr);
-  bool instrumentStack(memtag::StackInfo &Info, const DominatorTree &DT,
-                       const PostDominatorTree &PDT, const LoopInfo &LI,
-                       const DataLayout &DL);
-  bool instrumentLandingPads(SmallVectorImpl<Instruction *> &RetVec);
-  Value *getNextTagWithCall(IRBuilder<> &IRB); // not sure I still need this
-
-  Value *getHwasanThreadSlotPtr(IRBuilder<> &IRB);
-  Value *applyTagMask(IRBuilder<> &IRB, Value *OldTag);
-  unsigned retagMask(unsigned AllocaNo);
-  void instrumentGlobal(GlobalVariable *GV);
-
-  void instrumentGlobals();
-
-  Value *getCachedFP(IRBuilder<> &IRB);
-  Value *getFrameRecordInfo(IRBuilder<> &IRB);
-
-  void instrumentPersonalityFunctions();
-
-  LLVMContext *C;
-  Module &M;
-  const StackSafetyGlobalInfo *SSI;
-  const TypeCopilotResult *RetrievedTypes;
-  Triple TargetTriple;
-
-  /// This struct defines the shadow mapping using the rule:
-  /// If `kFixed`, then
-  ///   shadow = (mem >> Scale) + Offset.
-  /// If `kGlobal`, then
-  ///   extern char* __hwasan_shadow_memory_dynamic_address;
-  ///   shadow = (mem >> Scale) + __hwasan_shadow_memory_dynamic_address
-  /// If `kIfunc`, then
-  ///   extern char __hwasan_shadow[];
-  ///   shadow = (mem >> Scale) + &__hwasan_shadow
-  /// If `kTls`, then
-  ///   extern char *__hwasan_tls ; // THIS IS USED BY DEFAULT @ale
-  ///   shadow = (mem>>Scale) + align_up(__hwasan_shadow,
-  ///   kShadowBaseAlignment)
-  ///
-  /// If WithFrameRecord is true, then __hwasan_tls will be used to access the
-  /// ring buffer for storing stack allocations on targets that support it.
-  class ShadowMapping {
-    OffsetKind Kind;
-    uint64_t Offset;
-    uint8_t Scale;
-    bool WithFrameRecord;
-
-    void SetFixed(uint64_t O) {
-      Kind = OffsetKind::kFixed;
-      Offset = O;
-    }
-
-  public:
-    void init(Triple &TargetTriple, bool InstrumentWithCalls,
-              bool CompileKernel);
-    Align getObjectAlignment() const { return Align(1ULL << Scale); }
-
-    bool isInGlobal() const { return Kind == OffsetKind::kGlobal; }
-    bool isInIfunc() const { return Kind == OffsetKind::kIfunc; }
-    bool isInTls() const { return Kind == OffsetKind::kTls; }
-    bool isFixed() const { return Kind == OffsetKind::kFixed; }
-    uint8_t scale() const { return Scale; };
-    uint64_t offset() const {
-      assert(isFixed());
-      return Offset;
-    };
-    bool withFrameRecord() const { return WithFrameRecord; };
-  };
-
-  ShadowMapping Mapping;
-
-  Type *VoidTy = Type::getVoidTy(M.getContext());
-  Type *IntptrTy = M.getDataLayout().getIntPtrType(M.getContext());
-  PointerType *PtrTy = PointerType::getUnqual(M.getContext());
-  Type *Int8Ty = Type::getInt8Ty(M.getContext());
-  Type *Int32Ty = Type::getInt32Ty(M.getContext());
-  Type *Int64Ty = Type::getInt64Ty(M.getContext());
-
-  bool CompileKernel;
-  bool Recover;
-  bool OutlinedChecks;
-  bool InlineFastPath;
-  bool InstrumentLandingPads;
-  bool InstrumentWithCalls;
-  bool InstrumentStack;
-  bool InstrumentGlobals;
-  bool UseMatchAllCallback;
-
-  std::optional<uint8_t> MatchAllTag;
-
-  unsigned PointerTagShift;
-  uint64_t TagMaskByte;
-
-  Function *HwasanCtorFunction;
-
-  FunctionCallee HwasanMemoryAccessCallback[2][kNumberOfAccessSizes];
-  FunctionCallee HwasanMemoryAccessCallbackSized[2];
-
-  FunctionCallee HwasanMemmove, HwasanMemcpy, HwasanMemset;
-  FunctionCallee HwasanHandleVfork;
-
-  FunctionCallee HwasanTagMemoryFunc;
-  FunctionCallee HwasanGenerateTagFunc;
-  FunctionCallee HwasanRecordFrameRecordFunc;
-
-  Constant *ShadowGlobal;
-
-  Value *ShadowBase = nullptr;
-
-  Value *CachedFP = nullptr;
-  GlobalValue *ThreadPtrGlobal = nullptr;
-};
-
-} // end anonymous namespace
-
 PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
                                               ModuleAnalysisManager &MAM) {
   // Return early if nosanitize_hwaddress module flag is present for the module.
   if (checkIfAlreadyInstrumented(M, "nosanitize_hwaddress"))
     return PreservedAnalyses::all();
   const StackSafetyGlobalInfo *SSI = nullptr;
-  const TypeCopilotResult *RetrievedTypes = nullptr;
-  MAM.registerPass([&] {
-    return TypeReconstructionAnalysis();
-  }); // TODO: this does not go here!
-  RetrievedTypes =
-      &MAM.getResult<TypeReconstructionAnalysis>(M); // TODO: remove
-  const Triple &TargetTriple = M.getTargetTriple();
-  // TODO: investigate this, what if it hides UB?
-  if (shouldUseStackSafetyAnalysis(TargetTriple, Options.DisableOptimization))
-    SSI = &MAM.getResult<StackSafetyGlobalAnalysis>(M);
+  // const Triple &TargetTriple = M.getTargetTriple();
+  // if (shouldUseStackSafetyAnalysis(TargetTriple,
+  // Options.DisableOptimization))
 
-  HWAddressSanitizer HWASan(M, Options.CompileKernel, Options.Recover, SSI,
-                            RetrievedTypes);
+  // TODO: this might introduce UB, potentially delete!
+  SSI = &MAM.getResult<StackSafetyGlobalAnalysis>(M);
+
+  HWAddressSanitizer HWASan(M, false, false, SSI);
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
   for (Function &F : M) {
-
-    // errs() << "=== HWASan Before Function: " << F.getName() << " ===\n";
-    // F.print(errs());
     HWASan.sanitizeFunction(F, FAM);
-
-    // errs() << "=== HWASan After Function: " << F.getName() << " ===\n";
-    // F.print(errs());
   }
 
   PreservedAnalyses PA = PreservedAnalyses::none();
@@ -655,14 +337,15 @@ void HWAddressSanitizer::initializeModule() {
   for (Function &F : M.functions())
     removeASanIncompatibleFnAttributes(F, /*ReadsArgMem=*/true);
 
-  // x86_64 currently has two modes:
-  // - Intel LAM (default)
-  // - pointer aliasing (heap only)
   bool IsX86_64 = TargetTriple.getArch() == Triple::x86_64;
 
-  InstrumentWithCalls = shouldInstrumentWithCalls(TargetTriple);
-  InstrumentStack = shouldInstrumentStack(TargetTriple);
+  InstrumentWithCalls = true;
+  InstrumentStack = true;
+  CompileKernel = false;
+
   errs() << "[FSAN] MEM ACCESS" << (ClFSAN_memAccesses ? " ON\n" : " OFF\n");
+  errs() << "[FSAN] CHK INLINE"
+         << (ClFSAN_memAccessesInline ? " ON\n" : " OFF\n");
   errs() << "[FSAN] MEM INTRIN" << (ClFSAN_memIntr ? " ON\n" : " OFF\n");
   errs() << "[FSAN] STACK" << (ClFSAN_stack ? " ON\n" : " OFF\n");
   errs() << "[FSAN] GLOBALS " << (ClFSAN_globals ? " ON\n" : " OFF\n");
@@ -670,68 +353,25 @@ void HWAddressSanitizer::initializeModule() {
   errs() << "[FSAN] CMP " << (ClFSAN_CMP ? " ON\n" : " OFF\n");
   errs() << "[FSAN] GEP " << (ClFSAN_GEP ? " ON\n" : " OFF\n");
 
-  unsigned PtrBits = M.getDataLayout().getPointerTypeSizeInBits(PtrTy);
-  Type *MaskTy = IntegerType::get(M.getContext(), PtrBits);
-  Function *PtrMask =
-      Intrinsic::getDeclaration(&M, Intrinsic::ptrmask, {PtrTy, MaskTy});
-  errs() << "[FSAN] PointerMask intrinsic: "
-         << (PtrMask ? "FOUND\n" : "NOT FOUND\n");
   PointerTagShift = IsX86_64 ? 57 : 56;
   TagMaskByte = IsX86_64 ? 0x3F : 0xFF;
-  // errs() << "[DBGDBG] PointerTagShift: " << PointerTagShift
-  //        << ", TagMaskByte: " << (unsigned)TagMaskByte << "\n";
   Mapping.init(TargetTriple, InstrumentWithCalls, CompileKernel);
 
   C = &(M.getContext());
   IRBuilder<> IRB(*C);
 
   HwasanCtorFunction = nullptr;
-
-  // Older versions of Android do not have the required runtime support for
-  // short granules, global or personality function instrumentation. On other
-  // platforms we currently require using the latest version of the runtime.
-  bool NewRuntime =
-      !TargetTriple.isAndroid() || !TargetTriple.isAndroidVersionLT(30);
-
-  // OutlinedChecks = (TargetTriple.isAArch64() || TargetTriple.isRISCV64()) &&
-  //                  TargetTriple.isOSBinFormatELF() &&
-  //                  !optOr(ClInlineAllChecks, Recover);
-
-  // These platforms may prefer less inlining to reduce binary size.
-  // InlineFastPath = optOr(ClInlineFastPathChecks, !(TargetTriple.isAndroid()
-  // ||
-  //                                                  TargetTriple.isOSFuchsia()));
-
-  if (ClMatchAllTag.getNumOccurrences()) {
-    if (ClMatchAllTag != -1) {
-      MatchAllTag = ClMatchAllTag & 0xFF;
-    }
-  } else if (CompileKernel) {
-    MatchAllTag = 0xFF;
-  }
-  UseMatchAllCallback = !CompileKernel && MatchAllTag.has_value();
-
-  // If we don't have personality function support, fall back to landing pads.
-  InstrumentLandingPads = optOr(ClInstrumentLandingPads, true); // DEBUG
-
   InstrumentGlobals = optOr(ClFSAN_globals, true);
 
-  if (!CompileKernel) {
-    createHwasanCtorComdat(); // creates the routine ctor with a call into the
-                              // runtime function __hwasan_init
+  createHwasanCtorComdat(); // creates the routine ctor with a call into the
+                            // runtime function __hwasan_init
 
-    createTagVectors();
-    if (InstrumentGlobals) {
-      errs() << "[FSAN] GLOBAL ON\n";
-      instrumentGlobals();
-    } else
-      errs() << "[FSAN] GLOBAL OFF\n";
-
-    bool InstrumentPersonalityFunctions =
-        optOr(ClInstrumentPersonalityFunctions, NewRuntime);
-    if (InstrumentPersonalityFunctions)
-      instrumentPersonalityFunctions();
-  }
+  // createTagVectors();
+  if (InstrumentGlobals) {
+    errs() << "[FSAN] GLOBAL ON\n";
+    instrumentGlobals();
+  } else
+    errs() << "[FSAN] GLOBAL OFF\n";
 
   if (!TargetTriple.isAndroid()) {
     ThreadPtrGlobal = M.getOrInsertGlobal("__hwasan_tls", IntptrTy, [&] {
@@ -743,6 +383,8 @@ void HWAddressSanitizer::initializeModule() {
       return GV;
     });
   }
+  FSANTaggingFunc = M.getOrInsertFunction("fsan_tag_memory", Int64Ty, PtrTy,
+                                          PtrTy, Int64Ty, Int64Ty);
 }
 
 void HWAddressSanitizer::initializeCallbacks(Module &M) {
@@ -773,7 +415,7 @@ void HWAddressSanitizer::initializeCallbacks(Module &M) {
 
   for (size_t AccessIsWrite = 0; AccessIsWrite <= 1; AccessIsWrite++) {
     const std::string TypeStr = AccessIsWrite ? "store" : "load";
-    const std::string EndingStr = Recover ? "_noabort" : "";
+    const std::string EndingStr = ""; // Recover ? "_noabort" : "";
 
     HwasanMemoryAccessCallbackSized[AccessIsWrite] = M.getOrInsertFunction(
         ClMemoryAccessCallbackPrefix + TypeStr + "N" + MatchAllStr + EndingStr,
@@ -814,25 +456,6 @@ void HWAddressSanitizer::initializeCallbacks(Module &M) {
 
   HwasanHandleVfork =
       M.getOrInsertFunction("__hwasan_handle_vfork", VoidTy, IntptrTy);
-}
-
-void dbgPrintStructType(StructType *t) {
-  bool isUnion = false;
-  bool isLiteral = t->isLiteral();
-  bool isOpaque = t->isOpaque();
-  bool isSized = t->isSized();
-
-  isUnion =
-      !isLiteral && t->getName().str().find("union.") != std::string::npos;
-  LLVM_DEBUG(dbgs() << "[FieldArmor - createTagVectors] Identified struct: "
-                    << t->getName() << "\n");
-  LLVM_DEBUG(dbgs() << "\t\ttype: ");
-  LLVM_DEBUG(t->print(dbgs()));
-  LLVM_DEBUG(dbgs() << "\n");
-  LLVM_DEBUG(dbgs() << "\t\tisLiteral: " << isLiteral << "\n");
-  LLVM_DEBUG(dbgs() << "\t\tisOpaque: " << isOpaque << "\n");
-  LLVM_DEBUG(dbgs() << "\t\tisSized: " << isSized << "\n");
-  LLVM_DEBUG(dbgs() << "\t\tisUnion: " << isUnion << "\n");
 }
 
 Value *HWAddressSanitizer::getOpaqueNoopCast(IRBuilder<> &IRB, Value *Val) {
@@ -996,22 +619,25 @@ void HWAddressSanitizer::untagPointerOperand(Instruction *I, Value *Addr) {
 Value *HWAddressSanitizer::memToShadow(Value *Mem, IRBuilder<> &IRB) {
   Value *XorVal =
       IRB.CreateXor(Mem, ConstantInt::get(IntptrTy, TRANS_CONSTANT));
+  XorVal = IRB.CreateAdd(XorVal, ConstantInt::get(IntptrTy, OFFSET_CONSTANT));
   return IRB.CreateIntToPtr(XorVal, PtrTy);
 }
 
 int64_t HWAddressSanitizer::getAccessInfo(bool IsWrite,
                                           unsigned AccessSizeIndex) {
-  return (CompileKernel << HWASanAccessInfo::CompileKernelShift) |
+  return /*(CompileKernel << HWASanAccessInfo::CompileKernelShift) |
          (MatchAllTag.has_value() << HWASanAccessInfo::HasMatchAllShift) |
          (MatchAllTag.value_or(0) << HWASanAccessInfo::MatchAllShift) |
-         (Recover << HWASanAccessInfo::RecoverShift) |
-         (IsWrite << HWASanAccessInfo::IsWriteShift) |
-         (AccessSizeIndex << HWASanAccessInfo::AccessSizeShift);
+         (Recover << HWASanAccessInfo::RecoverShift) |*/
+      (IsWrite << HWASanAccessInfo::IsWriteShift) |
+      (AccessSizeIndex << HWASanAccessInfo::AccessSizeShift);
 }
 
-HWAddressSanitizer::ShadowTagCheckInfo
-HWAddressSanitizer::insertShadowTagCheck(Value *Ptr, Instruction *InsertBefore,
-                                         DomTreeUpdater &DTU, LoopInfo *LI) {}
+// HWAddressSanitizer::ShadowTagCheckInfo
+// HWAddressSanitizer::insertShadowTagCheck(Value *Ptr, Instruction
+// *InsertBefore,
+//                                          DomTreeUpdater &DTU, LoopInfo *LI)
+//                                          {}
 
 void HWAddressSanitizer::instrumentMemAccessOutline(Value *Ptr, bool IsWrite,
                                                     unsigned AccessSizeIndex,
@@ -1212,7 +838,7 @@ bool memcpyIsOOB(MemTransferInst *MTI, const DataLayout &DL) {
 }
 
 void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
-  bool untag_first = false;
+  // bool untag_first = false;
   auto arg0 = MI->getOperand(0);
   auto arg1 = MI->getOperand(1);
   if (!MI->getMetadata("fsan.instrument"))
@@ -1350,19 +976,14 @@ Value *HWAddressSanitizer::ApplyRLT(IRBuilder<> &IRB, Instruction *AI,
       structTy->getStructName().str() + ".fieldarmor.tagvec", true);
 
   if (!tagVector) {
-    createTagVector(structTy);
+    createTagVector(structTy, M);
   }
-  // TODO: pointer must be untagged. Why is it tagged?
   tagVector = M.getGlobalVariable(
       structTy->getStructName().str() + ".fieldarmor.tagvec", true);
   assert(tagVector && "Tag vector must exist here - tagAlloca");
-  FunctionCallee fieldarmor_tag_memory =
-      M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy,
-                            PtrTy, PtrTy, Int64Ty, Int64Ty);
-  // IRB.SetInsertPoint(AI->getNextNode()); // what if I ignore this?
 
   return IRB.CreateCall(
-      fieldarmor_tag_memory,
+      FSANTaggingFunc,
       {IRB.CreatePointerCast(AI, PtrTy),
        IRB.CreatePointerCast(tagVector, PtrTy),
        ConstantInt::get(Int64Ty, DL.getTypeAllocSize(rootType)),
@@ -1374,13 +995,10 @@ void HWAddressSanitizer::untagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
                                      const DataLayout &DL) {
   /** Apply tag 0 to the previously tagged memory, immaterially of the type.
    */
-  FunctionCallee fieldarmor_tag_memory =
-      M.getOrInsertFunction("_ZN8__hwasan21fieldarmor_tag_memoryEPvmm", PtrTy,
-                            PtrTy, PtrTy, Int64Ty, Int64Ty);
   Value *NullTagVector = IRB.CreateIntToPtr(ConstantInt::get(IntptrTy, 0),
                                             PtrTy); // all zeroes tag vector
   IRB.CreateCall(
-      fieldarmor_tag_memory,
+      FSANTaggingFunc,
       {IRB.CreatePointerCast(AI, PtrTy), NullTagVector,
        ConstantInt::get(Int64Ty, DL.getTypeAllocSize(AI->getAllocatedType())),
        ConstantInt::get(Int64Ty, 1)});
@@ -1556,19 +1174,7 @@ Value *HWAddressSanitizer::getFrameRecordInfo(IRBuilder<> &IRB) {
 
 bool HWAddressSanitizer::instrumentLandingPads(
     SmallVectorImpl<Instruction *> &LandingPadVec) {
-  for (auto *LP : LandingPadVec) {
-    // errs() << "[FSAN] Instrumenting landing pad: " << *LP << "\n";
-    // if (LandingPadInst *LPI = dyn_cast<LandingPadInst>(LP)) {
-    //   // dump ptr and int
-    //   LPI->dump();
-    // }
-    // IRBuilder<> IRB(LP->getNextNonDebugInstruction());
-    // IRB.CreateCall(
-    //     HwasanHandleVfork,
-    //     {memtag::readRegister(
-    //         IRB, (TargetTriple.getArch() == Triple::x86_64) ? "rsp" :
-    //         "sp")});
-  }
+
   return true;
 }
 
@@ -1660,8 +1266,7 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     llvm::for_each(Info.LifetimeStart, HandleLifetime);
     llvm::for_each(Info.LifetimeEnd, HandleLifetime);
 
-    tagAlloca(IRB, AI, DL); // insert a call to fieldarmor_tag_memory
-    // function
+    tagAlloca(IRB, AI, DL);
 
     // AI->replaceUsesWithIf(Replacement, [AICast, AILong](const Use &U) {
     //   auto *User = U.getUser();
@@ -1908,120 +1513,6 @@ void dumpGEPDebug(GetElementPtrInst *GEPI) {
   errs() << "\n _______________________________\n";
 }
 
-Value *HWAddressSanitizer::GetArraySize(CallBase *CI, StructType *t,
-                                        IRBuilder<> &IRB) {
-  std::string demangledName =
-      CI->getCalledFunction()
-          ? demangle(CI->getCalledFunction()->getName().str())
-          : "";
-  if (demangledName == "") {
-    return 0;
-  }
-
-  uint64_t typeSize = M.getDataLayout().getTypeAllocSize(t);
-
-  if (typeSize == 0) {
-    return nullptr;
-  }
-
-  Value *TypeSizeValue =
-      ConstantInt::get(Int64Ty, typeSize); // size of the struct type
-
-  if (demangledName == "malloc" || demangledName == "valloc" ||
-      demangledName == "pvalloc") {
-    Value *MallocSizeValue = IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
-    return IRB.CreateUDiv(MallocSizeValue, TypeSizeValue);
-  } else if (demangledName == "calloc") {
-    return IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
-  } else if (demangledName == "realloc") {
-    Value *ReallocSizeValue = IRB.CreateZExt(CI->getArgOperand(1), Int64Ty);
-    return IRB.CreateUDiv(ReallocSizeValue, TypeSizeValue);
-  } else if (demangledName == "reallocarray") {
-    return IRB.CreateZExt(CI->getArgOperand(1), Int64Ty);
-  } else if (demangledName.find("operator new") != std::string::npos) {
-    bool isArrayNew = (demangledName.find("new[]") != std::string::npos);
-    Value *NewSizeValue = IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
-    if (isArrayNew) {
-      return IRB.CreateUDiv(NewSizeValue, TypeSizeValue);
-    } else {
-      return ConstantInt::get(Int64Ty, 1);
-    }
-  }
-
-  errs() << "[FSAN] WARNING: allocator not handled for size "
-            "reconstruction: "
-         << demangledName << "\n";
-  return nullptr;
-}
-
-Type *fromString(std::string S, LLVMContext &C) {
-  // TODO: complete for classes
-  if (S == "i1")
-    return Type::getInt1Ty(C);
-  if (S == "i8" || S == "i8*")
-    return Type::getInt8Ty(C);
-  if (S == "i16" || S == "i16*")
-    return Type::getInt16Ty(C);
-  if (S == "i32" || S == "i32*")
-    return Type::getInt32Ty(C);
-  if (S == "i64" || S == "i64*")
-    return Type::getInt64Ty(C);
-  if (S == "float" || S == "float*")
-    return Type::getFloatTy(C);
-  if (S == "double" || S == "double*")
-    return Type::getDoubleTy(C);
-  if (S == "void" || S == "void*")
-    return Type::getVoidTy(C);
-  if (S.find("**") != std::string::npos || S == "struct.") {
-    // just for convenience
-    // struct. is a literal struct -> TODO: handle later ...
-    return Type::getVoidTy(C);
-  }
-  if (S.find("class.") != std::string::npos ||
-      S.find("union.") != std::string::npos)
-    // TODO: refine
-    return Type::getVoidTy(C);
-  return nullptr;
-}
-
-Value *HWAddressSanitizer::RetrieveOrCreateTagVector(StructType *t) {
-
-  auto TagVector = M.getGlobalVariable(
-      t->getStructName().str() + ".fieldarmor.tagvec", true);
-  if (!TagVector) {
-    createTagVector(t);
-    TagVector = M.getGlobalVariable(
-        t->getStructName().str() + ".fieldarmor.tagvec", true);
-    return TagVector;
-  }
-  return TagVector;
-}
-
-void HWAddressSanitizer::handleGEP2operands(GetElementPtrInst *GEPI) {
-  // EXAMPLE: GEP on ptr array
-  // TODO: if necessary, tag RPs. For now, it's not needed.
-  // if (GEPI->getType()->isStructTy() && !GEPI->getType()->isVectorTy()) {
-  //   IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
-  //   Value *resultLong =
-  //       IRB.CreatePointerCast(GEPI, IntptrTy); // this breaks for some GEPs
-
-  //   Value *untaggedResLong = untagPointer(IRB, resultLong);
-  //   Value *taggedPointer =
-  //       tagPointer(IRB, GEPI->getType(), untaggedResLong,
-  //                  ConstantInt::get(IntptrTy, RPTag)); // set RP bit
-  //   std::string Name = GEPI->hasName() ? GEPI->getName().str()
-  //                                      : "gep." +
-  //                                      itostr(NumInstrumentedGEPs);
-  //   taggedPointer->setName(Name + ".fieldarmor.struct");
-  //   GEPI->replaceUsesWithIf(taggedPointer, [resultLong](const Use &U) {
-  //     auto *User = U.getUser();
-  //     return User != resultLong && !isa<LifetimeIntrinsic>(User);
-  //   });
-  //   NumInstrumentedGEPs++;
-  //   return;
-  // }
-}
-
 bool isCallToPtrmask(Value *V) {
   if (CallInst *CI = dyn_cast<CallInst>(V)) {
     auto *callee = CI->getCalledFunction();
@@ -2219,11 +1710,11 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       if (LoadInst *LI = dyn_cast<LoadInst>(User)) {
         // TODO: these have to be triaged
         auto loadSize = DL.getTypeAllocSize(LI->getType());
-        if (loadSize > fieldSize) {
-          errs() << "UNSAFE LOAD USER";
-          LI->print(errs());
-          errs() << "\n";
-        }
+        // if (loadSize > fieldSize) {
+        // errs() << "UNSAFE LOAD USER";
+        // LI->print(errs());
+        // errs() << "\n";
+        // }
         safe = safe && (fieldSize >= loadSize);
       } else if (PHINode *PHI = dyn_cast<PHINode>(User)) {
         // TODO: these have to be triaged
@@ -2231,11 +1722,11 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         for (auto *PHIUser : PHIUsers) {
           if (LoadInst *LI = dyn_cast<LoadInst>(PHIUser)) {
             auto loadSize = DL.getTypeAllocSize(LI->getType());
-            if (loadSize > fieldSize) {
-              errs() << "UNSAFE LOAD USER";
-              LI->print(errs());
-              errs() << "\n";
-            }
+            // if (loadSize > fieldSize) {
+            // errs() << "UNSAFE LOAD USER";
+            // LI->print(errs());
+            // errs() << "\n";
+            // }
             safe = safe && (fieldSize >= loadSize);
           }
         }
@@ -2359,18 +1850,9 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
 
 /** Only expect structs, arrays of structs, matrices of structs */
 void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
-  bool isGVArray = GV->getValueType()->isArrayTy();
   Constant *Initializer = GV->getInitializer();
-  Type *type = GV->getValueType(); // this is a lie!
-  // errs() << "[FSAN] Instrumenting global variable: " << GV->getName()
-  //        << ", type: " << *type << "\n";
-  // std::string TypeStr;
-  // raw_string_ostream RSO(TypeStr);
-  // type->print(RSO);
-  // errs() << "[FSAN] Type: " << RSO.str() << ", isVector: " <<
-  // type->isVectorTy() << ", isArray: " << type->isArrayTy() << ", isStruct:
-  // "
-  // << type->isStructTy() << ", is GVARRAY: " << isGVArray << "\n";
+  Type *type = GV->getValueType();
+  bool isGVArray = type->isArrayTy();
 
   assert(type->isAggregateType() &&
          "[FSAN] Expected only aggregate types to be instrumented");
@@ -2563,40 +2045,10 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     assert(!struct_name.empty() &&
            "Struct name must be valid to instrument global variable.");
 
-    auto *TagVector =
-        M.getGlobalVariable(struct_name + ".fieldarmor.tagvec", true);
-
-    if (TagVector == nullptr) {
-      // TODO: create and then fail if still no TV
-      createTagVector(TYPE);
-      TagVector = M.getGlobalVariable(struct_name + ".fieldarmor.tagvec", true);
-      // NOTE: this fails for arrays of pairs
-      // errs() << "[FSAN] Error: Tag vector global not found for struct:
-      // "
-      //        << struct_name << "\n";
-      // errs() << *GV << "\n";
-      // errs() << *type << "\n";
-      // errs() << "isStructTy()? " << type->isStructTy() << "\n";
-      // errs() << "isArrayTy()? " << type->isArrayTy() << "\n";
-      // errs() << "isMatrixOfStructs? " << isMatrixOfStructs << "\n";
-      // errs() << "isArrayOfStructs? " << isArrayOfStructs << "\n";
-      // errs() << "isLiteral? "
-      //        << (type->isStructTy() ?
-      //        dyn_cast<StructType>(type)->isLiteral()
-      //                               : false)
-      //        << "\n";
-      // errs() << "isOpaque? "
-      //        << (type->isStructTy() ?
-      //        dyn_cast<StructType>(type)->isOpaque()
-      //                               : false)
-      //        << "\n";
-      // errs() << "isSized?"
-      //        << (type->isStructTy() ? dyn_cast<StructType>(type)->isSized()
-      //                               : false)
-      //        << "\n";
-      assert(TagVector &&
-             "Tag vector global must exist and be properly initialized.");
-    }
+    GlobalVariable *TagVector =
+        dyn_cast<GlobalVariable>(RetrieveOrCreateTagVector(TYPE, M));
+    assert(TagVector &&
+           "Tag vector global must exist and be properly initialized.");
     auto *TVRelPtr = ConstantExpr::getTrunc(
         ConstantExpr::getSub(ConstantExpr::getPtrToInt(TagVector, Int64Ty),
                              ConstantExpr::getPtrToInt(Descriptor, Int64Ty)),
@@ -2642,11 +2094,13 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       }
     }
     assert(arraySize && "Array size constant must be valid.");
+    errs() << "ARRAY SIZE GV " << GV->getName() << " : " << dyn_cast<ConstantInt>(arraySize)->getZExtValue() << "\n";
     uint32_t Size = std::min(SizeInBytes - DescriptorPos, MaxDescriptorSize);
     auto *SizeAndTag = ConstantInt::get(Int32Ty, Size);
+    auto * SizeOfTheStruct = ConstantInt::get(Int32Ty, M.getDataLayout().getTypeAllocSize(TYPE));
     Descriptor->setComdat(NewGV->getComdat());
     Descriptor->setInitializer(
-        ConstantStruct::getAnon({GVRelPtr, SizeAndTag, TVRelPtr, arraySize}));
+        ConstantStruct::getAnon({GVRelPtr, SizeOfTheStruct, TVRelPtr, arraySize}));
     Descriptor->setSection("hwasan_globals");
     Descriptor->setMetadata(LLVMContext::MD_associated,
                             MDNode::get(*C, ValueAsMetadata::get(NewGV)));
@@ -2679,8 +2133,10 @@ void HWAddressSanitizer::instrumentGlobals() {
 
   for (GlobalVariable &GV : M.globals()) {
 
-    if (GV.hasSanitizerMetadata() && GV.getSanitizerMetadata().NoHWAddress)
+    if (GV.hasSanitizerMetadata() && GV.getSanitizerMetadata().NoHWAddress) {
+      errs() << "[FSAN] CORNER CASE: NO HWASAN MD GV " << GV.getName() << "\n";
       continue;
+    }
 
     if (GV.isDeclarationForLinker() || GV.getName().starts_with("llvm.") ||
         GV.isThreadLocal())
@@ -2690,43 +2146,36 @@ void HWAddressSanitizer::instrumentGlobals() {
     // tagged.
     if (GV.hasCommonLinkage())
       continue;
-    /** NOTE: do not instrument tag vectors, they are special globals */
+    /** NOTE: FSAN does not instrument tag vectors, they are special globals for
+     * tagging */
     if (GV.getName().contains("tagvec"))
       continue;
+
     // Globals with custom sections may be used in __start_/__stop_
     // enumeration, which would be broken both by adding tags and
     // potentially by the extra padding/alignment that we insert.
     if (GV.hasSection())
       continue;
-    // WHAT HAPPEN IF A GLOBAL HAS NO INITIALIZER?
 
     if (GV.getValueType()->isArrayTy()) {
       if (!GV.getValueType()->getArrayElementType()->isStructTy() &&
           !GV.getValueType()->getArrayElementType()->isArrayTy()) {
-        // array of structs
+        // not an array of structs or array of arrays, skipping
         continue;
       } else if (GV.getValueType()->getArrayElementType()->isArrayTy()) {
         ArrayType *elemArrayType =
             dyn_cast<ArrayType>(GV.getValueType()->getArrayElementType());
         if (!elemArrayType->getElementType()->isStructTy()) {
-          // skipping 3d array
-          errs() << "[FSan] global variable (3D array): " << GV.getName()
-                 << "\n";
-          // continue; // TODO: no longer skip, correctly engineer
+          // skipping 3d arrays of anything other than structs
+          errs() << "[FSan] 3D array SKIP " << GV.getName() << "\n";
+          // TODO
+          continue;
         } // arrays of arrays of something other than structs
         else if (elemArrayType->getElementType()->isStructTy()) {
-          // bool isLiteral =
-          // dyn_cast<StructType>(elemArrayType->getElementType())
-          //                      ->isLiteral();
-          // if (isLiteral)
-          //   LiteralStructs++;
-          bool isUnion =
-              // isLiteral ? true
-              // :
-              dyn_cast<StructType>(elemArrayType->getElementType())
-                  ->getName()
-                  .str()
-                  .find("union.") == 0;
+          bool isUnion = dyn_cast<StructType>(elemArrayType->getElementType())
+                             ->getName()
+                             .str()
+                             .find("union.") == 0;
           if (isUnion) { // || isLiteral) {
             continue;
           }
@@ -2830,11 +2279,10 @@ void HWAddressSanitizer::ShadowMapping::init(Triple &TargetTriple,
   //   SetFixed(0);
   // } else
 
-  if (CompileKernel || InstrumentWithCalls) {
+  if (InstrumentWithCalls) {
     SetFixed(0);
     WithFrameRecord = false;
   }
-  // TODO: invest some time in figuring out this
   WithFrameRecord = optOr(ClFrameRecords, WithFrameRecord);
 
   // Apply the last of ClMappingOffset and ClMappingOffsetDynamic.
@@ -2846,398 +2294,14 @@ void HWAddressSanitizer::ShadowMapping::init(Triple &TargetTriple,
   }
 }
 
-Value *HWAddressSanitizer::getRPTag(IRBuilder<> &IRB) {
-  return ConstantInt::get(Int64Ty, RPTag);
-}
-
-/** This method is called on whatever struct that was identified in the
- * frontend. This includes unions and literal structs. */
-void HWAddressSanitizer::createTagVector(StructType *t) {
-  // dont create if it already exists
-  std::string TagVecName = t->getStructName().str() + ".fieldarmor.tagvec";
-  auto *TagVec = M.getGlobalVariable(TagVecName, true);
-  if (TagVec) {
-    // errs() << "[FSAN] Tag vector " << TagVecName
-    //        << " already exists, skipping creation.\n";
-    return;
-  }
-  auto size = M.getDataLayout().getTypeAllocSize(t);
-
-  u_int8_t *tags = nullptr;
-  bool isLiteral = t->isLiteral();
-  // if (isLiteral) {
-  //   LiteralStructs++;
-  //   // errs() << "[FSAN] StructType " << *t << " is literal!\n";
-  // }
-
-  bool isUnion =
-      !isLiteral && t->getName().str().find("union.") != std::string::npos;
-
-  if (isLiteral || isUnion) {
-    /** Non-literal union: treat it as a scalar field. */
-    tags = new uint8_t[size];
-    memset(tags, (unsigned char)0x00, size);
-  } else {
-    tags = computeTags(t);
-  }
-
-  ArrayType *TagArrayType = ArrayType::get(Int8Ty, size);
-  std::vector<llvm::Constant *> Elements(size,
-                                         llvm::ConstantInt::get(Int8Ty, 0));
-  for (unsigned long i = 0; i < size; i++) {
-    Elements[i] = llvm::ConstantInt::get(Int8Ty, tags[i]);
-  }
-  delete[] tags; // NOTE: is it responsibility of the caller to delete
-
-  llvm::Constant *Init = llvm::ConstantArray::get(TagArrayType, Elements);
-  auto *NewTagVector_global = new GlobalVariable(
-      M, TagArrayType, true, GlobalVariable::PrivateLinkage, Init, TagVecName);
-  NewTagVector_global->setSection("porcodiddio"); // is this necessary?
-  appendToCompilerUsed(M, NewTagVector_global);
-  // errs() << "[FSAN] Created tag vector " << TagVecName << "\n";
-  NumDefinedTagVectors++;
-}
-
 void HWAddressSanitizer::createTagVectors() {
-  auto identifiedStructTypes = M.getIdentifiedStructTypes();
-  for (auto t : identifiedStructTypes)
-    // errs() << "[FSAN] Identified StructType: " << *t << ", is literal
-    // "
-    //        << (t->isLiteral() ? "yes" : "no") << "\n";
-
-    for (auto t : identifiedStructTypes) {
-      StructType *ty = dyn_cast<StructType>(t);
-      // errs() << "[FSAN] Creating tag vector for StructType " << *t <<
-      // "\n";
-      /** NOTE: opaque types are not sized. */
-      if (!ty->isSized()) {
-        // Q: what is the solution to this?
-        // errs() << "[FSAN] StructType " << *t << " is not sized!\n";
-        continue;
-      }
-
-      createTagVector(t);
+  // TODO: move to lazy init!!!
+  auto StructTypes = M.getIdentifiedStructTypes();
+  for (auto *T : StructTypes) {
+    StructType *ST = dyn_cast<StructType>(T);
+    if (!ST->isSized()) {
+      continue;
     }
+    createTagVector(T, M);
+  }
 }
-
-/** This method computes tags for aggregates of unions up to level 2
- * (matrices). Vectors are out of scope for now. */
-u_int8_t *HWAddressSanitizer::computeTags(StructType *Ty) {
-  // TODO: introduce ad hoc tag for padding (maybe 0xff?)
-  // TODO: try tagging unions
-  // TODO: remove the 0 tag from everywhere else
-  // TODO: measure coverage of literal structs
-  DataLayout DL = M.getDataLayout();
-  u_int8_t *tags = new u_int8_t[DL.getTypeAllocSize(Ty)];
-  // Ty->dump();
-  memset(tags, 0xff,
-         DL.getTypeAllocSize(Ty)); // padding is gonna stay tagged!
-
-  assert(tags && "Could not allocate tags array");
-  std::deque<std::tuple<Type *, uint8_t, uint8_t, uint8_t, size_t>> AggQueue;
-
-  auto levelZeroFieldsOffsets = DL.getStructLayout(Ty)->getMemberOffsets();
-
-  uint8_t fatherT = 0;
-  uint8_t fatherL = 0;
-  uint16_t sonIdx = 1; // NOTE: 2^^16 max number of fields because tag on 4 bits
-  if (levelZeroFieldsOffsets.size() >= (1 << 16) - 1) {
-    /** Too many fields :( */
-    errs() << "[FSAN] Struct " << *Ty
-           << " has too many fields to be tagged properly.\n";
-    return nullptr;
-  }
-
-  for (auto subtype : Ty->subtypes()) {
-    AggQueue.push_back(std::make_tuple(subtype, fatherT, fatherL, sonIdx,
-                                       levelZeroFieldsOffsets[sonIdx - 1]));
-    sonIdx++;
-  }
-
-  while (!AggQueue.empty()) {
-
-    auto el_pair = AggQueue.front();
-    AggQueue.pop_front();
-    Type *sonType = std::get<0>(el_pair);
-    fatherT = std::get<1>(el_pair);
-    fatherL = std::get<2>(el_pair);
-    sonIdx = std::get<3>(el_pair);
-    size_t sonOffset = std::get<4>(el_pair);
-
-    auto ST_son = dyn_cast<StructType>(sonType);
-    auto isLitStr = ST_son && ST_son->isLiteral();
-    if (isLitStr)
-      LiteralStructs++;
-    auto isUnion =
-        ST_son && !isLitStr && (ST_son->getName().find("union.") == 0);
-    // auto isClass = ST_son && !isLitStr && !isUnion &&
-    //                (ST_son->getName().find("class.") == 0);
-    // TODO: if a class is embedded in a struct and the class has padding in
-    // the end, that is treated as an extra field and can lead to FPs? This
-    // has never happened till now.
-    if (ST_son && !isLitStr && !isUnion) {
-      u_int8_t newBaseTag = 0; // FLAT scheme introduced here
-      uint8_t count = 0;
-      auto sonSubfieldsCount = sonType->getNumContainedTypes();
-
-      auto sonSubfieldsOffsets =
-          DL.getStructLayout(cast<StructType>(sonType))->getMemberOffsets();
-      size_t currSonSubfieldOffset = 0;
-
-      for (Type *subtype : llvm::reverse(sonType->subtypes())) {
-        currSonSubfieldOffset =
-            sonSubfieldsOffsets[sonSubfieldsCount - count - 1] + sonOffset;
-        AggQueue.push_front(
-            std::make_tuple(subtype, newBaseTag, (fatherL + 1) % 4,
-                            sonSubfieldsCount - count, currSonSubfieldOffset));
-        count++;
-      } // for subtype
-    } // if son struct
-
-    else if (sonType->isArrayTy()) {
-      Type *elementType = sonType->getArrayElementType();
-      if (StructType *structType = dyn_cast<StructType>(elementType)) {
-        // case : ARRAY of STRUCTS embedded in a struct
-
-        if (structType->isLiteral()) {
-          LiteralStructs++;
-          // dont tag literal structs arrays for now
-          continue;
-        } else if (structType->getName().str().find("union.") == 0) {
-          // dont tag union arrays for now
-          continue;
-        }
-
-        auto structName = structType->getStructName().str();
-        auto tagVectorGlobal =
-            M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
-
-        if (!tagVectorGlobal)
-          createTagVector(structType);
-
-        tagVectorGlobal =
-            M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
-
-        if (!tagVectorGlobal) {
-          // continue;
-          assert(tagVectorGlobal &&
-                 "computeTags - error in creating and retrieving TV");
-        }
-
-        Constant *tagVectorInit =
-            cast<Constant>(tagVectorGlobal->getInitializer());
-
-        uint64_t elementSize = DL.getTypeAllocSize(elementType);
-        uint64_t arraySize = DL.getTypeAllocSize(sonType);
-        uint64_t numElements = arraySize / elementSize;
-
-        for (u_int64_t k = 0; k < numElements; k++) {
-          uint64_t elemOffset = sonOffset + k * elementSize;
-          for (u_int64_t i = 0; i < elementSize; i++) {
-            tags[elemOffset + i] = static_cast<uint8_t>(
-                cast<ConstantInt>(tagVectorInit->getAggregateElement(i))
-                    ->getZExtValue());
-          }
-        } // for each struct, copy its tag vector at the right position
-      } // case: array of structs embedded in a struct
-
-      else if (elementType->isArrayTy()) {
-        // 2+d matrix
-        auto innerArrayType = dyn_cast<ArrayType>(elementType);
-        Type *innerElementType = innerArrayType->getArrayElementType();
-        if (innerElementType->isStructTy()) {
-          // case : matrix of structs
-          auto structType = cast<StructType>(innerElementType);
-          if (structType->isLiteral()) {
-            // dont tag literal struct matrices for now
-            LiteralStructs++;
-            continue;
-          } else if (structType->getName().str().find("union.") == 0) {
-            // dont tag union matrices for now
-            continue;
-          }
-
-          // TODO: handle arrays of C++ classes. What happens if the wrong
-          // tag vector is used? E.g. base vs non-base? Using struct size
-          // should be fine though.
-
-          auto structName = structType->getStructName().str();
-          auto tagVectorGlobal =
-              M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
-
-          if (!tagVectorGlobal) {
-            createTagVector(structType);
-          }
-          tagVectorGlobal =
-              M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
-
-          if (!tagVectorGlobal) {
-            continue; // you could assert it here
-          }
-          auto sizeOuterArray = DL.getTypeAllocSize(sonType);
-          auto sizeInnerArray = DL.getTypeAllocSize(elementType);
-          uint64_t numOuterElements = sizeOuterArray / sizeInnerArray;
-          uint64_t structSize = DL.getTypeAllocSize(innerElementType);
-          uint64_t numInnerElements = sizeInnerArray / structSize;
-          Constant *tagVectorInit =
-              cast<Constant>(tagVectorGlobal->getInitializer());
-
-          for (u_int64_t k = 0; k < numOuterElements; k++) {
-            // each element is an array of structs
-            uint64_t currOuterArrayOffset = sonOffset + k * sizeInnerArray;
-
-            for (u_int64_t h = 0; h < numInnerElements; h++) {
-              uint64_t currInnerArrayOffset =
-                  currOuterArrayOffset + h * structSize;
-              for (u_int64_t i = 0; i < structSize; i++) {
-                tags[currInnerArrayOffset + i] = static_cast<uint8_t>(
-                    cast<ConstantInt>(tagVectorInit->getAggregateElement(i))
-                        ->getZExtValue());
-              } // for each byte of the tag vector of the struct
-            } // for each struct
-          } // for each array of structs
-        } // case : matrix of structs
-        else if (innerElementType->isArrayTy()) {
-          // case : matrix of arrays -> if struct, tag it. If not struct, no
-          // tags.
-          auto thirdLevElementType =
-              dyn_cast<ArrayType>(innerElementType)->getArrayElementType();
-          if (thirdLevElementType->isStructTy()) {
-            // case : 3D matrix of structs
-            auto structType = cast<StructType>(thirdLevElementType);
-            if (structType->isLiteral()) {
-              LiteralStructs++;
-              // dont tag literal struct matrices for now
-              continue;
-            } else if (structType->getName().str().find("union.") == 0) {
-              // dont tag union matrices for now
-              continue;
-            }
-
-            auto structName = structType->getStructName().str();
-            auto tagVectorGlobal =
-                M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
-
-            if (!tagVectorGlobal)
-              createTagVector(structType);
-
-            tagVectorGlobal =
-                M.getGlobalVariable(structName + ".fieldarmor.tagvec", true);
-
-            if (!tagVectorGlobal)
-              continue;
-            Constant *tagVectorInit =
-                cast<Constant>(tagVectorGlobal->getInitializer());
-            // compute the total number of structs enclosed in this
-            // aggregate
-            auto *L1arrayType = dyn_cast<ArrayType>(sonType);
-            auto *L2arrayType =
-                dyn_cast<ArrayType>(L1arrayType->getElementType());
-            auto *L3arrayType =
-                dyn_cast<ArrayType>(L2arrayType->getElementType());
-            structType =
-                dyn_cast<StructType>(L3arrayType->getArrayElementType());
-            assert(structType &&
-                   "Expected struct as innermost element of 3D matrix");
-            errs() << "3D array of " << structType->getStructName() << "\n";
-            auto L1Els = L1arrayType->getNumElements();
-            auto L2Els = L2arrayType->getNumElements();
-            auto L3Els = L3arrayType->getNumElements();
-            auto L1ArraySize = DL.getTypeAllocSize(L1arrayType);
-            auto L2ArraySize = DL.getTypeAllocSize(L2arrayType);
-            auto L3ArraySize = DL.getTypeAllocSize(L3arrayType);
-
-            auto structSize = DL.getTypeAllocSize(structType);
-            auto L1Offset = sonOffset; // offset from the beginning of the
-                                       // struct of the outermost array
-            for (u_int64_t L1 = 0; L1 < L1Els; L1++) {
-              // each element is an array of structs
-              L1Offset += L1 * L2ArraySize;
-
-              for (u_int64_t L2 = 0; L2 < L2Els; L2++) {
-                uint64_t L2Offset = L1Offset + L2 * L3ArraySize;
-
-                for (u_int64_t L3 = 0; L3 < L3Els; L3++) {
-                  uint64_t L3Offset = L2Offset + L3 * structSize;
-
-                  for (u_int64_t i = 0; i < structSize; i++) {
-                    tags[L3Offset + i] = static_cast<uint8_t>(
-                        cast<ConstantInt>(tagVectorInit->getAggregateElement(i))
-                            ->getZExtValue());
-                  }
-                } // for each struct in the innermost array
-              } // for each array of structs
-            } // for each matrix of structs
-            errs() << "TAGGED 3D MATRIX OF STRUCTS\n";
-          } // 3D matrix of structs
-          else {
-            // 3+D array of something that is not a struct -> dont tag! Memset
-            // to 0!
-            // TODO! This could bring FPs, debug!
-            uint8_t sonT = (fatherT + sonIdx) % 16;
-            uint8_t sonTag = sonT | (fatherL << 4);
-            uint64_t sonSize = DL.getTypeAllocSize(sonType);
-            for (uint64_t i = 0; i < sonSize; i++) {
-              tags[sonOffset + i] = sonTag;
-            }
-          }
-        }
-
-        else {
-          // 2D matrices of scalars ONLY.
-          uint8_t sonT = (fatherT + sonIdx) % 16;
-          uint8_t sonTag = sonT | (fatherL << 4);
-          uint64_t sonSize = DL.getTypeAllocSize(sonType);
-          for (uint64_t i = 0; i < sonSize; i++) {
-            tags[sonOffset + i] = sonTag;
-          }
-        } // case: matrix of scalars/arrays
-      } // case: inner element of array is an array
-      else {
-        // array of scalars -> all same tag
-        uint8_t sonT = (fatherT + sonIdx) % 16;
-        uint8_t sonTag = sonT | (fatherL << 4);
-        uint64_t sonSize =
-            DL.getTypeAllocSize(sonType); // USE ARRAY SIZE INSTEAD
-        uint64_t nElems = dyn_cast<ArrayType>(sonType)->getNumElements();
-        uint64_t remainingSizeOfStruct = DL.getTypeAllocSize(Ty) - (sonOffset);
-        bool isLastFieldOfStruct =
-            (sonIdx) ==
-            Ty->getNumContainedTypes(); // NOTEL sonIdx is adj to be 1-based
-        if (nElems == 1 && isLastFieldOfStruct) {
-          errs() << "[FSAN] Detected possible flexible array at offset "
-                 << sonOffset << " of struct " << *Ty << ", memsetting "
-                 << remainingSizeOfStruct << " bytes to 0\n";
-          memset(&tags[sonOffset], 0x00, remainingSizeOfStruct);
-
-        } else
-          for (uint64_t i = 0; i < sonSize; i++)
-            tags[sonOffset + i] = sonTag;
-      } // array of scalars
-    } // case: son is array
-
-    else {
-      // case : scalar fields, literal structs, unions == ALL SCALAR
-
-      if (sonType->isStructTy()) {
-        StructType *ty = dyn_cast<StructType>(sonType);
-        // errs() << "[DBG] Embedded struct is a literal " << *sonType <<
-        // "\n";
-        memset(&tags[sonOffset], 0x00,
-               DL.getTypeAllocSize(sonType)); // treat as NULL scalar field
-
-      } else {
-        uint8_t sonT = (fatherT + sonIdx) % 16;
-        uint8_t sonTag = sonT | (fatherL << 4);
-        if (isUnion)
-          sonTag = 0x00;
-        int sonSize = DL.getTypeAllocSize(sonType);
-        for (int i = 0; i < sonSize; i++) {
-          tags[sonOffset + i] = sonTag;
-        }
-      }
-    } // case : scalar fields, literal structs, unions
-  } // while agg queue not empty
-
-  return tags;
-} // computeTags

@@ -132,7 +132,10 @@ extern int hwasan_report_count;
 extern __sanitizer::atomic_uint64_t checks_on_uninited_shadow;
 extern __sanitizer::atomic_uint64_t checks_on_untagged_ptr;
 extern __sanitizer::atomic_uint64_t total_checks;
-extern __sanitizer::atomic_uint64_t overflows;
+extern __sanitizer::atomic_uint64_t overflows_on_total_checks;
+extern __sanitizer::atomic_uint64_t overflows_on_untagged_ptr_checks;
+extern __sanitizer::atomic_uint64_t overflows_on_uninited_shadow_checks;
+
 
 bool InitShadow();
 void InitializeOsSupport();
@@ -156,7 +159,9 @@ int hwasan_posix_memalign(void** memptr, uptr alignment, uptr size,
 void hwasan_free(void* ptr, StackTrace* stack);
 
 // fieldarmor functions
-uptr fieldarmor_tag_memory(void* ptr, uptr tags, uptr size);
+extern "C"
+SANITIZER_INTERFACE_ATTRIBUTE
+uptr fsan_tag_memory(void* Addr, void* TagVector, uptr TypeSize, uptr ArraySize);
 // EOF fieldarmor functions
 
 void InstallAtExitHandler();

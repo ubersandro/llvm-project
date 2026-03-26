@@ -171,7 +171,14 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   tag_t ptr_tag = GetTagFromPointer(p);
 
   if (UNLIKELY(ptr_tag == 0)) {
+#ifdef PERFORMANCE_DEBUGGING
     atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
+    if (atomic_load(&checks_on_untagged_ptr, memory_order_relaxed) == 0) {
+      // overflow detected
+      atomic_fetch_add(&overflows_on_untagged_ptr_checks, 1ULL,
+                       memory_order_relaxed);
+    }
+#endif
     return;
   }
 
@@ -181,7 +188,14 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   // NOTE: do check on first byte, catch the smallest read possible
 
   if (UNLIKELY(memIsNull)) {
+#ifdef PERFORMANCE_DEBUGGING
     atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
+    if (atomic_load(&checks_on_uninited_shadow, memory_order_relaxed) == 0) {
+      // overflow detected
+      atomic_fetch_add(&overflows_on_uninited_shadow_checks, 1ULL,
+                       memory_order_relaxed);
+    }
+#endif
     return;
   }
 
@@ -190,21 +204,21 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   unsigned int remainder = size % 8;
   uint64_t ptr_tag_8B = ptr_tag * 0x0101010101010101ULL;
 
-  // uint64_t extendedMemTag;
-  // for (unsigned int i = 0; i < chunks8B; i++) {
-  //   extendedMemTag = *(uint64_t*)(baseShadow + i * 8) &
-  //                    0x0F0F0F0F0F0F0F0FUL;  // only get T bits
-  //   if (UNLIKELY(extendedMemTag != ptr_tag_8B)) {
-  //     SigTrap<EA, AT>(p, sz);
-  //     if (EA == ErrorAction::Abort)
-  //       __builtin_unreachable();
-  //   }
-  // }  // for
+  uint64_t extendedMemTag;
+  for (unsigned int i = 0; i < chunks8B; i++) {
+    extendedMemTag = *(uint64_t*)(baseShadow + i * 8) &
+                     0x0F0F0F0F0F0F0F0FUL;  // only get T bits
+    if (UNLIKELY(extendedMemTag != ptr_tag_8B)) {
+      SigTrap<EA, AT>(p, sz);
+      if (EA == ErrorAction::Abort)
+        __builtin_unreachable();
+    }
+  }  // for
 
-  // uptr curShadow = baseShadow + chunks8B * 8;
-  uptr curShadow = baseShadow;
-  // for (unsigned int i = 0; i < remainder; i++) {
-  for (unsigned int i = 0; i < size; i++) {
+  uptr curShadow = baseShadow + chunks8B * 8;
+  // uptr curShadow = baseShadow;
+  for (unsigned int i = 0; i < remainder; i++) {
+  // for (unsigned int i = 0; i < size; i++) {
     tag_t mem_tag = *(tag_t*)(curShadow + i);
     // NOTE: memtag can become 0 at some point if a) going out of bounds on
     // the current object b) flexible array member. We tolerate a), but have
@@ -216,6 +230,13 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
         __builtin_unreachable();
     }
   }  // for
+#ifdef PERFORMANCE_DEBUGGING
+  atomic_fetch_add(&total_checks, 1ULL, memory_order_relaxed);
+  if (atomic_load(&total_checks, memory_order_relaxed) == 0) {
+    // overflow detected
+    atomic_fetch_add(&overflows_on_total_checks, 1ULL, memory_order_relaxed);
+  }
+#endif
 }  // CheckAddressSized
 
 template <ErrorAction EA, AccessType AT, unsigned LogSize>
@@ -235,8 +256,8 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
 
     if (atomic_load(&checks_on_uninited_shadow, memory_order_relaxed) == 0) {
       // overflow detected
-      VPrintf(1,
-              "FSAN: overflow detected in checks_on_uninited_shadow counter\n");
+      atomic_fetch_add(&overflows_on_uninited_shadow_checks, 1ULL,
+                       memory_order_relaxed);
     }
     return;
   }
@@ -244,12 +265,11 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
     atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
     if (atomic_load(&checks_on_untagged_ptr, memory_order_relaxed) == 0) {
       // overflow detected
-      VPrintf(1, "FSAN: overflow detected in checks_on_untagged_ptr counter\n");
+      atomic_fetch_add(&overflows_on_untagged_ptr_checks, 1ULL,
+                       memory_order_relaxed);
     }
     return;
   }
-  return;
-  // DEBUG
   uint16_t TagShort = 0;
   uint16_t ShadowTagShort = 0;
   uint16_t ShadowTagMaskShort = 0x0F0FUL;  // only get T bits
@@ -301,6 +321,11 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
           SigTrap<EA, AT, LogSize>(p);
       }
       break;
+  }
+  atomic_fetch_add(&total_checks, 1ULL, memory_order_relaxed);
+  if (atomic_load(&total_checks, memory_order_relaxed) == 0) {
+    // overflow detected
+    atomic_fetch_add(&overflows_on_total_checks, 1ULL, memory_order_relaxed);
   }
 }
 

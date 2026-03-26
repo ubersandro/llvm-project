@@ -1199,7 +1199,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
   }
   // only add this pass IF hwasan is active!
   if (LangOpts.Sanitize.has(SanitizerKind::HWAddress)) {
-    errs() << "Adding HWAddressSanitizer rewrite pass\n";
+    // errs() << "Adding HWAddressSanitizer rewrite pass\n";
     MPM.addPass(FSanRewriteFunctionCallsPass());
   }
   

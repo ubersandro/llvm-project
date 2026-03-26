@@ -25,6 +25,7 @@ add_llvm_component_library(LLVMInstrumentation
   ThreadSanitizer.cpp
   TypeSanitizer.cpp
   HWAddressSanitizer.cpp
+  RuntimeTaggingSupport.cpp
   RealtimeSanitizer.cpp
   FSanRewriteFunctionCalls.cpp
   ADDITIONAL_HEADER_DIRS

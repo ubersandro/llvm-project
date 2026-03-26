@@ -1067,7 +1067,7 @@ public:
       // } break;
 
     default:
-      errs() << "[TypeCopilot] WARNING: HANDLE DWARF TAG -> " << tag << "\n";
+      // errs() << "[TypeCopilot] WARNING: HANDLE DWARF TAG -> " << tag << "\n";
       break;
     }
 

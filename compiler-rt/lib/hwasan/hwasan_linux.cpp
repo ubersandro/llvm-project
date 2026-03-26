@@ -247,8 +247,9 @@ bool InitShadow() {
   // Define the entire memory range.
   // Determine shadow memory base offset.
   int k = 44;
+  int offsetMem = 0x1000UL;
   kLowMemStart = 0x0;
-  kLowMemEnd = (1ULL << k) - 1ULL;
+  kLowMemEnd = (1ULL << k) - 1ULL + 0x1000UL;
   kHighShadowStart = kLowMemEnd + 1;
   kHighShadowEnd = kHighShadowStart + (1ULL << k) - 1ULL;
   kLowShadowStart = kHighShadowEnd + 1;  // FIX
@@ -256,10 +257,6 @@ bool InitShadow() {
   kHighMemStart = kHighShadowStart ^ TRANS_CONSTANT;
   kHighMemEnd = GetHighMemEnd();    // 1<<48 -1
   InitializeShadowBaseAddress(-1);  // @ale: shrink shadow memory size
-  // VPrintf(1, ">>__hwasan_shadow_memory_dynamic_address: %p\n",
-  //         (void*)__hwasan_shadow_memory_dynamic_address);
-
-  // Check the sanity of the defined memory ranges (there might be gaps).
   CHECK_EQ(kHighMemStart % GetMmapGranularity(), 0);
   CHECK_GT(kHighMemStart, kHighShadowEnd);
   CHECK_GT(kHighShadowEnd, kHighShadowStart);
@@ -292,13 +289,17 @@ bool InitShadow() {
 #    define FINISH
 void __attribute__((destructor)) __hwasan_finish() {
   // enable on need
-  Printf(
-      "FSAN: %llu checks, %llu on untagged ptrs, %llu on uninitialized shadow. "
-      "Overflows %llu\n",
-      atomic_load(&total_checks, memory_order_relaxed),
-      atomic_load(&checks_on_untagged_ptr, memory_order_relaxed),
-      atomic_load(&checks_on_uninited_shadow, memory_order_relaxed),
-      atomic_load(&overflows, memory_order_relaxed));
+  if (flags()->print_stats)
+    Printf(
+        "FSAN:\t%llu checks\n\t%llu on untagged ptrs\n\t%llu on uninited "
+        "shadow\n\t%llu overflows on uninit shadow checks\n\t%llu overflows on "
+        "untagged ptr checks\n\t%llu overflows on total checks\n",
+        atomic_load(&total_checks, memory_order_relaxed),
+        atomic_load(&checks_on_untagged_ptr, memory_order_relaxed),
+        atomic_load(&checks_on_uninited_shadow, memory_order_relaxed),
+        atomic_load(&overflows_on_uninited_shadow_checks, memory_order_relaxed),
+        atomic_load(&overflows_on_untagged_ptr_checks, memory_order_relaxed),
+        atomic_load(&overflows_on_total_checks, memory_order_relaxed));
 }
 #  endif
 
@@ -531,36 +532,21 @@ void Thread::InitStackAndTls(const InitState*) {
   GetThreadStackAndTls(IsMainThread(), &stack_bottom_, &stack_top_, &tls_begin_,
                        &tls_end_);
 }
-uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector, uptr array_size) {
-  uptr perElementSize = size / array_size;
-  // TODO: enforce correctness of the division
+uptr TagMemory_mod(void* p, uptr size, void* tag_vector, uptr array_size) {
   u_int8_t* ptr = (u_int8_t*)tag_vector;
+  p = UntagPtr(p);
   bool tagging = tag_vector != 0;
-  VPrintf(1,
-          "[FSAN] TagMemory_mod: p: %p, shadow_p: %p, size: %zu, tag_vector: "
-          "%p, array_size: %zu\n",
-          (void*)p, (void*)MemToShadow(p), size, (void*)tag_vector, array_size);
-  uptr tagged = AddTagToPointer(p, RPTag);  // TODO: handle array case!
 
-  for (u_int64_t x = 0; x < array_size; x++) {
-    // LEGACY
-    // for (uptr i = 0; i < perElementSize; i++) {
-    //   u_int8_t tag = ptr ? ptr[i] : 0;
-    //   // VPrintf(2,
-    //   //         "\t\t[FieldArmor] TagMemory_mod: A: %p shadow[A]  -> T:
-    //   //         0x%02x\n", (void*)(p + i), tag);
-    //   *(char*)(MemToShadow(p + (i + x * perElementSize))) = tag;
-    // }
-    // LEGACY
-
-    if (tagging)
-      internal_memcpy((void*)(MemToShadow(p + x * perElementSize)), (void*)ptr,
-                      perElementSize);
-    else
-      internal_memset((void*)(MemToShadow(p + x * perElementSize)), 0,
-                      perElementSize);
+  uptr tagged = AddTagToPointer((uptr)p, RPTag);
+  if (tagging) {
+    for (u_int64_t x = 0; x < array_size; x++) {
+      uptr cur = (uptr)p + x * size;
+      internal_memcpy((void*)(MemToShadow(cur)), (void*)ptr, size);
+    }
+  } else {
+    internal_memset((void*)(MemToShadow((uptr)p)), 0, size * array_size);
   }
-  return ptr ? tagged : p;
+  return ptr ? tagged : (uptr)p;
 }
 
 uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
@@ -575,13 +561,6 @@ uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
   uptr threshold = common_flags()->clear_shadow_mmap_threshold;
   if (SANITIZER_LINUX &&
       UNLIKELY(page_end >= page_start + threshold && tag == 0)) {
-    // VPrintf(0, "HWASan: TagMemoryAligned: Clearing shadow memory for "
-    //          "large allocation at %p of size %p\n",
-    //          (void*)p, (void*)size);
-    // VPrintf(0, "page end: %p, page start: %p, shadow start: %p, shadow size:
-    // %p\n",
-    //         (void*)page_end, (void*)page_start, (void*)shadow_start,
-    //         (void*)shadow_size);
     internal_memset((void*)shadow_start, tag, page_start - shadow_start);
     internal_memset((void*)page_end, tag,
                     shadow_start + shadow_size - page_end);

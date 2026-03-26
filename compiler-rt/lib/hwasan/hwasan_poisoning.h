@@ -19,7 +19,7 @@ namespace __hwasan {
 uptr TagMemory(uptr p, uptr size, tag_t tag);
 uptr TagMemoryAligned(uptr p, uptr size, tag_t tag);
 // This function is never called by the pass!
-uptr TagMemory_mod(uptr p, uptr size, uptr tag_vector, uptr array_size);
+uptr TagMemory_mod(void* p, uptr size, void* tag_vector, uptr array_size);
 
 }  // namespace __hwasan
 

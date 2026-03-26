@@ -52,7 +52,9 @@ int hwasan_report_count = 0;
 __sanitizer::atomic_uint64_t checks_on_uninited_shadow;
 __sanitizer::atomic_uint64_t checks_on_untagged_ptr;
 __sanitizer::atomic_uint64_t total_checks;
-__sanitizer::atomic_uint64_t overflows;
+__sanitizer::atomic_uint64_t overflows_on_untagged_ptr_checks;
+__sanitizer::atomic_uint64_t overflows_on_uninited_shadow_checks;
+__sanitizer::atomic_uint64_t overflows_on_total_checks;
 
 uptr kLowShadowStart;
 uptr kLowShadowEnd;
@@ -78,8 +80,10 @@ static void InitializeFlags() {
   atomic_store(&checks_on_uninited_shadow, 0, memory_order_relaxed);
   atomic_store(&checks_on_untagged_ptr, 0, memory_order_relaxed);
   atomic_store(&total_checks, 0, memory_order_relaxed);
-  atomic_store(&overflows, 0, memory_order_relaxed);
-  
+  atomic_store(&overflows_on_uninited_shadow_checks, 0, memory_order_relaxed);
+  atomic_store(&overflows_on_untagged_ptr_checks, 0, memory_order_relaxed);
+  atomic_store(&overflows_on_total_checks, 0, memory_order_relaxed);
+
   SetCommonFlagsDefaults();
   {
     CommonFlags cf;
@@ -99,7 +103,7 @@ static void InitializeFlags() {
     // on as they become ready.
     // constexpr bool can_detect_leaks =
     //     (SANITIZER_LINUX && !SANITIZER_ANDROID) || SANITIZER_FUCHSIA;
-    cf.detect_leaks = false; // cf.detect_leaks && can_detect_leaks;
+    cf.detect_leaks = false;  // cf.detect_leaks && can_detect_leaks;
 
 #if SANITIZER_ANDROID
     // Let platform handle other signals. It is better at reporting them then we
@@ -289,24 +293,24 @@ Thread* GetCurrentThread() {
   return hwasanThreadList().GetThreadByBufferAddress((uptr)R->Next());
 }
 
-// TODO: consider refactoring
-SANITIZER_INTERFACE_ATTRIBUTE
-uptr fieldarmor_tag_memory(void* ptr, uptr tags, uptr size) {
-  if (!ptr)
-    return (uptr)ptr;
-  if (size == 0)
-    return (uptr)ptr;
-  // TODO: make sure pointer is untagged
-  if (!tags) {
-    // untag memory, i.e. tag it with 0s
-    // VPrintf(2, "[FieldArmor] untagging memory %p of size %zu\n", ptr, size);
-    // TODO
-    return TagMemory_mod((uptr)ptr, size, 0, 1);
-    // return (uptr) UntagPtr(ptr);
-  }
-  ptr = UntagPtr(ptr);
-  // TODO
-  return TagMemory_mod((uptr)ptr, size, tags, 1);
+// TODO: check how often ptr and size are 0
+// NOTE: calls into the pass can have fucked up ret addr, it's fine since it's
+// unused!
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE uptr fsan_tag_memory(void* Addr,
+                                                              void* TagVector,
+                                                              uptr TypeSize,
+                                                              uptr ArraySize) {
+  if (!Addr)
+    return (uptr)Addr;
+
+  // NOTE: this shouldn't happen!
+  if (ArraySize == 0 || TypeSize == 0)
+    return (uptr)Addr;
+
+  if (!TagVector)
+    return TagMemory_mod(Addr, TypeSize, 0, ArraySize);
+
+  return TagMemory_mod(Addr, TypeSize, TagVector, ArraySize);
 }
 
 }  // namespace __hwasan
@@ -328,7 +332,7 @@ void __sanitizer::BufferedStackTrace::UnwindImpl(uptr pc, uptr bp,
 }
 
 static bool InitializeSingleGlobal(const hwasan_global& global) {
-  TagMemory_mod(global.addr(), global.size(), global.tag_vector(),
+  TagMemory_mod((void*)global.addr(), global.size(), (void*)global.tag_vector(),
                 global.get_array_size());
   return true;
 }
@@ -487,7 +491,8 @@ void __hwasan_print_shadow(const void* p, uptr sz) {
 
 sptr __hwasan_test_shadow(const void* p, uptr sz) {
   // VPrintf(1,
-  //         "[FieldArmor] This routine has been patched. Test shadow for %p size "
+  //         "[FieldArmor] This routine has been patched. Test shadow for %p
+  //         size "
   //         "%zu\n",
   //         p, sz);
   if (sz == 0)
