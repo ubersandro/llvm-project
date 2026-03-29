@@ -14,7 +14,7 @@
 #ifndef HWASAN_MAPPING_H
 #define HWASAN_MAPPING_H
 #define TRANS_CONSTANT 0x400000000000ULL
-#define OFFSET 0x1000UL
+#define OFFSET_MEM 0x1000UL
 #include "hwasan_interface_internal.h"
 #include "sanitizer_common/sanitizer_internal_defs.h"
 
@@ -53,10 +53,10 @@ inline uptr GetShadowOffset() {
   return SANITIZER_FUCHSIA ? 0 : __hwasan_shadow_memory_dynamic_address;
 }
 inline uptr MemToShadow(uptr untagged_addr) {
-  return (untagged_addr ^ TRANS_CONSTANT) + 0x1000UL;
+  return (untagged_addr ^ TRANS_CONSTANT) + OFFSET_MEM;
 }
 inline uptr ShadowToMem(uptr shadow_addr) {
-  return ((shadow_addr - 0x1000UL) ^ TRANS_CONSTANT);
+  return ((shadow_addr - OFFSET_MEM) ^ TRANS_CONSTANT);
 }
 inline uptr MemToShadowSize(uptr size) {
   return size;

@@ -5134,8 +5134,8 @@ Value *ScalarExprEmitter::VisitBinAssign(const BinaryOperator *E) {
       if (FSAN::isAllocCall(Call)) {
         auto type = E->getLHS()->getType();
         if (!CGF.PendingTypeIsValid) {
-          llvm::errs() << "[DBG] VisitBinAssign: Setting pending alloc type: "
-                       << type.getAsString() << "\n";
+          // llvm::errs() << "[DBG] VisitBinAssign: Setting pending alloc type: "
+          //              << type.getAsString() << "\n";
           CGF.FSanPendingAllocType = type;
           CGF.PendingTypeIsValid = true;
         }

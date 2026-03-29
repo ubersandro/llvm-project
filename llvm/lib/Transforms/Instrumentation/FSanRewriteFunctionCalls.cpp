@@ -2,6 +2,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -190,6 +191,7 @@ CallBase *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
       return NewInvoke;
     } else {
       // its a new call
+
       Value *NewOperator = CI->getCalledOperand()->stripPointerCasts();
       FunctionType *NewOperatorTy = nullptr;
       if (Function *NewOperatorAsFn = dyn_cast<Function>(NewOperator)) {
@@ -212,6 +214,43 @@ CallBase *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
     return nullptr;
   } // if isNew
 
+  if (InvokeInst *Invoke = dyn_cast<InvokeInst>(CI)) {
+    // INVOKE MALLOC
+    InvokeInst *OldInv = cast<InvokeInst>(CI);
+
+    IRBuilder<> IRB(OldInv->getParent(), OldInv->getIterator());
+    auto *Dest = OldInv->getNormalDest();
+    auto *UnwindDest = OldInv->getUnwindDest();
+    Value *OldInvokedFunc; // = OldInv->getCalledOperand()->stripPointerCasts();
+    FunctionType *OldInvokedFuncTy = nullptr;
+    
+    // FETCH MALLOC SIGNATURE IF IT's MALLOC
+    if(formerAllocatorName == "malloc"){
+      OldInvokedFunc = M.getFunction("malloc");
+    }
+    if (formerAllocatorName == "calloc"){
+      OldInvokedFunc = M.getFunction("calloc");
+    }
+    if (formerAllocatorName == "realloc") {
+      OldInvokedFunc = M.getFunction("realloc");
+    }
+    else assert(false && "TODO  handle other allocators for invoke, currently only malloc");
+    if (Function *OldInvokedFuncAsFn = dyn_cast<Function>(OldInvokedFunc)) {
+      OldInvokedFuncTy = OldInvokedFuncAsFn->getFunctionType();
+    }
+
+    assert(OldInvokedFuncTy &&
+           "Failed to get function type of old invoked function");
+    
+    InvokeInst *NewInvoke =
+        InvokeInst::Create(OldInvokedFuncTy, OldInvokedFunc, Dest,
+                           UnwindDest, arguments, "invoke.rewrite");
+    NewInvoke->setDebugLoc(OldInv->getDebugLoc());
+    NewInvoke->insertBefore(OldInv);
+    OldInv->replaceAllUsesWith(NewInvoke);
+    OldInv->eraseFromParent();
+    return NewInvoke;
+  }
   IRBuilder<> IRB(CI);
   CallBase *formerCall = IRB.CreateCall(formerFn, arguments);
   CI->replaceAllUsesWith(formerCall);
@@ -233,9 +272,9 @@ Value *GetArraySize(CallBase *CI, std::string demangledName, Module &M,
     errs() << "isOpaque = " << t->isOpaque() << "\n";
     errs() << "Type dump:\n";
     errs() << *t << "\n";
-    return nullptr;
+    assert(typeSize != 0 &&
+           "Type size cannot be zero for allocation size reconstruction");
   }
-
   auto Int64Ty = Type::getInt64Ty(M.getContext());
   PointerType *PtrTy = PointerType::getUnqual(M.getContext());
 
@@ -342,8 +381,6 @@ bool FSanRewriteFunctionCallsPass::ProcessMallocLikeCall(CallBase *CI,
         formerAllocatorName = ref.str();
         formerAllocatorName =
             formerAllocatorName.substr(0, formerAllocatorName.size() - 1);
-        // llvm::errs() << "[DBG-IR] FUNCTION TO CALL: " << formerAllocatorName
-        //              << "\n";
       }
     }
   }
@@ -354,35 +391,55 @@ bool FSanRewriteFunctionCallsPass::ProcessMallocLikeCall(CallBase *CI,
   assert(formerCall &&
          "Failed to rewrite malloc-like call to former allocator");
 
-  CallInst *newCI = dyn_cast<CallInst>(formerCall);
+  CallBase *newCI = dyn_cast<CallBase>(formerCall);
   assert(newCI && "Expected the rewritten call to be an instruction");
-  auto oldName = newCI->getName();
-  // errs() << oldName << " REWRITTEN TO CALL: " << *newCI << "\n";
+  auto oldName = newCI->hasName() ? newCI->getName().str() : "noname";
   newCI->setName(oldName + ".fieldarmor.rewrite");
   bool changed = true;
 
-  // errs() << "\t[IR] REWRITING OK: " << *newCI << "\n";
   if (allocType && !dontTag && ClInstrumentHeap && !allocType->isOpaque()) {
-    IRBuilder<> IRB(newCI->getNextNonDebugInstruction());
+    auto *NextInst = newCI->getNextNonDebugInstruction();
+    Instruction *InsertPt = nullptr;
+    BasicBlock *BB;
 
+    if (InvokeInst *Invoke = dyn_cast<InvokeInst>(newCI)) {
+      BasicBlock *NormalDest = Invoke->getNormalDest();
+      if (NormalDest)
+        InsertPt = &NormalDest->front(); // insert at the beginning
+                                         // of the normal dest block
+      else
+        InsertPt = Invoke; // fallback to inserting after the invoke
+                           // if no normal dest
+    } else
+      InsertPt = newCI->getNextNonDebugInstruction(); // insert right after
+                                                      // the new call
+    // if (!NextInst) {
+    //   // TODO: instrument as done with INVOKE
+    //   // set BB
+    //   // set InsertPt
+
+    // } else {
+    //   Instruction *Last = cast<CallInst>(newCI); // your %.fieldarmor.rewrite
+    //   BB = Last->getParent();
+    //   InsertPt = std::next(Last->getIterator());
+    //   while (InsertPt != BB->end() && InsertPt->isDebugOrPseudoInst())
+    //     ++InsertPt;
+    // }
+    
+
+    IRBuilder<> IRB(InsertPt);
     Value *ArraySize;
     int32_t extractedArraySize = 0;
-    if (ConstantInt *CI = dyn_cast<ConstantInt>(arraySize)) {
-      extractedArraySize = CI->getZExtValue();
+    if (ConstantInt *CInt = dyn_cast<ConstantInt>(arraySize)) {
+      extractedArraySize = CInt->getZExtValue();
       if (extractedArraySize != -1)
         ArraySize = ConstantInt::get(Int64Ty, extractedArraySize);
       else
         ArraySize = GetArraySize(newCI, formerAllocatorName, M, allocType, IRB);
     } else
       ArraySize = GetArraySize(newCI, formerAllocatorName, M, allocType, IRB);
-
     assert(ArraySize != nullptr &&
            "Failed to compute array size for typed allocation");
-
-    llvm::errs() << "[DBG-IR] COMP A_SZ : "
-                 << *GetArraySize(newCI, formerAllocatorName, M, allocType, IRB)
-                 << "\n";
-    llvm::errs() << "[DBG-IR] GIVEN A_SZ: " << *arraySize << "\n";
 
     TypeSize tSize = M.getDataLayout().getTypeAllocSize(allocType);
     // now tag with tagging function
@@ -396,9 +453,9 @@ bool FSanRewriteFunctionCallsPass::ProcessMallocLikeCall(CallBase *CI,
                                 {IRB.CreatePointerCast(newCI, PtrTy),
                                  IRB.CreatePointerCast(TagVector, PtrTy),
                                  ConstantInt::get(Int64Ty, tSize), ArraySize});
-    llvm::errs() << "[FieldArmor] TAGGING ALLOC:\n\t" << *newCI
-                 << "\n\t\tSTRUCT: " << allocType->getStructName()
-                 << "\n\t\tARR_SZ: " << *ArraySize << "\n";
+    // llvm::errs() << "[FieldArmor] TAGGING ALLOC:\n\t" << *newCI
+    //              << "\n\t\tSTRUCT: " << allocType->getStructName()
+    //              << "\n\t\tARR_SZ: " << *ArraySize << "\n";
   }
   return changed;
 }
@@ -601,9 +658,8 @@ void doQuickCheck(CallBase *CI) {
 PreservedAnalyses
 FSanRewriteFunctionCallsPass::run(Module &M, ModuleAnalysisManager &MAM) {
   bool changed = false;
-  if(ClInstrumentHeap)
-    llvm::errs() << "[FSAN] HEAP ON\n";
-  else return PreservedAnalyses::all();
+  if (!ClInstrumentHeap)
+    return PreservedAnalyses::all();
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;

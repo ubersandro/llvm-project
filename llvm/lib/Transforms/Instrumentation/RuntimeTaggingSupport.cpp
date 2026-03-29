@@ -1,9 +1,16 @@
 /** This file is part of custom HWAsan - FSAN */
 #include "llvm/Transforms/Instrumentation/RuntimeTaggingSupport.hpp"
-namespace RuntimeTaggingSupport {
+#include "llvm/Support/CommandLine.h"
 
-__attribute__((noinline))
-void createTagVector(StructType *ST, Module &M) {
+static cl::opt<bool> clFSAN_FAM(
+    "fsan-fam",
+    cl::desc("clear padding at the end of a struct in the presence of FAM"),
+    cl::Hidden, cl::init(true));
+
+namespace RuntimeTaggingSupport {
+uint64_t TAG_MAX = 64;
+
+__attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
   auto *Int8Ty = Type::getInt8Ty(M.getContext());
 
   std::string TagVecName = ST->getStructName().str() + ".fieldarmor.tagvec";
@@ -86,7 +93,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
   }
 
   while (!AggQueue.empty()) {
-    
+
     auto Tuple = AggQueue.front();
     AggQueue.pop_front();
     sonIdx = std::get<3>(Tuple);
@@ -143,8 +150,9 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
         auto *ElemStructType = dyn_cast<StructType>(ElemType);
         size_t ElemStructSize = DL.getTypeAllocSize(ElemStructType);
         auto *TagVector = RetrieveOrCreateTagVector(ElemStructType, M);
-        assert(TagVector &&
-               "Failed to retrieve or create tag vector for struct element type.");
+        assert(
+            TagVector &&
+            "Failed to retrieve or create tag vector for struct element type.");
         GlobalVariable *TVGV = dyn_cast<GlobalVariable>(TagVector);
 
         auto *TVInit = cast<Constant>(TVGV->getInitializer());
@@ -166,20 +174,37 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
       } else {
         // scalar arrays get the same tag
         // NOTE: this case catches arrays with depth > MAX_DEPTH as well
-        auto Tag = (fatherT + sonIdx) % 16 | (fatherL << 4);
-        auto FieldSize = DL.getTypeAllocSize(CurFieldType);
-        memset(&Tags[CurFieldOffset], Tag, FieldSize);
-        // addendum: check if flex array member
+        auto Tag = (sonIdx) % TAG_MAX; //  | (fatherL << 4);
+        if (Tag == 0)
+          errs() << "[FSAN - TAG] WARNING: Tag value 0 used for array field "
+                 << sonIdx << " of struct " << *Ty
+                 << ". This may cause false negatives in FSAN.\n";
+        size_t ArraySize = DL.getTypeAllocSize(CurFieldType);
+        // if (ArraySize == 0)
+        //   continue;
+
+        memset(&Tags[CurFieldOffset], Tag, ArraySize);
+
+        auto *arrTy = dyn_cast<ArrayType>(CurFieldType);
+        auto ArrayFieldElems = arrTy->getNumElements();
+
+        // NOTE: this does not violate the C std!
+        // ONLY ENABLE IF IT'S FULL OF THESE BUGS AND THEY ARE ANNOYING FOR
+        // FUZZING
         bool IsLastField = sonIdx == FieldsOffsets.size();
         if (IsLastField) {
-          if (FieldSize == 0 || FieldSize == 1) {
+          // || ArrayFieldElems == 1
+          // NOTE: the field might overlap with compiler-inserted padding
+          // TODO:double check that this makes sense in STD
+          if (ArrayFieldElems == 0) {
             errs() << "[FSAN - TAG] FLEX MEMBER IN " << *Ty << "\n";
             auto RemainderBytes = DL.getTypeAllocSize(Ty) - CurFieldOffset;
-            memset(&Tags[CurFieldOffset], 0x00, RemainderBytes);
+            if (clFSAN_FAM)
+              memset(&Tags[CurFieldOffset], 0x00, RemainderBytes);
           }
-        }// if LastField
+        } // if LastField
       }
-    }// cur sub field is array
+    } // cur sub field is array
 
     else {
       // case : scalar fields, literal structs, unions == ALL SCALAR
@@ -188,8 +213,12 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
         memset(&Tags[CurFieldOffset], 0x00, DL.getTypeAllocSize(CurFieldType));
       } else {
         // scalar field
-        uint8_t CurFieldT = (fatherT + sonIdx) % 16;
-        uint8_t CurFieldTag = CurFieldT | (fatherL << 4);
+        uint8_t CurFieldT = (sonIdx) % TAG_MAX;
+        if (CurFieldT == 0)
+          errs() << "[FSAN - TAG] WARNING: Tag value 0 used for field "
+                 << sonIdx << " of struct " << *Ty
+                 << ". This may cause false negatives in FSAN.\n";
+        uint8_t CurFieldTag = CurFieldT; // | (fatherL << 4);
         int CurFieldSize = DL.getTypeAllocSize(CurFieldType);
         memset(&Tags[CurFieldOffset], CurFieldTag, CurFieldSize);
       }

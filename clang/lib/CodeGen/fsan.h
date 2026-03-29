@@ -112,9 +112,6 @@ GetArraySizeFromAlloc(const clang::Expr *E,
   auto AllocFnName = FunctionDecl->getIdentifier()->getName().str();
   llvm::Value *RET = llvm::ConstantInt::get(llvm::Type::getInt64Ty(CGF.getLLVMContext()), -1);
 
-  llvm::errs() << "[FSAN-FE] GetArraySizeFromAlloc: AllocFnName: "
-               << AllocFnName << "\n";
-  
   if (AllocFnName == "malloc" || AllocFnName == "valloc" ||
       AllocFnName == "pvalloc") {
     // CASE 0 - malloc(sizeof(something))
@@ -123,24 +120,24 @@ GetArraySizeFromAlloc(const clang::Expr *E,
     auto *AllocSizeExpr = CallExpr->getArg(0);
     clang::SourceLocation Loc;
     if (auto *BinOp = llvm::dyn_cast<clang::BinaryOperator>(AllocSizeExpr)) {
-      Loc = BinOp->getExprLoc();
-      if (Loc.isValid()) {
-        clang::SourceManager &SM = CGF.getContext().getSourceManager();
-        llvm::errs() << "\tSRC: " << SM.getFilename(Loc) << ":"
-                     << SM.getSpellingLineNumber(Loc) << "\n";
-      }
+      // Loc = BinOp->getExprLoc();
+      // if (Loc.isValid()) {
+      //   clang::SourceManager &SM = CGF.getContext().getSourceManager();
+      //   llvm::errs() << "\tSRC: " << SM.getFilename(Loc) << ":"
+      //                << SM.getSpellingLineNumber(Loc) << "\n";
+      // }
       clang::Expr* SizeofExpr;
       auto OpCode = BinOp->getOpcode();
       switch (OpCode) {
       case clang::BO_Add:
-        llvm::errs() << "[FSAN-FE] DBG ADD OP:\n";
-        BinOp->dump();
+        // llvm::errs() << "[FSAN-FE] DBG ADD OP:\n";
+        // BinOp->dump();
         RET = llvm::ConstantInt::get(llvm::Type::getInt64Ty(CGF.getLLVMContext()), 1);
         break;
 
       case clang::BO_Mul:
-        llvm::errs() << "[FSAN-FE] DBG MUL OP:\n";
-        BinOp->dump();
+        // llvm::errs() << "[FSAN-FE] DBG MUL OP:\n";
+        // BinOp->dump();
         // get the sizeof, if any
         SizeofExpr = nullptr;
         SizeofExpr =

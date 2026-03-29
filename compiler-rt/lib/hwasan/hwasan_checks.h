@@ -156,7 +156,7 @@ PossiblyShortTagMatches(tag_t mem_tag, uptr ptr, uptr sz) {
   return *(u8*)(ptr | (kShadowAlignment - 1)) == ptr_tag;
 }
 
-#define getT(tag) (tag & 0b00001111UL)
+#define getT(tag) (tag & 0b00111111UL)
 #define getL(tag) (tag & 0b00110000UL) >> 4
 #define getR(tag) (tag & 0b01000000UL) >> 6
 
@@ -207,8 +207,10 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   uint64_t extendedMemTag;
   for (unsigned int i = 0; i < chunks8B; i++) {
     extendedMemTag = *(uint64_t*)(baseShadow + i * 8) &
-                     0x0F0F0F0F0F0F0F0FUL;  // only get T bits
+                     0x3F3F3F3F3F3F3F3FUL;  // only get T bits
     if (UNLIKELY(extendedMemTag != ptr_tag_8B)) {
+      VPrintf(0, "[HWASAN] Tag mismatch detected at address %p: ptr tag=%02x mem tag=%02x\n",
+              (void*)(p + i * 8), ptr_tag_8B, getT(extendedMemTag));
       SigTrap<EA, AT>(p, sz);
       if (EA == ErrorAction::Abort)
         __builtin_unreachable();
@@ -218,13 +220,15 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   uptr curShadow = baseShadow + chunks8B * 8;
   // uptr curShadow = baseShadow;
   for (unsigned int i = 0; i < remainder; i++) {
-  // for (unsigned int i = 0; i < size; i++) {
+    // for (unsigned int i = 0; i < size; i++) {
     tag_t mem_tag = *(tag_t*)(curShadow + i);
     // NOTE: memtag can become 0 at some point if a) going out of bounds on
     // the current object b) flexible array member. We tolerate a), but have
     // to be lenient on b)
-    if (UNLIKELY(getT(mem_tag) != getT(ptr_tag))) {  //  && mem_tag != 0
-
+    // if (UNLIKELY(getT(mem_tag) != getT(ptr_tag))) {  //  && mem_tag != 0
+    if (UNLIKELY(mem_tag != ptr_tag)) {  //  && mem_tag != 0
+      VPrintf(0, "[HWASAN] Tag mismatch detected at address %p: ptr tag=%02x mem tag=%02x\n",
+              (void*)(p + i), ptr_tag, mem_tag);
       SigTrap<EA, AT>(p, sz);
       if (EA == ErrorAction::Abort)
         __builtin_unreachable();
@@ -246,7 +250,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   // NOTE: levels are masked for now, but they could be removed to make this
   // check even faster
 
-  uint8_t tag = GetTagFromPointer(p) & 0x0FUL;  // only get T bits
+  uint8_t tag = GetTagFromPointer(p) & 0x3FUL;  // only get T bits
   uptr untagged_ptr = UntagAddr(p);             // this could be avoided
   uptr shadow_addr = MemToShadow(untagged_ptr);
   uint8_t ShadowTag = getT(*(uint8_t*)shadow_addr);
@@ -272,14 +276,14 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   }
   uint16_t TagShort = 0;
   uint16_t ShadowTagShort = 0;
-  uint16_t ShadowTagMaskShort = 0x0F0FUL;  // only get T bits
+  uint16_t ShadowTagMaskShort = 0x3F3FUL;  // only get T bits
   uint32_t TagInt = 0;
   uint32_t ShadowTagInt = 0;
-  uint32_t ShadowTagMaskInt = 0x0F0F0F0FUL;
+  uint32_t ShadowTagMaskInt = 0x3F3F3F3FUL;
 
   uint64_t TagLong = 0;
   uint64_t ShadowTagLong = 0;
-  uint64_t ShadowTagMaskLong = 0x0F0F0F0F0F0F0F0FUL;
+  uint64_t ShadowTagMaskLong = 0x3F3F3F3F3F3F3F3FUL;
 
   switch (LogSize) {
     case 0: /*byte*/

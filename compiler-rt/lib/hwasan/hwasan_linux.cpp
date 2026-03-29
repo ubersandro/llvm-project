@@ -247,9 +247,8 @@ bool InitShadow() {
   // Define the entire memory range.
   // Determine shadow memory base offset.
   int k = 44;
-  int offsetMem = 0x1000UL;
   kLowMemStart = 0x0;
-  kLowMemEnd = (1ULL << k) - 1ULL + 0x1000UL;
+  kLowMemEnd = (1ULL << k) - 1ULL + OFFSET_MEM;
   kHighShadowStart = kLowMemEnd + 1;
   kHighShadowEnd = kHighShadowStart + (1ULL << k) - 1ULL;
   kLowShadowStart = kHighShadowEnd + 1;  // FIX

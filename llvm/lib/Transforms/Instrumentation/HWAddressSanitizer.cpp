@@ -13,7 +13,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Transforms/Instrumentation/RuntimeTaggingSupport.hpp"
 #define TRANS_CONSTANT 0x400000000000ULL // 1<<46, 0x400000000000
-#define OFFSET_CONSTANT 0x1000UL
+#define OFFSET_MEM 0x1000ULL
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
@@ -41,6 +41,9 @@ static cl::opt<std::string>
     ClMemoryAccessCallbackPrefix("hwasan-memory-access-callback-prefix",
                                  cl::desc("Prefix for memory access callbacks"),
                                  cl::Hidden, cl::init("__hwasan_"));
+static cl::opt<bool> ClFSAN_verbose("fsan-verbose",
+                                    cl::desc("print out more info"), cl::Hidden,
+                                    cl::init(false));
 
 static cl::opt<bool> ClFSAN_stack("fsan-instrument-stack",
                                   cl::desc("instrument stack allocations"),
@@ -342,16 +345,18 @@ void HWAddressSanitizer::initializeModule() {
   InstrumentWithCalls = true;
   InstrumentStack = true;
   CompileKernel = false;
-
-  errs() << "[FSAN] MEM ACCESS" << (ClFSAN_memAccesses ? " ON\n" : " OFF\n");
-  errs() << "[FSAN] CHK INLINE"
-         << (ClFSAN_memAccessesInline ? " ON\n" : " OFF\n");
-  errs() << "[FSAN] MEM INTRIN" << (ClFSAN_memIntr ? " ON\n" : " OFF\n");
-  errs() << "[FSAN] STACK" << (ClFSAN_stack ? " ON\n" : " OFF\n");
-  errs() << "[FSAN] GLOBALS " << (ClFSAN_globals ? " ON\n" : " OFF\n");
-  errs() << "[FSAN] BOP " << (ClFSAN_BOP ? " ON\n" : " OFF\n");
-  errs() << "[FSAN] CMP " << (ClFSAN_CMP ? " ON\n" : " OFF\n");
-  errs() << "[FSAN] GEP " << (ClFSAN_GEP ? " ON\n" : " OFF\n");
+  if (ClFSAN_verbose) {
+    errs() << "[FSAN] MEM ACCESS" << (ClFSAN_memAccesses ? " ON\n" : " OFF\n");
+    errs() << "[FSAN] CHK INLINE"
+           << (ClFSAN_memAccessesInline ? " ON\n" : " OFF\n");
+    errs() << "[FSAN] MEM INTRIN" << (ClFSAN_memIntr ? " ON\n" : " OFF\n");
+    errs() << "[FSAN] STACK" << (ClFSAN_stack ? " ON\n" : " OFF\n");
+    errs() << "[FSAN] GLOBALS " << (ClFSAN_globals ? " ON\n" : " OFF\n");
+    errs() << "[FSAN] BOP " << (ClFSAN_BOP ? " ON\n" : " OFF\n");
+    errs() << "[FSAN] CMP " << (ClFSAN_CMP ? " ON\n" : " OFF\n");
+    errs() << "[FSAN] GEP " << (ClFSAN_GEP ? " ON\n" : " OFF\n");
+    errs() << "[FSAN] GLOBAL " << (ClFSAN_globals ? " ON\n" : " OFF\n");
+  }
 
   PointerTagShift = IsX86_64 ? 57 : 56;
   TagMaskByte = IsX86_64 ? 0x3F : 0xFF;
@@ -368,11 +373,8 @@ void HWAddressSanitizer::initializeModule() {
 
   // createTagVectors();
   if (InstrumentGlobals) {
-    errs() << "[FSAN] GLOBAL ON\n";
     instrumentGlobals();
-  } else
-    errs() << "[FSAN] GLOBAL OFF\n";
-
+  }
   if (!TargetTriple.isAndroid()) {
     ThreadPtrGlobal = M.getOrInsertGlobal("__hwasan_tls", IntptrTy, [&] {
       auto *GV = new GlobalVariable(M, IntptrTy, /*isConstant=*/false,
@@ -619,7 +621,7 @@ void HWAddressSanitizer::untagPointerOperand(Instruction *I, Value *Addr) {
 Value *HWAddressSanitizer::memToShadow(Value *Mem, IRBuilder<> &IRB) {
   Value *XorVal =
       IRB.CreateXor(Mem, ConstantInt::get(IntptrTy, TRANS_CONSTANT));
-  XorVal = IRB.CreateAdd(XorVal, ConstantInt::get(IntptrTy, OFFSET_CONSTANT));
+  XorVal = IRB.CreateAdd(XorVal, ConstantInt::get(IntptrTy, OFFSET_MEM));
   return IRB.CreateIntToPtr(XorVal, PtrTy);
 }
 
@@ -691,7 +693,7 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
   Value *Shadow = memToShadow(R.PtrLong, IRB);
   R.MemTag = nullptr;
   Value *TagMismatch = nullptr;
-  uint8_t MemTagMask = 0x0FU;
+  uint8_t MemTagMask = 0x3FU;
   uint64_t ExtendPattern = 0ULL;
   // extend ptr tag
   switch (AccessSizeIndex) {
@@ -761,7 +763,7 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     R.PtrTag =
         IRB.CreateMul(R.PtrTag, ConstantInt::get(Int128Ty, ExtendPattern));
     R.MemTag = IRB.CreateLoad(R.PtrTag->getType(), Shadow);
-    APInt MaskPattern(128, "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F", 16);
+    APInt MaskPattern(128, "3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F", 16);
     R.MemTag = IRB.CreateAnd(R.MemTag, ConstantInt::get(Int128Ty, MaskPattern));
     TagMismatch = IRB.CreateICmpNE(R.PtrTag, R.MemTag);
     break;
@@ -1559,6 +1561,7 @@ bool isArrayOfAggregates(llvm::Type *T) {
 
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   auto nOperands = GEPI->getNumOperands();
+  
   assert(nOperands <= 3);
   auto fatherType = GEPI->getSourceElementType();
   auto sonType = GEPI->getResultElementType();
@@ -1580,7 +1583,22 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   Value *taggedPointer = nullptr;
   bool isScalar = false;
   bool setMetadata = true;
+  // TODO: investigate "register" 
+  // if (nOperands == 2) {
+  //   // if GEPPING from ptr to struct, untag
+  //   // TODO: ge
+  //   if (sonType->isStructTy()) {
+  //     errs() << "[FSAN] WARNING: GEP from ptr to struct, skipping instrumentation for this GEP: ";
+  //     GEPI->print(errs());
+  //     errs() << "\n";
+  //     Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
+  //     taggedPointer = untaggedResult;
+  //     endResultName = gepName + ".fsan.struct";
+  //     // setMetadata = false;
+  //   }
+  // }
 
+  // else
   if (fatherType->isArrayTy()) {
     if (sonType->isAggregateType()) { /** GEP into array of aggregates */
       // NOTE: this should trigger whenever gepping into array of structs, and
@@ -1631,12 +1649,12 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         auto sonIdx = IRB.CreateAnd(
             IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
                           ConstantInt::get(IntptrTy, 0x1Lu)),
-            ConstantInt::get(IntptrTy, 0b1111UL)); // modulo 16
-        Value *sonT =
-            IRB.CreateAnd(sonIdx, ConstantInt::get(IntptrTy, 0b1111UL));
+            ConstantInt::get(IntptrTy, 0b111111UL)); // modulo 64
+        // Value *sonT =
+        //     IRB.CreateAnd(sonIdx, ConstantInt::get(IntptrTy, 0b111111UL));
         // NOTE: tags might be 0 after this operation.
         // TODO: prevent nulltag
-        sonTag = sonT;
+        sonTag = sonIdx;
 
         Value *untaggedResLong = untagPointer(IRB, resultLong);
         taggedPointer =
@@ -2094,13 +2112,13 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       }
     }
     assert(arraySize && "Array size constant must be valid.");
-    errs() << "ARRAY SIZE GV " << GV->getName() << " : " << dyn_cast<ConstantInt>(arraySize)->getZExtValue() << "\n";
     uint32_t Size = std::min(SizeInBytes - DescriptorPos, MaxDescriptorSize);
     auto *SizeAndTag = ConstantInt::get(Int32Ty, Size);
-    auto * SizeOfTheStruct = ConstantInt::get(Int32Ty, M.getDataLayout().getTypeAllocSize(TYPE));
+    auto *SizeOfTheStruct =
+        ConstantInt::get(Int32Ty, M.getDataLayout().getTypeAllocSize(TYPE));
     Descriptor->setComdat(NewGV->getComdat());
-    Descriptor->setInitializer(
-        ConstantStruct::getAnon({GVRelPtr, SizeOfTheStruct, TVRelPtr, arraySize}));
+    Descriptor->setInitializer(ConstantStruct::getAnon(
+        {GVRelPtr, SizeOfTheStruct, TVRelPtr, arraySize}));
     Descriptor->setSection("hwasan_globals");
     Descriptor->setMetadata(LLVMContext::MD_associated,
                             MDNode::get(*C, ValueAsMetadata::get(NewGV)));
