@@ -68,13 +68,14 @@
 #include "llvm/Transforms/Utils/MemoryTaggingSupport.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include <cstdint>
 #include <optional>
 
 namespace llvm {
 class Module;
 class StringRef;
 class raw_ostream;
-
+#define TAG_MAX 64
 struct HWAddressSanitizerOptions {
   HWAddressSanitizerOptions()
       : HWAddressSanitizerOptions(false, false, false){};

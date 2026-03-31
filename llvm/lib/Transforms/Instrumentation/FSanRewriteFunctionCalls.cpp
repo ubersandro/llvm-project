@@ -618,9 +618,9 @@ bool FSanRewriteFunctionCallsPass::ProcessNewCall(CallBase *I, Module &M) {
                        {IRB.CreatePointerCast(whereToTagFrom, PtrTy),
                         IRB.CreatePointerCast(TagVector, PtrTy),
                         ConstantInt::get(Int64Ty, tSize), ArraySize});
-        llvm::errs() << "[FieldArmor] TAGGING NEW:\n\t" << *NewCI
-                     << "\n\t\tSTRUCT: " << allocType->getStructName()
-                     << "\n\t\tARR_SZ: " << *ArraySize << "\n";
+        // llvm::errs() << "[FieldArmor] TAGGING NEW:\n\t" << *NewCI
+        //              << "\n\t\tSTRUCT: " << allocType->getStructName()
+        //              << "\n\t\tARR_SZ: " << *ArraySize << "\n";
         NewCI->setName(NewCI->getName() + ".tagged");
         changed = true;
       } // if allocType

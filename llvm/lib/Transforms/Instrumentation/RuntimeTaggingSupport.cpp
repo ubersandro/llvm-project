@@ -1,6 +1,7 @@
 /** This file is part of custom HWAsan - FSAN */
 #include "llvm/Transforms/Instrumentation/RuntimeTaggingSupport.hpp"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Format.h"
 
 static cl::opt<bool> clFSAN_FAM(
     "fsan-fam",
@@ -8,7 +9,8 @@ static cl::opt<bool> clFSAN_FAM(
     cl::Hidden, cl::init(true));
 
 namespace RuntimeTaggingSupport {
-uint64_t TAG_MAX = 64;
+#define TAG_MAX 64
+#define LEVEL_SHIFT 6 // DEBUG
 
 __attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
   auto *Int8Ty = Type::getInt8Ty(M.getContext());
@@ -224,7 +226,12 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
       }
     } // case : scalar fields, literal structs, unions
   } // while agg queue not empty
-
+  // DEBUG
+  // errs() << "TV for type " << *Ty << ": ";
+  // for (size_t i = 0; i < DL.getTypeAllocSize(Ty); i++) {
+  //   errs() << llvm::format_hex(Tags[i], 2);
+  // }
+  // errs() << "\n";
   return Tags;
 } // ComputeTags
 

@@ -10,6 +10,7 @@
 /// This file is a part of HWAddressSanitizer, an address basic correctness
 /// checker based on tagged addressing.
 //===----------------------------------------------------------------------===//
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Transforms/Instrumentation/RuntimeTaggingSupport.hpp"
 #define TRANS_CONSTANT 0x400000000000ULL // 1<<46, 0x400000000000
@@ -621,7 +622,8 @@ void HWAddressSanitizer::untagPointerOperand(Instruction *I, Value *Addr) {
 Value *HWAddressSanitizer::memToShadow(Value *Mem, IRBuilder<> &IRB) {
   Value *XorVal =
       IRB.CreateXor(Mem, ConstantInt::get(IntptrTy, TRANS_CONSTANT));
-  XorVal = IRB.CreateAdd(XorVal, ConstantInt::get(IntptrTy, OFFSET_MEM));
+  XorVal =
+      IRB.CreateAdd(XorVal, ConstantInt::get(IntptrTy, OFFSET_MEM + 88ULL));
   return IRB.CreateIntToPtr(XorVal, PtrTy);
 }
 
@@ -1561,7 +1563,7 @@ bool isArrayOfAggregates(llvm::Type *T) {
 
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   auto nOperands = GEPI->getNumOperands();
-  
+
   assert(nOperands <= 3);
   auto fatherType = GEPI->getSourceElementType();
   auto sonType = GEPI->getResultElementType();
@@ -1583,14 +1585,13 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   Value *taggedPointer = nullptr;
   bool isScalar = false;
   bool setMetadata = true;
-  // TODO: investigate "register" 
+  // TODO: investigate "register"
   // if (nOperands == 2) {
   //   // if GEPPING from ptr to struct, untag
   //   // TODO: ge
   //   if (sonType->isStructTy()) {
-  //     errs() << "[FSAN] WARNING: GEP from ptr to struct, skipping instrumentation for this GEP: ";
-  //     GEPI->print(errs());
-  //     errs() << "\n";
+  //     errs() << "[FSAN] WARNING: GEP from ptr to struct, skipping
+  //     instrumentation for this GEP: "; GEPI->print(errs()); errs() << "\n";
   //     Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
   //     taggedPointer = untaggedResult;
   //     endResultName = gepName + ".fsan.struct";
@@ -1637,19 +1638,29 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         // GEPI->setMetadata("fsan.noinstrument", UnionNode); // TODO
         return;
       }
-
+      // TODO: introduce blocklisting for structs here or at tag time if
+      // necessary
+      if (ST && ST->hasName() &&
+          ST->getName().str().find("std::basic_ostream.base") == 0) {
+        // NOTE: this idiom is used by iterators, it can cause FPs
+        // UNTAG
+        Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
+        taggedPointer = untaggedResult;
+        endResultName = gepName + ".fsan.struct";
+        // return;
+      }
       Value *sonTag = nullptr;
       auto sonIsScalar = !sonType->isStructTy() && !sonType->isVectorTy();
 
       bool sonIsArrayOfAggregates = isArrayOfAggregates(sonType);
-      if (sonIsScalar || !sonIsArrayOfAggregates) {
+      if (sonIsScalar && !sonIsArrayOfAggregates) {
         // GEP struct -> scalar
         auto op2 = GEPI->getOperand(2);
 
         auto sonIdx = IRB.CreateAnd(
             IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
                           ConstantInt::get(IntptrTy, 0x1Lu)),
-            ConstantInt::get(IntptrTy, 0b111111UL)); // modulo 64
+            ConstantInt::get(IntptrTy, TAG_MAX-1)); // modulo 64
         // Value *sonT =
         //     IRB.CreateAnd(sonIdx, ConstantInt::get(IntptrTy, 0b111111UL));
         // NOTE: tags might be 0 after this operation.
@@ -1666,8 +1677,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         // NOTE: ignoring here opens up to FPs if the original pointer was
         // tagged for whatever reason.
         // NOTE: when NOT instrumenting memory accesses, one of the benchmarks
-        // segfaults. It's either full of BS and UB, or something is unsafe, but
-        // only in that specific case. No worries if running with mem ops
+        // segfaults. It's either full of BS and UB, or something is unsafe,
+        // but only in that specific case. No worries if running with mem ops
         // instrumented.
         if (sonType->isStructTy()) {
           Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
