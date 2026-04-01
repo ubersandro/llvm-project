@@ -622,8 +622,7 @@ void HWAddressSanitizer::untagPointerOperand(Instruction *I, Value *Addr) {
 Value *HWAddressSanitizer::memToShadow(Value *Mem, IRBuilder<> &IRB) {
   Value *XorVal =
       IRB.CreateXor(Mem, ConstantInt::get(IntptrTy, TRANS_CONSTANT));
-  XorVal =
-      IRB.CreateAdd(XorVal, ConstantInt::get(IntptrTy, OFFSET_MEM + 88ULL));
+  XorVal = IRB.CreateAdd(XorVal, ConstantInt::get(IntptrTy, OFFSET_MEM));
   return IRB.CreateIntToPtr(XorVal, PtrTy);
 }
 
@@ -1656,16 +1655,32 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       if (sonIsScalar && !sonIsArrayOfAggregates) {
         // GEP struct -> scalar
         auto op2 = GEPI->getOperand(2);
-
-        auto sonIdx = IRB.CreateAnd(
-            IRB.CreateAdd(IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
-                          ConstantInt::get(IntptrTy, 0x1Lu)),
-            ConstantInt::get(IntptrTy, TAG_MAX-1)); // modulo 64
-        // Value *sonT =
-        //     IRB.CreateAnd(sonIdx, ConstantInt::get(IntptrTy, 0b111111UL));
-        // NOTE: tags might be 0 after this operation.
-        // TODO: prevent nulltag
-        sonTag = sonIdx;
+        Value *sonIdx;
+        if (ConstantInt *CI = dyn_cast<ConstantInt>(op2)) {
+          auto idx = CI->getZExtValue();
+          if (idx == (TAG_MAX - 1)) {
+            errs() << "[FSAN-DBG] IDX ADJUSTED FOR FIELD " << idx
+                   << " IN GEP: ";
+            GEPI->print(errs());
+            errs() << "\n";
+            idx = 0;
+          }
+          sonTag = ConstantInt::get(
+              IntptrTy,
+              (idx + 1) % TAG_MAX); // +1 to avoid 0, which means untagged
+        } else {
+          assert(false &&
+                 "Non-constant GEP index not supported in struct GEPs for now");
+          errs() << "WARNING: NON-CONSTANT GEP INDEX, USING DYNAMIC TAG FOR "
+                    "THIS FIELD. GEP: ";
+          GEPI->print(errs());
+          errs() << "\n";
+          sonTag = IRB.CreateAnd(
+              IRB.CreateAdd(
+                  IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
+                  ConstantInt::get(IntptrTy, 0x1Lu)),
+              ConstantInt::get(IntptrTy, TAG_MAX - 1)); // modulo 64
+        }
 
         Value *untaggedResLong = untagPointer(IRB, resultLong);
         taggedPointer =
@@ -1739,24 +1754,79 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       if (LoadInst *LI = dyn_cast<LoadInst>(User)) {
         // TODO: these have to be triaged
         auto loadSize = DL.getTypeAllocSize(LI->getType());
-        // if (loadSize > fieldSize) {
-        // errs() << "UNSAFE LOAD USER";
-        // LI->print(errs());
-        // errs() << "\n";
-        // }
-        safe = safe && (fieldSize >= loadSize);
+        if (loadSize > fieldSize) {
+          // errs() << "UNSAFE LOAD USER";
+          // LI->print(errs());
+          // errs() << "\n";
+          // if (LI->getDebugLoc()) {
+          //   auto srcLoc = LI->getDebugLoc();
+          //   auto line = srcLoc.getLine();
+          //   auto col = srcLoc.getCol();
+          //   auto filename = srcLoc->getFilename();
+          //   errs() << "UNSAFE LOAD LOCATION: " << filename << ":" << line << ":"
+          //          << col << "\n";
+          // }
+          // errs() << "GEP ON STRUCT "
+          //        << GEPI->getSourceElementType()->getStructName()
+          //        << " FIELD SIZE: " << fieldSize << " LOAD SIZE: " << loadSize
+          //        << "\n";
+          // errs() << "GEP: ";
+          // GEPI->print(errs());
+          // errs() << "\nLOAD: ";
+          // LI->print(errs());
+          // errs() << "\n";
+          for(auto * USER_LOAD : LI->users()) {
+            // errs() << "\t\tLOAD USER: ";
+            // USER_LOAD->print(errs());
+            if(StoreInst* SI = dyn_cast<StoreInst>(USER_LOAD)) {
+              // errs() << "NOT REPLACING" << " STORE SIZE: " << DL.getTypeAllocSize(SI->getValueOperand()->getType()) << "\n";
+              return false; // NOT safe to replace as it might be a store to
+                            // load forwarding done by the frontend through type
+                            // coercion
+              // NOTE: stored type must be same size as the loaded type
+              // NOTE: 
+            }
+            // errs() << "\n";
+          }
+        }
+        // TODO: is the UNSAFE load the result of type coercion?
+        
+        // safe = safe && (fieldSize >= loadSize); // DEBUG
       } else if (PHINode *PHI = dyn_cast<PHINode>(User)) {
         // TODO: these have to be triaged
         auto PHIUsers = PHI->users();
         for (auto *PHIUser : PHIUsers) {
           if (LoadInst *LI = dyn_cast<LoadInst>(PHIUser)) {
             auto loadSize = DL.getTypeAllocSize(LI->getType());
-            // if (loadSize > fieldSize) {
-            // errs() << "UNSAFE LOAD USER";
-            // LI->print(errs());
-            // errs() << "\n";
-            // }
-            safe = safe && (fieldSize >= loadSize);
+            if (loadSize > fieldSize) {
+              // errs() << "UNSAFE LOAD USER";
+              // LI->print(errs());
+              // errs() << "\n";
+              // // DUMP SRC LOCATIONS from DBG INFO
+              // if (LI->getDebugLoc()) {
+              //   auto srcLoc = LI->getDebugLoc();
+              //   auto line = srcLoc.getLine();
+              //   auto col = srcLoc.getCol();
+              //   auto filename = srcLoc->getFilename();
+              //   errs() << "UNSAFE LOAD LOCATION: " << filename << ":" << line
+              //          << ":" << col << "\n";
+              // }
+              for( auto * USER_LOAD : LI->users()) {
+                // errs() << "\t\tLOAD USER: ";
+                // USER_LOAD->print(errs());
+                if(StoreInst* SI = dyn_cast<StoreInst>(USER_LOAD)) {
+                  // errs() << "NOT REPLACING" << " STORE SIZE: " << DL.getTypeAllocSize(SI->getValueOperand()->getType()) << "\n";
+                  return false; // NOT safe to replace as it might be a store to
+                                // load forwarding done by the frontend through type
+                                // coercion
+                  // NOTE: stored type must be same size as the loaded type
+                  // NOTE: 
+                }
+                // errs() << "\n";
+              }
+              
+            }
+            // safe = safe && (fieldSize >= loadSize); // DEBUG
           }
         }
       }

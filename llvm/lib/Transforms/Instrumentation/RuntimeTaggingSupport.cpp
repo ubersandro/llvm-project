@@ -177,13 +177,13 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
         // scalar arrays get the same tag
         // NOTE: this case catches arrays with depth > MAX_DEPTH as well
         auto Tag = (sonIdx) % TAG_MAX; //  | (fatherL << 4);
-        if (Tag == 0)
+        if (Tag == 0){
           errs() << "[FSAN - TAG] WARNING: Tag value 0 used for array field "
                  << sonIdx << " of struct " << *Ty
                  << ". This may cause false negatives in FSAN.\n";
+          Tag = 1; 
+        }
         size_t ArraySize = DL.getTypeAllocSize(CurFieldType);
-        // if (ArraySize == 0)
-        //   continue;
 
         memset(&Tags[CurFieldOffset], Tag, ArraySize);
 
@@ -198,7 +198,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
           // || ArrayFieldElems == 1
           // NOTE: the field might overlap with compiler-inserted padding
           // TODO:double check that this makes sense in STD
-          if (ArrayFieldElems == 0) {
+          if (ArrayFieldElems == 0 || !clFSAN_FAM) {
             errs() << "[FSAN - TAG] FLEX MEMBER IN " << *Ty << "\n";
             auto RemainderBytes = DL.getTypeAllocSize(Ty) - CurFieldOffset;
             if (clFSAN_FAM)
@@ -216,10 +216,12 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
       } else {
         // scalar field
         uint8_t CurFieldT = (sonIdx) % TAG_MAX;
-        if (CurFieldT == 0)
-          errs() << "[FSAN - TAG] WARNING: Tag value 0 used for field "
-                 << sonIdx << " of struct " << *Ty
-                 << ". This may cause false negatives in FSAN.\n";
+        if (CurFieldT == 0) {
+          errs() << "[FSAN - TAG] ADJUSTING TAG VALUE FOR FIELD " << sonIdx
+                 << " OF STRUCT " << *Ty << "\n";
+          CurFieldT = 1; // avoid 0 tag for scalar fields, which is the default
+                         // tag for padding and unions/literal structs
+        }
         uint8_t CurFieldTag = CurFieldT; // | (fatherL << 4);
         int CurFieldSize = DL.getTypeAllocSize(CurFieldType);
         memset(&Tags[CurFieldOffset], CurFieldTag, CurFieldSize);

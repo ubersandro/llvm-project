@@ -53,10 +53,10 @@ inline uptr GetShadowOffset() {
   return SANITIZER_FUCHSIA ? 0 : __hwasan_shadow_memory_dynamic_address;
 }
 inline uptr MemToShadow(uptr untagged_addr) {
-  return (untagged_addr ^ TRANS_CONSTANT) + OFFSET_MEM + 88ULL;
+  return (untagged_addr ^ TRANS_CONSTANT) + OFFSET_MEM;
 }
 inline uptr ShadowToMem(uptr shadow_addr) {
-  return ((shadow_addr - OFFSET_MEM - 88ULL) ^ TRANS_CONSTANT);
+  return ((shadow_addr - OFFSET_MEM) ^ TRANS_CONSTANT);
 }
 inline uptr MemToShadowSize(uptr size) {
   return size;
