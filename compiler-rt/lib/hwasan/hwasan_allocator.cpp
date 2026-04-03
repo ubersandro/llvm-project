@@ -252,10 +252,10 @@ static void* HwasanAllocate(StackTrace* stack, uptr orig_size, uptr alignment,
 
   Metadata* meta =
       reinterpret_cast<Metadata*>(allocator.GetMetaData(allocated));
-// #if CAN_SANITIZE_LEAKS
-//   meta->SetLsanTag(__lsan::DisabledInThisThread() ? __lsan::kIgnored
-//                                                   : __lsan::kDirectlyLeaked);
-// #endif
+#if CAN_SANITIZE_LEAKS
+  meta->SetLsanTag(__lsan::DisabledInThisThread() ? __lsan::kIgnored
+                                                  : __lsan::kDirectlyLeaked);
+#endif
   meta->SetAllocated(StackDepotPut(*stack), orig_size);
   RunMallocHooks(user_ptr, orig_size);
   // VPrintf(1, "[HWASAN] HwasanAllocate: size=%zx align=%zx, return %p\n",

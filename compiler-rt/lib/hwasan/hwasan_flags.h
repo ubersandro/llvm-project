@@ -12,9 +12,6 @@
 #ifndef HWASAN_FLAGS_H
 #define HWASAN_FLAGS_H
 
-// #ifdef CAN_SANITIZE_LEAKS
-// #define CAN_SANITIZE_LEAKS 0
-// #endif
 
 #include "sanitizer_common/sanitizer_internal_defs.h"
 

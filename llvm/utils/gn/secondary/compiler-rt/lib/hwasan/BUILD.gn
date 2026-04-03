@@ -2,8 +2,6 @@ import("//compiler-rt/gen_version_script.gni")
 import("//compiler-rt/target.gni")
 
 if (current_cpu == "x64") {
-  hwasan_name = "hwasan_aliases"
-} else {
   hwasan_name = "hwasan"
 }
 

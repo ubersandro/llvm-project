@@ -101,9 +101,9 @@ static void InitializeFlags() {
     cf.handle_sigtrap = kHandleSignalExclusive;
     // For now only tested on Linux and Fuchsia. Other plantforms can be turned
     // on as they become ready.
-    // constexpr bool can_detect_leaks =
-    //     (SANITIZER_LINUX && !SANITIZER_ANDROID) || SANITIZER_FUCHSIA;
-    cf.detect_leaks = false;  // cf.detect_leaks && can_detect_leaks;
+    constexpr bool can_detect_leaks =
+        (SANITIZER_LINUX && !SANITIZER_ANDROID) || SANITIZER_FUCHSIA;
+    cf.detect_leaks = cf.detect_leaks && can_detect_leaks;
 
 #if SANITIZER_ANDROID
     // Let platform handle other signals. It is better at reporting them then we

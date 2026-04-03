@@ -20,9 +20,6 @@
 #include "sanitizer_common/sanitizer_common.h"
 #include "sanitizer_common/sanitizer_internal_defs.h"
 
-// #ifdef CAN_SANITIZE_LEAKS
-// #  define CAN_SANITIZE_LEAKS 0
-// #endif
 
 namespace __hwasan {
 
