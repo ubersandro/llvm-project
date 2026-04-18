@@ -1328,6 +1328,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   if (!F.hasFnAttribute(Attribute::SanitizeHWAddress)) {
     return;
   }
+  // PROTOBUF: skip functions called "SharedCtor" TODO
 
   if (F.empty())
     return;
@@ -1637,22 +1638,72 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         // GEPI->setMetadata("fsan.noinstrument", UnionNode); // TODO
         return;
       }
-      // TODO: introduce blocklisting for structs here or at tag time if
-      // necessary
+      // TODO: introduce blocklisting for structs. Introduce config file,
+      // fsan_config.json -> specify blocklists for FPs there
+      bool tag = true;
+
+      // JSON : blocklisting all GEPs to iterators to prevent FPs
+      // TODO: limit this, it's too much -> restrict the limited GEPs
       if (ST && ST->hasName() &&
-          ST->getName().str().find("std::basic_ostream.base") == 0) {
+          ((demangle(ST->getName().str()).find("iterator") !=
+            std::string::npos))) {
         // NOTE: this idiom is used by iterators, it can cause FPs
         // UNTAG
-        Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
-        taggedPointer = untaggedResult;
-        endResultName = gepName + ".fsan.struct";
-        // return;
+        errs() << "[FSAN] WARNING: GEP to iterator struct, skipping "
+                  "instrumentation for this GEP: ";
+        GEPI->print(errs());
+        errs() << "\n";
+        tag = false;
       }
+
+      // TESSERACT: blocklist GEPs to vtables using tagged pointers -> FPs there
+      // in LIBC
+      if (ST && ST->hasName() &&
+          ((demangle(ST->getName().str()).find("class.std::ios_base") == 0))) {
+
+          // if this GEP has a user that stores a vtable ptr there, do not tag
+          for (auto U : GEPI->users()) {
+            if (StoreInst *SI = dyn_cast<StoreInst>(U))
+              if (SI->getPointerOperand() == GEPI) {
+
+                Value *storedVal = SI->getValueOperand();
+
+                // it will be a CONST EXPR GEP to some global var named "vtable
+                // for"
+                //         STORE USER:   store ptr getelementptr inbounds
+                //         inrange(-16, 112) ({ [16 x ptr] }, ptr
+                //         @_ZTVSt15basic_streambufIcSt11char_traitsIcEE, i32 0,
+                //         i32 0, i32 2), ptr %111, align 8, !dbg !6833, !tbaa
+                //         !5818, !DIAssignID !6834
+                if (GEPOperator *CE = dyn_cast<GEPOperator>(storedVal)) {
+                  if (CE->isInBounds() && CE->getNumOperands() >= 3) {
+                    // OP0 is an external unnamed constant array of ptrs
+                    // EXAMPLE ->  GEP OPERAND 0:
+                    // @_ZTVNSt7__cxx1115basic_stringbufIcSt11char_traitsIcESaIcEEE
+                    // = external unnamed_addr constant { [16 x ptr] }, align 8
+                    if (GlobalVariable *GV =
+                            dyn_cast<GlobalVariable>(CE->getOperand(0))) {
+                      if (GV->hasName() &&
+                          demangle(GV->getName().str()).find("vtable for") ==
+                              0) {
+                        errs() << "[FSAN-DBG] GEP ALERT: a tagged pointer "
+                                  "might be used to access a vtable, skipping "
+                                  "tagging for this GEP: "
+                               << *GEPI << "\n";
+                        tag = false;
+                      }
+                    }
+                  }
+                }
+              }
+        } // for users
+      } // class.std::ios_base
+
       Value *sonTag = nullptr;
       auto sonIsScalar = !sonType->isStructTy() && !sonType->isVectorTy();
 
       bool sonIsArrayOfAggregates = isArrayOfAggregates(sonType);
-      if (sonIsScalar && !sonIsArrayOfAggregates) {
+      if (sonIsScalar && !sonIsArrayOfAggregates && tag) {
         // GEP struct -> scalar
         auto op2 = GEPI->getOperand(2);
         Value *sonIdx;
@@ -1763,34 +1814,37 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           //   auto line = srcLoc.getLine();
           //   auto col = srcLoc.getCol();
           //   auto filename = srcLoc->getFilename();
-          //   errs() << "UNSAFE LOAD LOCATION: " << filename << ":" << line << ":"
+          //   errs() << "UNSAFE LOAD LOCATION: " << filename << ":" << line <<
+          //   ":"
           //          << col << "\n";
           // }
           // errs() << "GEP ON STRUCT "
           //        << GEPI->getSourceElementType()->getStructName()
-          //        << " FIELD SIZE: " << fieldSize << " LOAD SIZE: " << loadSize
+          //        << " FIELD SIZE: " << fieldSize << " LOAD SIZE: " <<
+          //        loadSize
           //        << "\n";
           // errs() << "GEP: ";
           // GEPI->print(errs());
           // errs() << "\nLOAD: ";
           // LI->print(errs());
           // errs() << "\n";
-          for(auto * USER_LOAD : LI->users()) {
+          for (auto *USER_LOAD : LI->users()) {
             // errs() << "\t\tLOAD USER: ";
             // USER_LOAD->print(errs());
-            if(StoreInst* SI = dyn_cast<StoreInst>(USER_LOAD)) {
-              // errs() << "NOT REPLACING" << " STORE SIZE: " << DL.getTypeAllocSize(SI->getValueOperand()->getType()) << "\n";
+            if (StoreInst *SI = dyn_cast<StoreInst>(USER_LOAD)) {
+              // errs() << "NOT REPLACING" << " STORE SIZE: " <<
+              // DL.getTypeAllocSize(SI->getValueOperand()->getType()) << "\n";
               return false; // NOT safe to replace as it might be a store to
                             // load forwarding done by the frontend through type
                             // coercion
               // NOTE: stored type must be same size as the loaded type
-              // NOTE: 
+              // NOTE:
             }
             // errs() << "\n";
           }
         }
         // TODO: is the UNSAFE load the result of type coercion?
-        
+
         // safe = safe && (fieldSize >= loadSize); // DEBUG
       } else if (PHINode *PHI = dyn_cast<PHINode>(User)) {
         // TODO: these have to be triaged
@@ -1811,20 +1865,21 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
               //   errs() << "UNSAFE LOAD LOCATION: " << filename << ":" << line
               //          << ":" << col << "\n";
               // }
-              for( auto * USER_LOAD : LI->users()) {
+              for (auto *USER_LOAD : LI->users()) {
                 // errs() << "\t\tLOAD USER: ";
                 // USER_LOAD->print(errs());
-                if(StoreInst* SI = dyn_cast<StoreInst>(USER_LOAD)) {
-                  // errs() << "NOT REPLACING" << " STORE SIZE: " << DL.getTypeAllocSize(SI->getValueOperand()->getType()) << "\n";
+                if (StoreInst *SI = dyn_cast<StoreInst>(USER_LOAD)) {
+                  // errs() << "NOT REPLACING" << " STORE SIZE: " <<
+                  // DL.getTypeAllocSize(SI->getValueOperand()->getType()) <<
+                  // "\n";
                   return false; // NOT safe to replace as it might be a store to
-                                // load forwarding done by the frontend through type
-                                // coercion
+                                // load forwarding done by the frontend through
+                                // type coercion
                   // NOTE: stored type must be same size as the loaded type
-                  // NOTE: 
+                  // NOTE:
                 }
                 // errs() << "\n";
               }
-              
             }
             // safe = safe && (fieldSize >= loadSize); // DEBUG
           }

@@ -177,11 +177,11 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
         // scalar arrays get the same tag
         // NOTE: this case catches arrays with depth > MAX_DEPTH as well
         auto Tag = (sonIdx) % TAG_MAX; //  | (fatherL << 4);
-        if (Tag == 0){
+        if (Tag == 0) {
           errs() << "[FSAN - TAG] WARNING: Tag value 0 used for array field "
                  << sonIdx << " of struct " << *Ty
                  << ". This may cause false negatives in FSAN.\n";
-          Tag = 1; 
+          Tag = 1;
         }
         size_t ArraySize = DL.getTypeAllocSize(CurFieldType);
 
@@ -204,6 +204,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
             if (clFSAN_FAM)
               memset(&Tags[CurFieldOffset], 0x00, RemainderBytes);
           }
+          // FFMPEG fix: remove FPs untagging artifically padded structs? Can be patched in SRC
         } // if LastField
       }
     } // cur sub field is array

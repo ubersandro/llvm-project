@@ -35,7 +35,7 @@ bool FSanRewriteFunctionCallsPass::isTypedMallocLike(CallBase *CB) {
   Function *Callee = dyn_cast<Function>(V);
   auto demangledName = Callee ? llvm::demangle(Callee->getName().str()) : "";
   return (Callee &&
-          demangledName == "typed_allocation"); // label for typed fnctn
+          demangledName.find("typed_allocation") != std::string::npos); // label for typed fnctn
 }
 bool FSanRewriteFunctionCallsPass::isTypedNewOperator(CallBase *CB) {
   Value *V = CB->getCalledOperand()->stripPointerCasts();
