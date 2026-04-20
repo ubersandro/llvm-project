@@ -17,7 +17,16 @@
 #define OFFSET_MEM 0x1000ULL
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
+#include <fstream>
+#include <set>
+
+static llvm::cl::opt<std::string> FilterFilePath(
+    "hwasan-filter-file",
+    llvm::cl::desc("File containing struct names to protect/ignore"),
+    llvm::cl::Hidden, llvm::cl::init(""));
+std::set<std::string> FilterSet;
 
 using namespace llvm;
 using namespace RuntimeTaggingSupport;
@@ -75,6 +84,10 @@ static cl::opt<bool> ClInstrumentWithCalls(
 static cl::opt<bool> ClInstrumentReads("hwasan-instrument-reads",
                                        cl::desc("instrument read instructions"),
                                        cl::Hidden, cl::init(true));
+static cl::opt<bool> ClSkipUnnamedStructs(
+    "hwasan-skip-unnamed-structs",
+    cl::desc("skip instrumentation of unnamed struct types"), cl::Hidden,
+    cl::init(true));
 
 static cl::opt<bool>
     ClInstrumentWrites("hwasan-instrument-writes",
@@ -132,7 +145,7 @@ static cl::opt<bool>
 
 static cl::opt<bool> ClInstrumentPersonalityFunctions(
     "hwasan-instrument-personality-functions",
-    cl::desc("instrument personality functions"), cl::Hidden, cl::init(false));
+    cl::desc("instrument personality functions"), cl::Hidden, cl::init(true));
 
 static cl::opt<bool> ClKasanMemIntrinCallbackPrefix(
     "hwasan-kernel-mem-intrinsic-prefix",
@@ -190,7 +203,16 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
   // const Triple &TargetTriple = M.getTargetTriple();
   // if (shouldUseStackSafetyAnalysis(TargetTriple,
   // Options.DisableOptimization))
-
+  if (FilterFilePath.getNumOccurrences() > 0) {
+    std::ifstream filterFile(FilterFilePath);
+    std::string line;
+    while (std::getline(filterFile, line)) {
+      FilterSet.insert(line);
+      errs() << "FSAN: FILTER class/struct " << line << "\n";
+    }
+    errs() << "FSAN: Loaded " << FilterSet.size()
+           << " struct names into the filter set.\n";
+  }
   // TODO: this might introduce UB, potentially delete!
   SSI = &MAM.getResult<StackSafetyGlobalAnalysis>(M);
 
@@ -367,15 +389,14 @@ void HWAddressSanitizer::initializeModule() {
   IRBuilder<> IRB(*C);
 
   HwasanCtorFunction = nullptr;
-  InstrumentGlobals = optOr(ClFSAN_globals, true);
-
   createHwasanCtorComdat(); // creates the routine ctor with a call into the
                             // runtime function __hwasan_init
 
   // createTagVectors();
-  if (InstrumentGlobals) {
+  if (ClFSAN_globals) {
     instrumentGlobals();
   }
+  instrumentPersonalityFunctions();
   if (!TargetTriple.isAndroid()) {
     ThreadPtrGlobal = M.getOrInsertGlobal("__hwasan_tls", IntptrTy, [&] {
       auto *GV = new GlobalVariable(M, IntptrTy, /*isConstant=*/false,
@@ -1618,7 +1639,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   else { /** father is not array */
     if (fatherType->isStructTy()) {
       StructType *ST = dyn_cast<StructType>(fatherType);
-      if (ST && !ST->hasName()) {
+      if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
         // UNNAMED STRUCT -> SKIP
         //
         // Clang emits hoisted struct representations for structs that result
@@ -1628,14 +1649,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         // errs() << "\n";
         return;
       }
+
       if (ST && ST->getName().str().find("union.") == 0) {
-        // UNION SKIP
-        // errs() << " SKIPPING GEP UNION ";
-        // GEPI->print(errs());
-        // errs() << "\n";
-        auto *UnionNode = MDNode::get(
-            *C, ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 1)));
-        // GEPI->setMetadata("fsan.noinstrument", UnionNode); // TODO
         return;
       }
       // TODO: introduce blocklisting for structs. Introduce config file,
@@ -1644,58 +1659,83 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
       // JSON : blocklisting all GEPs to iterators to prevent FPs
       // TODO: limit this, it's too much -> restrict the limited GEPs
-      if (ST && ST->hasName() &&
-          ((demangle(ST->getName().str()).find("iterator") !=
-            std::string::npos))) {
-        // NOTE: this idiom is used by iterators, it can cause FPs
-        // UNTAG
-        errs() << "[FSAN] WARNING: GEP to iterator struct, skipping "
-                  "instrumentation for this GEP: ";
-        GEPI->print(errs());
-        errs() << "\n";
-        tag = false;
+      // if (ST && ST->hasName() &&
+      //     ((demangle(ST->getName().str()).find("iterator") !=
+      //       std::string::npos))) {
+      //   // NOTE: this idiom is used by iterators, it can cause FPs
+      //   // UNTAG
+      //   errs() << "[FSAN] WARNING: GEP to iterator struct, skipping "
+      //             "instrumentation for this GEP: ";
+      //   GEPI->print(errs());
+      //   errs() << "\n";
+      //   tag = false;
+      // }
+      if (ST && ST->hasName()) {
+        auto demangledName = demangle(ST->getName().str());
+        for (auto &pattern : FilterSet) {
+          if (demangledName.find(pattern) != std::string::npos) {
+            errs() << "[FSAN] GEP BLOCK: " << pattern << ", GEP: ";
+            GEPI->print(errs());
+            errs() << "\n";
+            tag = false;
+            break;
+          }
+        }
       }
+
+      // if (ST && ST->hasName() &&
+      //     (((demangle(ST->getName().str()).find("class.anon") !=
+      //        std::string::npos)) ||
+      //      (ST->hasName() &&
+      //       ST->getName().str().find("struct.anon") != std::string::npos))) {
+      //   // NOTE: this idiom is used by iterators, it can cause FPs
+      //   // UNTAG
+      //   errs() << "[FSAN] WARNING: GEP to anonymous class struct, skipping "
+      //             "instrumentation for this GEP: ";
+      //   GEPI->print(errs());
+      //   errs() << "\n";
+      //   tag = false;
+      // }
 
       // TESSERACT: blocklist GEPs to vtables using tagged pointers -> FPs there
       // in LIBC
       if (ST && ST->hasName() &&
           ((demangle(ST->getName().str()).find("class.std::ios_base") == 0))) {
 
-          // if this GEP has a user that stores a vtable ptr there, do not tag
-          for (auto U : GEPI->users()) {
-            if (StoreInst *SI = dyn_cast<StoreInst>(U))
-              if (SI->getPointerOperand() == GEPI) {
+        // if this GEP has a user that stores a vtable ptr there, do not tag
+        for (auto U : GEPI->users()) {
+          if (StoreInst *SI = dyn_cast<StoreInst>(U))
+            if (SI->getPointerOperand() == GEPI) {
 
-                Value *storedVal = SI->getValueOperand();
+              Value *storedVal = SI->getValueOperand();
 
-                // it will be a CONST EXPR GEP to some global var named "vtable
-                // for"
-                //         STORE USER:   store ptr getelementptr inbounds
-                //         inrange(-16, 112) ({ [16 x ptr] }, ptr
-                //         @_ZTVSt15basic_streambufIcSt11char_traitsIcEE, i32 0,
-                //         i32 0, i32 2), ptr %111, align 8, !dbg !6833, !tbaa
-                //         !5818, !DIAssignID !6834
-                if (GEPOperator *CE = dyn_cast<GEPOperator>(storedVal)) {
-                  if (CE->isInBounds() && CE->getNumOperands() >= 3) {
-                    // OP0 is an external unnamed constant array of ptrs
-                    // EXAMPLE ->  GEP OPERAND 0:
-                    // @_ZTVNSt7__cxx1115basic_stringbufIcSt11char_traitsIcESaIcEEE
-                    // = external unnamed_addr constant { [16 x ptr] }, align 8
-                    if (GlobalVariable *GV =
-                            dyn_cast<GlobalVariable>(CE->getOperand(0))) {
-                      if (GV->hasName() &&
-                          demangle(GV->getName().str()).find("vtable for") ==
-                              0) {
-                        errs() << "[FSAN-DBG] GEP ALERT: a tagged pointer "
-                                  "might be used to access a vtable, skipping "
-                                  "tagging for this GEP: "
-                               << *GEPI << "\n";
-                        tag = false;
-                      }
+              // it will be a CONST EXPR GEP to some global var named "vtable
+              // for"
+              //         STORE USER:   store ptr getelementptr inbounds
+              //         inrange(-16, 112) ({ [16 x ptr] }, ptr
+              //         @_ZTVSt15basic_streambufIcSt11char_traitsIcEE, i32 0,
+              //         i32 0, i32 2), ptr %111, align 8, !dbg !6833, !tbaa
+              //         !5818, !DIAssignID !6834
+              if (GEPOperator *CE = dyn_cast<GEPOperator>(storedVal)) {
+                if (CE->isInBounds() && CE->getNumOperands() >= 3) {
+                  // OP0 is an external unnamed constant array of ptrs
+                  // EXAMPLE ->  GEP OPERAND 0:
+                  // @_ZTVNSt7__cxx1115basic_stringbufIcSt11char_traitsIcESaIcEEE
+                  // = external unnamed_addr constant { [16 x ptr] }, align 8
+                  if (GlobalVariable *GV =
+                          dyn_cast<GlobalVariable>(CE->getOperand(0))) {
+                    if (GV->hasName() &&
+                        demangle(GV->getName().str()).find("vtable for") == 0) {
+                      errs() << "[FSAN-DBG] GEP ALERT: a tagged pointer "
+                                "might be used to access a vtable, skipping "
+                                "tagging for this GEP: "
+                             << *GEPI << "\n";
+                      tag = false;
                     }
                   }
                 }
               }
+            }
         } // for users
       } // class.std::ios_base
 
@@ -2284,7 +2324,7 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
 
 void HWAddressSanitizer::instrumentGlobals() {
   std::vector<GlobalVariable *> Globals;
-
+  errs() << "[FSAN] Instrumenting globals...\n";
   for (GlobalVariable &GV : M.globals()) {
 
     if (GV.hasSanitizerMetadata() && GV.getSanitizerMetadata().NoHWAddress) {
@@ -2391,11 +2431,11 @@ void HWAddressSanitizer::instrumentPersonalityFunctions() {
                                              : GlobalValue::LinkOnceODRLinkage,
                                      ThunkName, &M);
     // TODO: think about other attributes as well.
-    if (any_of(P.second, [](const Function *F) {
-          return F->hasFnAttribute("branch-target-enforcement");
-        })) {
-      ThunkFn->addFnAttr("branch-target-enforcement");
-    }
+    // if (any_of(P.second, [](const Function *F) {
+    //       return F->hasFnAttribute("branch-target-enforcement");
+    //     })) {
+    //   ThunkFn->addFnAttr("branch-target-enforcement");
+    // }
     if (!IsLocal) {
       ThunkFn->setVisibility(GlobalValue::HiddenVisibility);
       ThunkFn->setComdat(M.getOrInsertComdat(ThunkName));

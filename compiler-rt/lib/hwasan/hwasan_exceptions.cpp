@@ -11,6 +11,7 @@
 // HWAddressSanitizer runtime.
 //===----------------------------------------------------------------------===//
 
+#include "hwasan/hwasan.h"
 #include "hwasan_poisoning.h"
 #include "sanitizer_common/sanitizer_common.h"
 
@@ -32,6 +33,7 @@ typedef _Unwind_Reason_Code PersonalityFn(int version, _Unwind_Action actions,
 typedef uintptr_t GetGRFn(_Unwind_Context* context, int index);
 typedef uintptr_t GetCFAFn(_Unwind_Context* context);
 
+__attribute__((no_sanitize("hwaddress")))
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE _Unwind_Reason_Code
 __hwasan_personality_wrapper(int version, _Unwind_Action actions,
                              uint64_t exception_class,
@@ -54,7 +56,6 @@ __hwasan_personality_wrapper(int version, _Unwind_Action actions,
   if ((actions & _UA_CLEANUP_PHASE) && rc == _URC_CONTINUE_UNWIND) {
 #if defined(__x86_64__)
     uptr fp = get_gr(context, 6);  // rbp
-    VPrintf(1, "real personality is %p\n", (void*)real_personality);
 #elif defined(__aarch64__)
     uptr fp = get_gr(context, 29); // x29
 #elif SANITIZER_RISCV64
@@ -63,12 +64,8 @@ __hwasan_personality_wrapper(int version, _Unwind_Action actions,
 #error Unsupported architecture
 #endif
     uptr sp = get_cfa(context);
-    VPrintf(1, "HWASan: EXCP: SP %p\n",
-            (void*)sp);
-    VPrintf(1, "HWASan: EXCP: FP %p\n",
-            (void*)fp);
-    // TagMemory(UntagAddr(sp), UntagAddr(fp) - UntagAddr(sp),
-    //           GetTagFromPointer(sp));
+    TagMemory(UntagAddr(sp), UntagAddr(fp) - UntagAddr(sp),
+              GetTagFromPointer(sp));
   }
 
   return rc;

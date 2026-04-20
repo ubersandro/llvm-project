@@ -37,12 +37,13 @@ bool FSanRewriteFunctionCallsPass::isTypedMallocLike(CallBase *CB) {
   return (Callee &&
           demangledName.find("typed_allocation") != std::string::npos); // label for typed fnctn
 }
+
 bool FSanRewriteFunctionCallsPass::isTypedNewOperator(CallBase *CB) {
   Value *V = CB->getCalledOperand()->stripPointerCasts();
   Function *Callee = dyn_cast<Function>(V);
   auto demangledName = Callee ? llvm::demangle(Callee->getName().str()) : "";
-  return (Callee && demangledName.find("operator new") !=
-                        std::string::npos); // for now, TODO later fix
+  return (Callee && demangledName.find("operator new") != std::string::npos &&
+          demangledName.find("align_val_t") == std::string::npos);
 }
 
 bool doCheckOnCookie(Value *V) {
