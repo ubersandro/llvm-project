@@ -12,7 +12,9 @@
 //===----------------------------------------------------------------------===//
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/InstIterator.h"
+// #include "llvm/Support/Casting.h"
 #include "llvm/Transforms/Instrumentation/RuntimeTaggingSupport.hpp"
+// #include <cstdint>
 #define TRANS_CONSTANT 0x400000000000ULL // 1<<46, 0x400000000000
 #define OFFSET_MEM 0x1000ULL
 #include "llvm/BinaryFormat/ELF.h"
@@ -409,6 +411,8 @@ void HWAddressSanitizer::initializeModule() {
   }
   FSANTaggingFunc = M.getOrInsertFunction("fsan_tag_memory", Int64Ty, PtrTy,
                                           PtrTy, Int64Ty, Int64Ty);
+  assert(FSANTaggingFunc.getCallee() &&
+         "FSAN tagging function must be declared");
 }
 
 void HWAddressSanitizer::initializeCallbacks(Module &M) {
@@ -1033,49 +1037,43 @@ void HWAddressSanitizer::untagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
 void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
                                    const DataLayout &DL) {
   if (StructType *ST = dyn_cast<StructType>(AI->getAllocatedType())) {
-    ApplyRLT(IRB, AI, ST, DL);
+    auto TagVector = RetrieveOrCreateTagVector(ST, M);
+    assert(TagVector && "Tag vector must exist here - tagAlloca");
+    IRB.CreateCall(FSANTaggingFunc,
+                   {IRB.CreatePointerCast(AI, PtrTy),
+                    IRB.CreatePointerCast(TagVector, PtrTy),
+                    ConstantInt::get(Int64Ty, DL.getTypeAllocSize(ST)),
+                    ConstantInt::get(Int64Ty, 1)});
+
   } // StructType
-
-  else if (VectorType *VT = dyn_cast<VectorType>(AI->getAllocatedType())) {
-    errs() << "[FSAN] WARNING: Alloca of VectorType for RLT not yet "
-              "supported: "
-           << *(VT) << "\n";
-  } // VectorType
-
   else if (ArrayType *AT = dyn_cast<ArrayType>(AI->getAllocatedType())) {
-    auto elementType = AT->getElementType();
+    auto *InTY = AT->getElementType();
+    int nElems = AT->getNumElements();
+    int depth = 1;
 
-    if (elementType->isStructTy()) {
-      for (u_int64_t el = 0; el < AT->getNumElements(); el++) {
-        auto *ElementPtr =
-            IRB.CreateGEP(elementType, AI, {ConstantInt::get(Int64Ty, el)});
-        GetElementPtrInst *GepInstruction = cast<GetElementPtrInst>(ElementPtr);
-        ApplyRLT(IRB, GepInstruction, elementType, DL);
-      } // for
-    } // CASE: ARRAY OF STRUCTS
+    while (ArrayType *INAT = dyn_cast<ArrayType>(InTY)) {
+      InTY = INAT->getElementType();
+      nElems *= INAT->getNumElements();
+      depth++;
+    }
+    auto *ST = dyn_cast<StructType>(InTY);
+    assert(ST && "Innermost element type of array must be struct for RLT");
 
-    else if (elementType->isArrayTy()) {
-      // NOTE: SPEC2017 does not use arrays of arrays, apparently
-      // errs() << "[FSAN] Alloca of array of arrays "
-      //  << *(AI->getAllocatedType()) << "\n";
-      for (u_int64_t el = 0; el < AT->getNumElements(); el++) {
-        auto *ElementPtr =
-            IRB.CreateGEP(elementType, AI, {ConstantInt::get(Int64Ty, el)});
-        // this points to an array
-        GetElementPtrInst *i_th_array = cast<GetElementPtrInst>(ElementPtr);
-        ArrayType *innerArrayType = cast<ArrayType>(elementType);
-        uint64_t int_n = innerArrayType->getNumElements();
-        for (uint64_t el_int = 0; el_int < int_n; el_int++) {
-          auto *innerElementPtr =
-              IRB.CreateGEP(innerArrayType->getElementType(), i_th_array,
-                            {ConstantInt::get(Int64Ty, el_int)});
-          GetElementPtrInst *GepInstruction =
-              cast<GetElementPtrInst>(innerElementPtr);
-          ApplyRLT(IRB, GepInstruction, innerArrayType->getElementType(), DL);
-        } // for inner elements
-      } // for each element, tag
-    } // CASE: ARRAY OF ARRAYS
+    if (depth > 1) {
+      errs() << "[FSAN] TAG STV " << depth << "-D array, INTY " << *InTY
+             << ", nElems " << nElems << "\n";
+    }
+    
+    auto *TV = RetrieveOrCreateTagVector(ST, M);
+    assert(TV && "Tag vector must exist here - tagAlloca");
+
+    IRB.CreateCall(FSANTaggingFunc,
+                   {IRB.CreatePointerCast(AI, PtrTy),
+                    IRB.CreatePointerCast(TV, PtrTy),
+                    ConstantInt::get(Int64Ty, DL.getTypeAllocSize(ST)),
+                    ConstantInt::get(Int64Ty, nElems)});
   } // ArrayType
+
   else {
     // SPEC2017 never hits this case
     errs() << "[FSAN] WARNING: Alloca of unsupported type for RLT: "
@@ -1214,63 +1212,42 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     auto *AI = KV.first;
     memtag::AllocaInfo &Info = KV.second;
     Value *Tag = nullptr;
+    int depth = 0;
 
     if (AllocaInst *AIcast = dyn_cast<AllocaInst>(AI)) {
       Type *allocatedType = AIcast->getAllocatedType();
-      // NOTE: SPEC 2017 does not have literals on stack.
-      if (allocatedType->isArrayTy()) {
-        auto elementType = allocatedType->getArrayElementType();
-        if (elementType->isStructTy()) {
-          // 1D array
-          StructType *ST_internal = dyn_cast<StructType>(elementType);
-          if (ST_internal->isLiteral()) {
-            continue;
-          }
+      bool IsArray = allocatedType->isArrayTy();
 
-          else if (ST_internal->getName().str().find("union.") == 0) {
-            continue;
-          }
-        } // case: 1d array of structs
+      Type *TY = allocatedType;
+      while (1) {
+        if (ArrayType *AT = dyn_cast<ArrayType>(TY)) {
+          TY = AT->getElementType();
+          depth++;
+        } else {
+          break;
+        }
+      }
 
-        else if (elementType->isArrayTy()) {
-          // multi-dimensional array
-          auto innerElementType = elementType->getArrayElementType();
-          if (innerElementType->isStructTy()) {
-            StructType *ST_internal_l2 = dyn_cast<StructType>(innerElementType);
-            if (ST_internal_l2->isLiteral()) {
-              LiteralStructs++;
-              continue;
-            }
-
-            else if (ST_internal_l2->getName().str().find("union.") == 0) {
-              continue;
-            }
-          } // case: 2d array of structs
-          else if (innerElementType->isArrayTy()) {
-            continue; // TODO
-          } else {
-            continue;
-          } // case: 2d array of scalars or other types I don't care about atm
-
-        } // case 2d array
-
-        else {
-          continue;
-        } // case : array of scalars/NA
-      } // case : alloca of ARRAY
-
-      if (!allocatedType->isStructTy()) {
-        // not an array, not a struct
+      if (depth == 0 && !TY->isStructTy()) {
+        // not an array, not a struct -> SKIP
         continue;
-      } else {
-        // it's a struct
-        StructType *ST = dyn_cast<StructType>(allocatedType);
+      }
+
+      if (IsArray && !TY->isStructTy()) {
+        // multi-dim array of non-structs -> SKIP
+        continue;
+      }
+
+      if (IsArray && TY->isStructTy()) {
+        // multi-dim array of structs -> check if struct is safe
+        StructType *ST = dyn_cast<StructType>(TY);
         if (ST->isLiteral()) {
           continue;
-        } else if (ST->getName().str().find("union.") == 0) {
+        }
+        if (ST->getName().str().find("union.") == 0) {
           continue;
         }
-      } // rules out allocas of not safe structs
+      }
     } // cast AI
     else
       assert(false && "Allocas must be AllocaInsts");
@@ -1290,6 +1267,7 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     llvm::for_each(Info.LifetimeStart, HandleLifetime);
     llvm::for_each(Info.LifetimeEnd, HandleLifetime);
 
+    // could be a struct or an array of structs. No unions, no literals
     tagAlloca(IRB, AI, DL);
 
     // AI->replaceUsesWithIf(Replacement, [AICast, AILong](const Use &U) {
@@ -1639,37 +1617,23 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   else { /** father is not array */
     if (fatherType->isStructTy()) {
       StructType *ST = dyn_cast<StructType>(fatherType);
-      if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
-        // UNNAMED STRUCT -> SKIP
-        //
-        // Clang emits hoisted struct representations for structs that result
-        // in GEPs on anon structs on x86. This probably introduces FNs.
-        // errs() << " SKIPPING GEP ANON STRUCT ";
-        // GEPI->print(errs());
-        // errs() << "\n";
-        return;
-      }
-
-      if (ST && ST->getName().str().find("union.") == 0) {
-        return;
-      }
-      // TODO: introduce blocklisting for structs. Introduce config file,
-      // fsan_config.json -> specify blocklists for FPs there
       bool tag = true;
 
+      if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
+        // LIMIT THE IMPACT OF TYPE COERCION, remove some FPs
+        // errs() << "[FSAN] SKIP UNNAMED STRUCT GEP: " << *ST << ", GEP: ";
+        // GEPI->print(errs());
+        // errs() << "\n";
+        tag = false;
+      }
+
+      if (ST && ST->hasName() && ST->getName().str().find("union.") == 0) {
+        tag = false;
+      }
+      // fsan_config.json -> specify blocklists for FPs there
+
       // JSON : blocklisting all GEPs to iterators to prevent FPs
-      // TODO: limit this, it's too much -> restrict the limited GEPs
-      // if (ST && ST->hasName() &&
-      //     ((demangle(ST->getName().str()).find("iterator") !=
-      //       std::string::npos))) {
-      //   // NOTE: this idiom is used by iterators, it can cause FPs
-      //   // UNTAG
-      //   errs() << "[FSAN] WARNING: GEP to iterator struct, skipping "
-      //             "instrumentation for this GEP: ";
-      //   GEPI->print(errs());
-      //   errs() << "\n";
-      //   tag = false;
-      // }
+
       if (ST && ST->hasName()) {
         auto demangledName = demangle(ST->getName().str());
         for (auto &pattern : FilterSet) {
@@ -1683,61 +1647,60 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         }
       }
 
-      // if (ST && ST->hasName() &&
-      //     (((demangle(ST->getName().str()).find("class.anon") !=
-      //        std::string::npos)) ||
-      //      (ST->hasName() &&
-      //       ST->getName().str().find("struct.anon") != std::string::npos))) {
-      //   // NOTE: this idiom is used by iterators, it can cause FPs
-      //   // UNTAG
-      //   errs() << "[FSAN] WARNING: GEP to anonymous class struct, skipping "
-      //             "instrumentation for this GEP: ";
-      //   GEPI->print(errs());
-      //   errs() << "\n";
-      //   tag = false;
-      // }
+      if (ST && ST->hasName()) {
+        auto demangledName = demangle(ST->getName().str());
+        if ((demangledName.find("class.anon") != std::string::npos) ||
+            (demangledName.find("struct.anon") != std::string::npos)) {
+          // errs() << "[FSAN] ANON CLASS/STRUCT GEP: " << demangledName
+          //        << ", GEP: ";
+          // GEPI->print(errs());
+          // errs() << "\n";
+          tag = false;
+        }
+      }
 
       // TESSERACT: blocklist GEPs to vtables using tagged pointers -> FPs there
       // in LIBC
-      if (ST && ST->hasName() &&
-          ((demangle(ST->getName().str()).find("class.std::ios_base") == 0))) {
+      // if (ST && ST->hasName() &&
+      //     ((demangle(ST->getName().str()).find("class.std::ios_base") == 0)))
+      //     {
 
-        // if this GEP has a user that stores a vtable ptr there, do not tag
-        for (auto U : GEPI->users()) {
-          if (StoreInst *SI = dyn_cast<StoreInst>(U))
-            if (SI->getPointerOperand() == GEPI) {
+      // if this GEP has a user that stores a vtable ptr there, do not tag
+      for (auto U : GEPI->users()) {
+        if (StoreInst *SI = dyn_cast<StoreInst>(U))
+          if (SI->getPointerOperand() == GEPI) {
 
-              Value *storedVal = SI->getValueOperand();
+            Value *storedVal = SI->getValueOperand();
 
-              // it will be a CONST EXPR GEP to some global var named "vtable
-              // for"
-              //         STORE USER:   store ptr getelementptr inbounds
-              //         inrange(-16, 112) ({ [16 x ptr] }, ptr
-              //         @_ZTVSt15basic_streambufIcSt11char_traitsIcEE, i32 0,
-              //         i32 0, i32 2), ptr %111, align 8, !dbg !6833, !tbaa
-              //         !5818, !DIAssignID !6834
-              if (GEPOperator *CE = dyn_cast<GEPOperator>(storedVal)) {
-                if (CE->isInBounds() && CE->getNumOperands() >= 3) {
-                  // OP0 is an external unnamed constant array of ptrs
-                  // EXAMPLE ->  GEP OPERAND 0:
-                  // @_ZTVNSt7__cxx1115basic_stringbufIcSt11char_traitsIcESaIcEEE
-                  // = external unnamed_addr constant { [16 x ptr] }, align 8
-                  if (GlobalVariable *GV =
-                          dyn_cast<GlobalVariable>(CE->getOperand(0))) {
-                    if (GV->hasName() &&
-                        demangle(GV->getName().str()).find("vtable for") == 0) {
-                      errs() << "[FSAN-DBG] GEP ALERT: a tagged pointer "
-                                "might be used to access a vtable, skipping "
-                                "tagging for this GEP: "
-                             << *GEPI << "\n";
-                      tag = false;
-                    }
+            // it will be a CONST EXPR GEP to some global var named "vtable
+            // for"
+            //         STORE USER:   store ptr getelementptr inbounds
+            //         inrange(-16, 112) ({ [16 x ptr] }, ptr
+            //         @_ZTVSt15basic_streambufIcSt11char_traitsIcEE, i32 0,
+            //         i32 0, i32 2), ptr %111, align 8, !dbg !6833, !tbaa
+            //         !5818, !DIAssignID !6834
+            if (GEPOperator *CE = dyn_cast<GEPOperator>(storedVal)) {
+              if (CE->isInBounds() && CE->getNumOperands() >= 3) {
+                // OP0 is an external unnamed constant array of ptrs
+                // EXAMPLE ->  GEP OPERAND 0:
+                // @_ZTVNSt7__cxx1115basic_stringbufIcSt11char_traitsIcESaIcEEE
+                // = external unnamed_addr constant { [16 x ptr] }, align 8
+                if (GlobalVariable *GV =
+                        dyn_cast<GlobalVariable>(CE->getOperand(0))) {
+                  if (GV->hasName() &&
+                      demangle(GV->getName().str()).find("vtable for") == 0) {
+                    errs() << "[FSAN-DBG] GEP ALERT: a tagged pointer "
+                              "might be used to access a vtable, skipping "
+                              "tagging for this GEP: "
+                           << *GEPI << "\n";
+                    tag = false;
                   }
                 }
               }
             }
-        } // for users
-      } // class.std::ios_base
+          }
+      } // for users
+      // } // class.std::ios_base
 
       Value *sonTag = nullptr;
       auto sonIsScalar = !sonType->isStructTy() && !sonType->isVectorTy();
@@ -1750,10 +1713,10 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         if (ConstantInt *CI = dyn_cast<ConstantInt>(op2)) {
           auto idx = CI->getZExtValue();
           if (idx == (TAG_MAX - 1)) {
-            errs() << "[FSAN-DBG] IDX ADJUSTED FOR FIELD " << idx
-                   << " IN GEP: ";
-            GEPI->print(errs());
-            errs() << "\n";
+            // errs() << "[FSAN-DBG] IDX ADJUSTED FOR FIELD " << idx
+            //        << " IN GEP: ";
+            // GEPI->print(errs());
+            // errs() << "\n";
             idx = 0;
           }
           sonTag = ConstantInt::get(
@@ -1762,15 +1725,15 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         } else {
           assert(false &&
                  "Non-constant GEP index not supported in struct GEPs for now");
-          errs() << "WARNING: NON-CONSTANT GEP INDEX, USING DYNAMIC TAG FOR "
-                    "THIS FIELD. GEP: ";
-          GEPI->print(errs());
-          errs() << "\n";
-          sonTag = IRB.CreateAnd(
-              IRB.CreateAdd(
-                  IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
-                  ConstantInt::get(IntptrTy, 0x1Lu)),
-              ConstantInt::get(IntptrTy, TAG_MAX - 1)); // modulo 64
+          // errs() << "WARNING: NON-CONSTANT GEP INDEX, USING DYNAMIC TAG FOR "
+          //           "THIS FIELD. GEP: ";
+          // GEPI->print(errs());
+          // errs() << "\n";
+          // sonTag = IRB.CreateAnd(
+          //     IRB.CreateAdd(
+          //         IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
+          //         ConstantInt::get(IntptrTy, 0x1Lu)),
+          //     ConstantInt::get(IntptrTy, TAG_MAX - 1)); // modulo 64
         }
 
         Value *untaggedResLong = untagPointer(IRB, resultLong);
@@ -2045,149 +2008,56 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
 /** Only expect structs, arrays of structs, matrices of structs */
 void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   Constant *Initializer = GV->getInitializer();
-  Type *type = GV->getValueType();
-  bool isGVArray = type->isArrayTy();
+  Type *GVType = GV->getValueType();
 
-  assert(type->isAggregateType() &&
+  StructType *STType = nullptr;
+  assert(GVType->isAggregateType() &&
          "[FSAN] Expected only aggregate types to be instrumented");
-  StructType *TYPE = nullptr;
-  bool isStruct = type->isStructTy();
-  bool isArrayOfStructs =
-      type->isArrayTy() &&
-      dyn_cast<ArrayType>(type)->getArrayElementType()->isStructTy();
 
-  bool isMatrixOfStructs =
-      type->isArrayTy() &&
-      dyn_cast<ArrayType>(type)->getElementType()->isArrayTy() &&
-      dyn_cast<ArrayType>(dyn_cast<ArrayType>(type)->getElementType())
-          ->getElementType()
-          ->isStructTy();
-  bool is3DMatrixOfStructs =
-      type->isArrayTy() &&
-      dyn_cast<ArrayType>(type)->getElementType()->isArrayTy() &&
-      dyn_cast<ArrayType>(dyn_cast<ArrayType>(type)->getElementType())
-          ->getElementType()
-          ->isArrayTy() &&
-      dyn_cast<ArrayType>(
-          dyn_cast<ArrayType>(dyn_cast<ArrayType>(type)->getElementType())
-              ->getElementType())
-          ->getElementType()
-          ->isStructTy();
+  uint64_t nElems = 1;
+  uint64_t depth = 0;
 
-  if (!(isStruct || isArrayOfStructs || isMatrixOfStructs ||
-        is3DMatrixOfStructs)) {
-    // TODO: refactor
-    // errs() << "[FieldArmor - WARNING] Skipping global variable: "
-    //        << GV->getName() << ", initializer type: " << *type << "\n";
-    return;
-  }
-
-  bool isUnion = false; // is union or aggregates of unions
-  std::string struct_name = "";
-
-  if (type->isStructTy()) {
-    StructType *ST = dyn_cast<StructType>(type);
-    if (ST->isLiteral()) {
-      int depth = 0;
-      // something is rotten in the state of denmark!
-      // DEPTH can be GT 1 because const struct arrays become structs of the
-      // same type!!!!
-      auto *tmp = getStructTypeFromDbgInfo(GV, &depth, &isUnion);
-
-      if (tmp) {
-        ST = tmp;
-        // errs() << "BOOM got NON NESTED struct type from dbg info: "
-        //        << ST->getName() << " BUT DEPTH " << depth << "\n";
-        if (depth != 0) {
-          // errs() << "[FieldArmor - WARNING] SKIPPING THIS CRAP!\n";
-          return;
-        }
-      } else
-        return;
+  if (ArrayType *AT = dyn_cast<ArrayType>(GVType)) { // NEW
+    auto InTY = AT->getElementType();
+    nElems = AT->getNumElements();
+    depth++;
+    while (ArrayType *INAT = dyn_cast<ArrayType>(InTY)) {
+      InTY = INAT->getElementType();
+      nElems *= INAT->getNumElements();
+      depth++;
     }
-    isUnion = ST->getName().str().find("union.") != std::string::npos;
-    struct_name = ST->getName().str();
-    TYPE = ST;
+    assert(InTY->isStructTy() &&
+           "[FSAN] Expected only arrays of structs to be instrumented");
+    STType = dyn_cast<StructType>(InTY);
+  } // if it's an array
+  else if (StructType *ST = dyn_cast<StructType>(GVType)) {
+    STType = ST;
+  } else {
+    assert(
+        false &&
+        "[FSAN] Expected only structs or arrays of structs to be instrumented");
+  }
+  Constant *ArraySize = ConstantInt::get(Int32Ty, nElems);
+
+  if (STType->isLiteral()) {
+    auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, nullptr);
+    if (tmp) {
+      STType = tmp;
+      if (STType->hasName() && STType->getName().str().find("union.") == 0)
+        return; // skip unions
+    } else
+      return;
   }
 
-  if (isArrayOfStructs) {
-    Type *elementType = type->getArrayElementType();
-    StructType *STA = dyn_cast<StructType>(elementType);
-
-    // errs() << "[FSAN] Instrumenting global variable with array of "
-    //           "structs: "
-    //        << GV->getName() << "\n";
-    if (STA->isLiteral()) {
-      auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
-      if (tmp) {
-        STA = tmp;
-        // errs() << "BOOM got struct type from dbg info: " << STA->getName()
-        //        << "\n";
-      }
-
-      else
-        return;
-    }
-    isUnion = STA->getName().str().find("union.") != std::string::npos;
-    struct_name = STA->getName().str();
-    TYPE = STA;
+  if (depth > 0) {
+    errs() << "[FSAN] TAG GV: " << GV->getName() << ", TY: " << *GVType << "\n";
+    errs() << "\t * " << depth << "-D array of structs" << "\n";
+    errs() << "\t * Number of elements: " << nElems << "\n";
   }
 
-  if (isMatrixOfStructs) {
-    Type *elementType = dyn_cast<ArrayType>(type)->getElementType();
-    Type *structType = dyn_cast<ArrayType>(elementType)->getElementType();
-    StructType *STM = dyn_cast<StructType>(structType);
-    // errs() << "[FSAN] Instrumenting global variable with matrix of "
-    //           "structs: "
-    //        << GV->getName() << "\n";
-    if (STM->isLiteral()) {
-      auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
-      if (tmp) {
-        // errs() << "BOOM got struct type from dbg info: " << STM->getName()
-        //        << "\n";
-        STM = tmp;
-      }
-
-      else
-        return;
-    }
-    isUnion = STM->getName().str().find("union.") != std::string::npos;
-    struct_name = STM->getName().str();
-    TYPE = STM;
-  }
-
-  if (is3DMatrixOfStructs) {
-    // errs() << "[FSAN] Instrumenting global 3D array of structs: "
-    //        << GV->getName() << "\n";
-    Type *elementType = dyn_cast<ArrayType>(type)->getElementType();
-    Type *innerArrayType = dyn_cast<ArrayType>(elementType)->getElementType();
-    Type *structType = dyn_cast<ArrayType>(innerArrayType)->getElementType();
-    StructType *STM = dyn_cast<StructType>(structType);
-    if (STM->isLiteral()) {
-      auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, &isUnion);
-      if (tmp) {
-        STM = tmp;
-      }
-
-      else
-        return;
-    }
-    isUnion = STM->getName().str().find("union.") != std::string::npos;
-    struct_name = STM->getName().str();
-    TYPE = STM;
-  }
-
-  if (isUnion) {
-    // errs() << "[FSAN] Skipping union/aggregate of unions GV: "
-    //        << GV->getName() << "\n";
-    return;
-  }
-
+  // END of type check
   uint64_t SizeInBytes =
       M.getDataLayout().getTypeAllocSize(Initializer->getType());
-
-  // errs() << "[FSAN] Instrumenting global variable: " << GV->getName()
-  //        << ", is array: " << isGVArray << "\n";
   auto *NewGV = new GlobalVariable(M, Initializer->getType(), GV->isConstant(),
                                    GlobalValue::ExternalLinkage, Initializer,
                                    GV->getName() + ".hwasan");
@@ -2197,7 +2067,6 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   auto *MD_node =
       MDNode::get(*C, ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 1)));
   NewGV->setMetadata("fsan.instrument", MD_node);
-
   NewGV->setAlignment(
       std::max(GV->getAlign().valueOrOne(), Mapping.getObjectAlignment()));
 
@@ -2239,62 +2108,24 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     assert(!struct_name.empty() &&
            "Struct name must be valid to instrument global variable.");
 
+    assert(STType &&
+           "Struct type must be valid to instrument global variable.");
     GlobalVariable *TagVector =
-        dyn_cast<GlobalVariable>(RetrieveOrCreateTagVector(TYPE, M));
+        dyn_cast<GlobalVariable>(RetrieveOrCreateTagVector(STType, M));
     assert(TagVector &&
            "Tag vector global must exist and be properly initialized.");
     auto *TVRelPtr = ConstantExpr::getTrunc(
         ConstantExpr::getSub(ConstantExpr::getPtrToInt(TagVector, Int64Ty),
                              ConstantExpr::getPtrToInt(Descriptor, Int64Ty)),
         Int32Ty);
-    Constant *arraySize = nullptr;
-    if (isStruct) {
-      // single struct
-      arraySize = ConstantInt::get(Int32Ty, 0x1);
-    } else {
-      // array of structs
-      if (isMatrixOfStructs) {
-        auto outerArrayType = dyn_cast<ArrayType>(type);
-        auto innerArrayType =
-            dyn_cast<ArrayType>(outerArrayType->getElementType());
-        assert(outerArrayType &&
-               "Outer array type must be valid for matrix of structs.");
-        assert(innerArrayType &&
-               "Inner array type must be valid for matrix of structs.");
-
-        arraySize =
-            ConstantInt::get(Int32Ty, outerArrayType->getNumElements() *
-                                          innerArrayType->getNumElements());
-      } else if (is3DMatrixOfStructs) {
-        auto outerArrayType = dyn_cast<ArrayType>(type);
-        auto middleArrayType =
-            dyn_cast<ArrayType>(outerArrayType->getElementType());
-        auto innerArrayType =
-            dyn_cast<ArrayType>(middleArrayType->getElementType());
-        assert(outerArrayType &&
-               "Outer array type must be valid for 3D matrix of structs.");
-        assert(middleArrayType &&
-               "Middle array type must be valid for 3D matrix of structs.");
-        assert(innerArrayType &&
-               "Inner array type must be valid for 3D matrix of structs.");
-
-        arraySize =
-            ConstantInt::get(Int32Ty, outerArrayType->getNumElements() *
-                                          middleArrayType->getNumElements() *
-                                          innerArrayType->getNumElements());
-      } else {
-        auto arrayType = dyn_cast<ArrayType>(type);
-        arraySize = ConstantInt::get(Int32Ty, arrayType->getNumElements());
-      }
-    }
-    assert(arraySize && "Array size constant must be valid.");
-    uint32_t Size = std::min(SizeInBytes - DescriptorPos, MaxDescriptorSize);
-    auto *SizeAndTag = ConstantInt::get(Int32Ty, Size);
+    assert(ArraySize && "Array size constant must be valid.");
+    // uint32_t Size = std::min(SizeInBytes - DescriptorPos, MaxDescriptorSize);
+    // auto *SizeAndTag = ConstantInt::get(Int32Ty, Size);
     auto *SizeOfTheStruct =
-        ConstantInt::get(Int32Ty, M.getDataLayout().getTypeAllocSize(TYPE));
+        ConstantInt::get(Int32Ty, M.getDataLayout().getTypeAllocSize(STType));
     Descriptor->setComdat(NewGV->getComdat());
     Descriptor->setInitializer(ConstantStruct::getAnon(
-        {GVRelPtr, SizeOfTheStruct, TVRelPtr, arraySize}));
+        {GVRelPtr, SizeOfTheStruct, TVRelPtr, ArraySize}));
     Descriptor->setSection("hwasan_globals");
     Descriptor->setMetadata(LLVMContext::MD_associated,
                             MDNode::get(*C, ValueAsMetadata::get(NewGV)));
@@ -2324,11 +2155,9 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
 
 void HWAddressSanitizer::instrumentGlobals() {
   std::vector<GlobalVariable *> Globals;
-  errs() << "[FSAN] Instrumenting globals...\n";
   for (GlobalVariable &GV : M.globals()) {
-
     if (GV.hasSanitizerMetadata() && GV.getSanitizerMetadata().NoHWAddress) {
-      errs() << "[FSAN] CORNER CASE: NO HWASAN MD GV " << GV.getName() << "\n";
+      errs() << "[FSAN] NO HWASAN MD GV " << GV.getName() << "\n";
       continue;
     }
 
@@ -2352,34 +2181,32 @@ void HWAddressSanitizer::instrumentGlobals() {
       continue;
 
     if (GV.getValueType()->isArrayTy()) {
-      if (!GV.getValueType()->getArrayElementType()->isStructTy() &&
-          !GV.getValueType()->getArrayElementType()->isArrayTy()) {
-        // not an array of structs or array of arrays, skipping
-        continue;
-      } else if (GV.getValueType()->getArrayElementType()->isArrayTy()) {
-        ArrayType *elemArrayType =
-            dyn_cast<ArrayType>(GV.getValueType()->getArrayElementType());
-        if (!elemArrayType->getElementType()->isStructTy()) {
-          // skipping 3d arrays of anything other than structs
-          errs() << "[FSan] 3D array SKIP " << GV.getName() << "\n";
-          // TODO
-          continue;
-        } // arrays of arrays of something other than structs
-        else if (elemArrayType->getElementType()->isStructTy()) {
-          bool isUnion = dyn_cast<StructType>(elemArrayType->getElementType())
-                             ->getName()
-                             .str()
-                             .find("union.") == 0;
-          if (isUnion) { // || isLiteral) {
-            continue;
-          }
-        } // if array of arrays of structs
-      } // if array of arrays
-    } // if it's an array
+      Type *TY = dyn_cast<ArrayType>(GV.getValueType());
 
-    else if (!GV.getValueType()->isStructTy()) {
+      while (ArrayType *AT = dyn_cast<ArrayType>(TY)) {
+        TY = AT->getElementType();
+      }
+
+      if (!TY->isStructTy()) {
+        continue;
+      } else {
+        auto ST = dyn_cast<StructType>(TY);
+        if (ST->hasName() &&
+            ST->getStructName().str().find("union.") != std::string::npos) {
+          continue;
+        }
+
+      } // it's an array of structs
+    } else if (GV.getValueType()->isStructTy()) {
+      auto ST = dyn_cast<StructType>(GV.getValueType());
+      if (ST->hasName() &&
+          ST->getStructName().str().find("union.") != std::string::npos) {
+        continue;
+      }
+
+    } else if (!GV.getValueType()->isStructTy()) {
       continue;
-    } // Q: can I do the check on the initializer? Or it breaks?
+    }
 
     Globals.push_back(&GV);
   }
