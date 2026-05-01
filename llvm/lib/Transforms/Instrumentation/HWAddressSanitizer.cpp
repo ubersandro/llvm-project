@@ -877,6 +877,7 @@ void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
   IRBuilder<> IRB(MI);
 
   // TODO: memmove
+  // NOTE: memcmp is caught by the runtime interposition
   if (isa<MemTransferInst>(MI)) { /*memcpy, memmove*/
     SmallVector<Value *, 4> Args{
         arg0, arg1, IRB.CreateIntCast(MI->getOperand(2), IntptrTy, false)};
@@ -1612,7 +1613,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     } // GEP into array of non-literal structs
 
     // else LEAVE THE PTR TAGGED!
-    //
+    
   } // GEP from array type
   else { /** father is not array */
     if (fatherType->isStructTy()) {
@@ -1621,18 +1622,12 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
       if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
         // LIMIT THE IMPACT OF TYPE COERCION, remove some FPs
-        // errs() << "[FSAN] SKIP UNNAMED STRUCT GEP: " << *ST << ", GEP: ";
-        // GEPI->print(errs());
-        // errs() << "\n";
         tag = false;
       }
 
       if (ST && ST->hasName() && ST->getName().str().find("union.") == 0) {
         tag = false;
       }
-      // fsan_config.json -> specify blocklists for FPs there
-
-      // JSON : blocklisting all GEPs to iterators to prevent FPs
 
       if (ST && ST->hasName()) {
         auto demangledName = demangle(ST->getName().str());
@@ -1647,60 +1642,17 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         }
       }
 
+      // GEPs on anon structs might be a symptom of type coercion, which is a common source of FPs
       if (ST && ST->hasName()) {
         auto demangledName = demangle(ST->getName().str());
         if ((demangledName.find("class.anon") != std::string::npos) ||
             (demangledName.find("struct.anon") != std::string::npos)) {
-          // errs() << "[FSAN] ANON CLASS/STRUCT GEP: " << demangledName
-          //        << ", GEP: ";
-          // GEPI->print(errs());
-          // errs() << "\n";
           tag = false;
         }
       }
 
-      // TESSERACT: blocklist GEPs to vtables using tagged pointers -> FPs there
-      // in LIBC
-      // if (ST && ST->hasName() &&
-      //     ((demangle(ST->getName().str()).find("class.std::ios_base") == 0)))
-      //     {
-
-      // if this GEP has a user that stores a vtable ptr there, do not tag
-      for (auto U : GEPI->users()) {
-        if (StoreInst *SI = dyn_cast<StoreInst>(U))
-          if (SI->getPointerOperand() == GEPI) {
-
-            Value *storedVal = SI->getValueOperand();
-
-            // it will be a CONST EXPR GEP to some global var named "vtable
-            // for"
-            //         STORE USER:   store ptr getelementptr inbounds
-            //         inrange(-16, 112) ({ [16 x ptr] }, ptr
-            //         @_ZTVSt15basic_streambufIcSt11char_traitsIcEE, i32 0,
-            //         i32 0, i32 2), ptr %111, align 8, !dbg !6833, !tbaa
-            //         !5818, !DIAssignID !6834
-            if (GEPOperator *CE = dyn_cast<GEPOperator>(storedVal)) {
-              if (CE->isInBounds() && CE->getNumOperands() >= 3) {
-                // OP0 is an external unnamed constant array of ptrs
-                // EXAMPLE ->  GEP OPERAND 0:
-                // @_ZTVNSt7__cxx1115basic_stringbufIcSt11char_traitsIcESaIcEEE
-                // = external unnamed_addr constant { [16 x ptr] }, align 8
-                if (GlobalVariable *GV =
-                        dyn_cast<GlobalVariable>(CE->getOperand(0))) {
-                  if (GV->hasName() &&
-                      demangle(GV->getName().str()).find("vtable for") == 0) {
-                    errs() << "[FSAN-DBG] GEP ALERT: a tagged pointer "
-                              "might be used to access a vtable, skipping "
-                              "tagging for this GEP: "
-                           << *GEPI << "\n";
-                    tag = false;
-                  }
-                }
-              }
-            }
-          }
-      } // for users
-      // } // class.std::ios_base
+      // TESSERACT: blocklist GEPs to vtables using tagged pointers
+      // JSON : blocklisting all GEPs to iterators to prevent FPs
 
       Value *sonTag = nullptr;
       auto sonIsScalar = !sonType->isStructTy() && !sonType->isVectorTy();
@@ -1713,10 +1665,6 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         if (ConstantInt *CI = dyn_cast<ConstantInt>(op2)) {
           auto idx = CI->getZExtValue();
           if (idx == (TAG_MAX - 1)) {
-            // errs() << "[FSAN-DBG] IDX ADJUSTED FOR FIELD " << idx
-            //        << " IN GEP: ";
-            // GEPI->print(errs());
-            // errs() << "\n";
             idx = 0;
           }
           sonTag = ConstantInt::get(
@@ -1725,15 +1673,6 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         } else {
           assert(false &&
                  "Non-constant GEP index not supported in struct GEPs for now");
-          // errs() << "WARNING: NON-CONSTANT GEP INDEX, USING DYNAMIC TAG FOR "
-          //           "THIS FIELD. GEP: ";
-          // GEPI->print(errs());
-          // errs() << "\n";
-          // sonTag = IRB.CreateAnd(
-          //     IRB.CreateAdd(
-          //         IRB.CreateZExtOrTrunc(GEPI->getOperand(2), IntptrTy),
-          //         ConstantInt::get(IntptrTy, 0x1Lu)),
-          //     ConstantInt::get(IntptrTy, TAG_MAX - 1)); // modulo 64
         }
 
         Value *untaggedResLong = untagPointer(IRB, resultLong);
@@ -1885,6 +1824,39 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
               }
             }
             // safe = safe && (fieldSize >= loadSize); // DEBUG
+          }
+        }
+      }
+    }
+    if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
+      if (SI->getPointerOperand() == GEPI) {
+
+        Value *storedVal = SI->getValueOperand();
+
+        // it will be a CONST EXPR GEP to some global var named "vtable
+        // for"
+        //         STORE USER:   store ptr getelementptr inbounds
+        //         inrange(-16, 112) ({ [16 x ptr] }, ptr
+        //         @_ZTVSt15basic_streambufIcSt11char_traitsIcEE, i32 0,
+        //         i32 0, i32 2), ptr %111, align 8, !dbg !6833, !tbaa
+        //         !5818, !DIAssignID !6834
+        if (GEPOperator *CE = dyn_cast<GEPOperator>(storedVal)) {
+          if (CE->isInBounds() && CE->getNumOperands() >= 3) {
+            // OP0 is an external unnamed constant array of ptrs
+            // EXAMPLE ->  GEP OPERAND 0:
+            // @_ZTVNSt7__cxx1115basic_stringbufIcSt11char_traitsIcESaIcEEE
+            // = external unnamed_addr constant { [16 x ptr] }, align 8
+            if (GlobalVariable *GV =
+                    dyn_cast<GlobalVariable>(CE->getOperand(0))) {
+              if (GV->hasName() &&
+                  demangle(GV->getName().str()).find("vtable for") == 0) {
+                // errs() << "[FSAN-DBG] GEP ALERT: TAGGED PTR ON VTABLE GEP: ";
+                // User->print(errs());
+                // errs() << "\n";
+
+                safe = false;
+              }
+            }
           }
         }
       }
@@ -2157,7 +2129,6 @@ void HWAddressSanitizer::instrumentGlobals() {
   std::vector<GlobalVariable *> Globals;
   for (GlobalVariable &GV : M.globals()) {
     if (GV.hasSanitizerMetadata() && GV.getSanitizerMetadata().NoHWAddress) {
-      errs() << "[FSAN] NO HWASAN MD GV " << GV.getName() << "\n";
       continue;
     }
 

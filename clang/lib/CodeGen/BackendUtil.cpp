@@ -1113,6 +1113,12 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
       });
     }
 
+    // NOTE: adding another one of these passes, since LTO could mess up the IR
+    if (LangOpts.Sanitize.has(SanitizerKind::HWAddress)) {
+      // errs() << "Adding HWAddressSanitizer rewrite pass\n";
+      MPM.addPass(FSanRewriteFunctionCallsPass());
+    }
+
     if (CodeGenOpts.FatLTO) {
       MPM.addPass(PB.buildFatLTODefaultPipeline(
           Level, PrepareForThinLTO,

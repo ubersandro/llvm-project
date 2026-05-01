@@ -48,7 +48,7 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
   llvm::Constant *Init = llvm::ConstantArray::get(TagArrayType, Elements);
   auto *NewlyCreatedTVGV = new GlobalVariable(
       M, TagArrayType, true, GlobalVariable::PrivateLinkage, Init, TagVecName);
-  NewlyCreatedTVGV->setSection("fsan.diocan"); // is this necessary?
+  NewlyCreatedTVGV->setSection(".data");
   appendToCompilerUsed(M, NewlyCreatedTVGV);
 }
 
@@ -178,9 +178,6 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
         // NOTE: this case catches arrays with depth > MAX_DEPTH as well
         auto Tag = (sonIdx) % TAG_MAX; //  | (fatherL << 4);
         if (Tag == 0) {
-          errs() << "[FSAN - TAG] WARNING: Tag value 0 used for array field "
-                 << sonIdx << " of struct " << *Ty
-                 << ". This may cause false negatives in FSAN.\n";
           Tag = 1;
         }
         size_t ArraySize = DL.getTypeAllocSize(CurFieldType);
@@ -204,7 +201,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
             if (clFSAN_FAM)
               memset(&Tags[CurFieldOffset], 0x00, RemainderBytes);
           }
-          // FFMPEG fix: remove FPs untagging artifically padded structs? Can be patched in SRC
+          // FFMPEG fix: remove FPs untagging artifically padded structs? Can be
+          // patched in SRC
         } // if LastField
       }
     } // cur sub field is array
@@ -218,8 +216,6 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
         // scalar field
         uint8_t CurFieldT = (sonIdx) % TAG_MAX;
         if (CurFieldT == 0) {
-          errs() << "[FSAN - TAG] ADJUSTING TAG VALUE FOR FIELD " << sonIdx
-                 << " OF STRUCT " << *Ty << "\n";
           CurFieldT = 1; // avoid 0 tag for scalar fields, which is the default
                          // tag for padding and unions/literal structs
         }
