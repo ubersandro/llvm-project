@@ -1,12 +1,19 @@
 /** This file is part of custom HWAsan - FSAN */
 #include "llvm/Transforms/Instrumentation/RuntimeTaggingSupport.hpp"
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Format.h"
-
+#include <fstream>
 static cl::opt<bool> clFSAN_FAM(
     "fsan-fam",
     cl::desc("clear padding at the end of a struct in the presence of FAM"),
     cl::Hidden, cl::init(true));
+
+static cl::opt<std::string> clFSAN_BLOCKLIST_TAG_FILEPATH(
+    "fsan-blocklist-tag-filepath",
+    cl::desc("Path to the blocklist tag file, which contains struct names to "
+             "blocklist from tagging"),
+    cl::Hidden, cl::init(""));
 
 namespace RuntimeTaggingSupport {
 #define TAG_MAX 64
@@ -27,12 +34,32 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
 
   bool isUnion =
       !isLiteral && ST->getName().str().find("union.") != std::string::npos;
+  auto demangledTypeName = demangle(ST->getStructName().str());
 
   if (isLiteral || isUnion) {
     // literal, unions == all 0 tags
+    errs() << "[FSAN - TAG] NULL TAG ON STRUCT " << *ST
+           << " (literal: " << isLiteral << ", union: " << isUnion << ")\n";
     Tags = new u_int8_t[Size];
     memset(Tags, (unsigned char)0x00, Size);
-  } else
+  } else if (!clFSAN_BLOCKLIST_TAG_FILEPATH.getValue().empty()) {
+    std::ifstream BlocklistFile(clFSAN_BLOCKLIST_TAG_FILEPATH.getValue());
+    if (BlocklistFile.is_open()) {
+      std::string Line;
+      while (std::getline(BlocklistFile, Line)) {
+        if (demangledTypeName.find(Line) != std::string::npos) {
+          Tags = new u_int8_t[Size];
+          memset(Tags, (unsigned char)0x00, Size);
+          errs() << "[FSAN - TAG] NULL TAG ON STRUCT " << *ST
+                 << " (blocklisted by pattern: " << Line << ")\n";
+          break;
+        }
+      }
+    }
+  }
+
+  // if at the end of the checks, no Tags, then compute
+  if (!Tags)
     Tags = ComputeTags(ST, M);
 
   assert(Tags && "Tags array must be valid after computation.");
@@ -152,9 +179,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
         auto *ElemStructType = dyn_cast<StructType>(ElemType);
         size_t ElemStructSize = DL.getTypeAllocSize(ElemStructType);
         auto *TagVector = RetrieveOrCreateTagVector(ElemStructType, M);
-        assert(
-            TagVector &&
-            "Failed to retrieve or create tag vector for struct element type.");
+        assert(TagVector && "Failed to retrieve or create tag vector for "
+                            "struct element type.");
         GlobalVariable *TVGV = dyn_cast<GlobalVariable>(TagVector);
 
         auto *TVInit = cast<Constant>(TVGV->getInitializer());
@@ -201,8 +227,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
             if (clFSAN_FAM)
               memset(&Tags[CurFieldOffset], 0x00, RemainderBytes);
           }
-          // FFMPEG fix: remove FPs untagging artifically padded structs? Can be
-          // patched in SRC
+          // FFMPEG fix: remove FPs untagging artifically padded structs? Can
+          // be patched in SRC
         } // if LastField
       }
     } // cur sub field is array
@@ -216,8 +242,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
         // scalar field
         uint8_t CurFieldT = (sonIdx) % TAG_MAX;
         if (CurFieldT == 0) {
-          CurFieldT = 1; // avoid 0 tag for scalar fields, which is the default
-                         // tag for padding and unions/literal structs
+          CurFieldT = 1; // avoid 0 tag for scalar fields, which is the
+                         // default tag for padding and unions/literal structs
         }
         uint8_t CurFieldTag = CurFieldT; // | (fatherL << 4);
         int CurFieldSize = DL.getTypeAllocSize(CurFieldType);

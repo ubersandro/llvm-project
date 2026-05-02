@@ -869,14 +869,21 @@ void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
   // bool untag_first = false;
   auto arg0 = MI->getOperand(0);
   auto arg1 = MI->getOperand(1);
-  if (!MI->getMetadata("fsan.instrument"))
+  if (!MI->getMetadata("fsan.instrument")) {
+    errs() << "[FSAN] NO FSAN MD INTRINSIC: " << *MI << "\n";
+    auto debugLoc = MI->getDebugLoc();
+    if (debugLoc)
+      errs() << "\t[src loc] " << debugLoc->getFilename() << ":" << debugLoc->getLine()
+             << "\n";
     return;
+  }
+    
   // NOTE: the above may introduce FNs
   // NO FPs observed on SPEC though
 
   IRBuilder<> IRB(MI);
 
-  // TODO: memmove
+  // TODO: memmove -> does not seem to be used in fuzzed software though
   // NOTE: memcmp is caught by the runtime interposition
   if (isa<MemTransferInst>(MI)) { /*memcpy, memmove*/
     SmallVector<Value *, 4> Args{

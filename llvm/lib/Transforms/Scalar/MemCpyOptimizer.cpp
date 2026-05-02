@@ -1744,7 +1744,11 @@ static bool isZeroSize(Value *Size) {
 /// circumstances). This allows later passes to remove the first memcpy
 /// altogether.
 bool MemCpyOptPass::processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI) {
-  return false;
+  bool InstrumentingWithFSAN =
+      !M->getFunction() ||
+      M->getFunction()->hasFnAttribute(Attribute::SanitizeHWAddress);
+  if (InstrumentingWithFSAN)
+    return false;
   // We can only optimize non-volatile memcpy's.
   if (M->isVolatile())
     return false;

@@ -45,6 +45,7 @@
 #include "llvm/Analysis/PtrUseVisitor.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/ConstantFolder.h"
@@ -5871,7 +5872,8 @@ std::pair<bool /*Changed*/, bool /*CFGChanged*/> SROA::runSROA(Function &F) {
 }
 
 PreservedAnalyses SROAPass::run(Function &F, FunctionAnalysisManager &AM) {
-  return PreservedAnalyses::all(); // Dont run for now.
+  if(F.hasFnAttribute(Attribute::SanitizeHWAddress))
+    return PreservedAnalyses::all(); // Dont run for now.
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
   AssumptionCache &AC = AM.getResult<AssumptionAnalysis>(F);
   DomTreeUpdater DTU(DT, DomTreeUpdater::UpdateStrategy::Lazy);

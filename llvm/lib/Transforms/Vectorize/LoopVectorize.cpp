@@ -10399,7 +10399,8 @@ LoopVectorizeResult LoopVectorizePass::runImpl(Function &F) {
 
 PreservedAnalyses LoopVectorizePass::run(Function &F,
                                          FunctionAnalysisManager &AM) {
-  return PreservedAnalyses::all();
+  if(F.hasFnAttribute(Attribute::SanitizeHWAddress))
+    return PreservedAnalyses::all();
   LI = &AM.getResult<LoopAnalysis>(F);
   // There are no loops in the function. Return before computing other
   // expensive analyses.

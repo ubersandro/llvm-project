@@ -5006,7 +5006,12 @@ static Value *simplifyGEPInst(Type *SrcTy, Value *Ptr,
                               ArrayRef<Value *> Indices, GEPNoWrapFlags NW,
                               const SimplifyQuery &Q, unsigned) {
   // The type of the GEP pointer operand.
-  return nullptr; // is this enough?
+  auto *Function = Q.CxtI ? Q.CxtI->getFunction() : nullptr;
+  if (!Function)
+    return nullptr;
+  if (Function->hasFnAttribute(Attribute::SanitizeHWAddress))
+    return nullptr;
+
   unsigned AS =
       cast<PointerType>(Ptr->getType()->getScalarType())->getAddressSpace();
 
@@ -7186,10 +7191,10 @@ static Value *simplifyInstructionWithOperands(Instruction *I,
     return simplifySelectInst(NewOps[0], NewOps[1], NewOps[2], Q, MaxRecurse);
   case Instruction::GetElementPtr: {
     return nullptr;
-    // auto *GEPI = cast<GetElementPtrInst>(I);
-    // return simplifyGEPInst(GEPI->getSourceElementType(), NewOps[0],
-    //                        ArrayRef(NewOps).slice(1), GEPI->getNoWrapFlags(), Q,
-    //                        MaxRecurse);
+    auto *GEPI = cast<GetElementPtrInst>(I);
+    return simplifyGEPInst(GEPI->getSourceElementType(), NewOps[0],
+                           ArrayRef(NewOps).slice(1), GEPI->getNoWrapFlags(), Q,
+                           MaxRecurse);
   }
   case Instruction::InsertValue: {
     InsertValueInst *IV = cast<InsertValueInst>(I);

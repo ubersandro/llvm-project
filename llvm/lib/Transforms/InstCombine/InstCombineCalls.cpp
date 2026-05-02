@@ -217,7 +217,8 @@ Instruction *InstCombinerImpl::SimplifyAnyMemTransfer(AnyMemTransferInst *MI) {
 }
 
 Instruction *InstCombinerImpl::SimplifyAnyMemSet(AnyMemSetInst *MI) {
-  return nullptr;
+  if (!MI->getFunction() || MI->getFunction()->hasFnAttribute(Attribute::SanitizeHWAddress))
+    return nullptr;
   const Align KnownAlignment =
       getKnownAlignment(MI->getDest(), DL, MI, &AC, &DT);
   MaybeAlign MemSetAlign = MI->getDestAlign();

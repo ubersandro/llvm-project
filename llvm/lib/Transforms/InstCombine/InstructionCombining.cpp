@@ -59,6 +59,7 @@
 #include "llvm/Analysis/Utils/Local.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/VectorUtils.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constant.h"
@@ -5939,7 +5940,8 @@ char InstCombinePass::ID = 0;
 
 PreservedAnalyses InstCombinePass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
-  return PreservedAnalyses::all();
+  if (F.hasFnAttribute(Attribute::SanitizeHWAddress))
+    return PreservedAnalyses::all();
   auto &LRT = AM.getResult<LastRunTrackingAnalysis>(F);
   // No changes since last InstCombine pass, exit early.
   if (LRT.shouldSkip(&ID))
