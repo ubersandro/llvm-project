@@ -332,6 +332,9 @@ void __sanitizer::BufferedStackTrace::UnwindImpl(uptr pc, uptr bp,
 }
 
 static bool InitializeSingleGlobal(const hwasan_global& global) {
+  // VPrintf(2, "HWASAN: initializing global %p .. %p (size %zu) with tag vector %p\n",
+  //         global.addr(), global.addr() + global.size(), global.size(),
+  //         global.tag_vector());
   TagMemory_mod((void*)global.addr(), global.size(), (void*)global.tag_vector(),
                 global.get_array_size());
   return true;
@@ -535,6 +538,17 @@ void __sanitizer_unaligned_store64(uu64* p, u64 x) { *p = x; }
 void __hwasan_loadN(uptr p, uptr sz) {
   CheckAddressSized<ErrorAction::Abort, AccessType::Load>(p, sz);
 }
+
+// convencience function defined for debugging memory checking inline
+void __hwasan_loadN_explicit(uptr p, uint8_t tag, uptr sz) {
+  // VPrintf(1,
+  //         "[FSAN] P %p, tag %x, size %zu\n",
+  //         p, tag, sz);
+  auto pp = UntagAddr(p);
+  pp = AddTagToPointer(pp, tag);
+  CheckAddressSized<ErrorAction::Abort, AccessType::Load>(pp, sz);
+}
+
 void __hwasan_load1(uptr p) {
   CheckAddress<ErrorAction::Abort, AccessType::Load, 0>(p);
 }

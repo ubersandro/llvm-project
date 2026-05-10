@@ -201,17 +201,18 @@ StackInfoBuilder::getAllocaInterestingness(const AllocaInst &AI) {
       memtag::getAllocaSizeInBytes(AI) > 0 &&
       // We are only interested in allocas not promotable to registers.
       // Promotable allocas are common under -O0.
-      !isAllocaPromotable(&AI) &&
+      // !isAllocaPromotable(&AI) &&
+      // FSAN-NOTE: for fsan, we do not promote alloca with SROA.
       // inalloca allocas are not treated as static, and we don't want
       // dynamic alloca instrumentation for them as well.
       !AI.isUsedWithInAlloca() &&
       // swifterror allocas are register promoted by ISel
       !AI.isSwiftError()) {
-    if (!(SSI && SSI->isSafe(AI))) {
+    // if (!(SSI && SSI->isSafe(AI))) {
       return AllocaInterestingness::kInteresting;
-    }
+    // }
     // safe allocas are not interesting
-    return AllocaInterestingness::kSafe;
+    // return AllocaInterestingness::kSafe;
   }
   return AllocaInterestingness::kUninteresting;
 }

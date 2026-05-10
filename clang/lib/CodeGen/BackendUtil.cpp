@@ -1115,7 +1115,6 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
 
     // NOTE: adding another one of these passes, since LTO could mess up the IR
     if (LangOpts.Sanitize.has(SanitizerKind::HWAddress)) {
-      // errs() << "Adding HWAddressSanitizer rewrite pass\n";
       MPM.addPass(FSanRewriteFunctionCallsPass());
     }
 
@@ -1203,11 +1202,11 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     outs() << "\n";
     return;
   }
-  // only add this pass IF hwasan is active!
-  if (LangOpts.Sanitize.has(SanitizerKind::HWAddress)) {
-    // errs() << "Adding HWAddressSanitizer rewrite pass\n";
-    MPM.addPass(FSanRewriteFunctionCallsPass());
-  }
+  // only add this pass IF hwasan is active! ONLY RUN ONCE!
+  // if (LangOpts.Sanitize.has(SanitizerKind::HWAddress)) {
+  //   // errs() << "Adding HWAddressSanitizer rewrite pass\n";
+  //   MPM.addPass(FSanRewriteFunctionCallsPass());
+  // }
   
 
   // Now that we have all of the passes ready, run them.

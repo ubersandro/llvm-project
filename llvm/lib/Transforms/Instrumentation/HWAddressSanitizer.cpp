@@ -10,10 +10,19 @@
 /// This file is a part of HWAddressSanitizer, an address basic correctness
 /// checker based on tagged addressing.
 //===----------------------------------------------------------------------===//
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstIterator.h"
 // #include "llvm/Support/Casting.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/Operator.h"
+#include "llvm/IR/Value.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Transforms/Instrumentation/RuntimeTaggingSupport.hpp"
+#include <cstdint>
+#include <sys/types.h>
 // #include <cstdint>
 #define TRANS_CONSTANT 0x400000000000ULL // 1<<46, 0x400000000000
 #define OFFSET_MEM 0x1000ULL
@@ -389,7 +398,7 @@ void HWAddressSanitizer::initializeModule() {
 
   C = &(M.getContext());
   IRBuilder<> IRB(*C);
-
+  InstrumentStack = ClFSAN_stack;
   HwasanCtorFunction = nullptr;
   createHwasanCtorComdat(); // creates the routine ctor with a call into the
                             // runtime function __hwasan_init
@@ -411,6 +420,10 @@ void HWAddressSanitizer::initializeModule() {
   }
   FSANTaggingFunc = M.getOrInsertFunction("fsan_tag_memory", Int64Ty, PtrTy,
                                           PtrTy, Int64Ty, Int64Ty);
+  // function for debugging inlined checks, some of them do not work
+  // TODO: debug more
+  __hwasan_loadN_explicit_function = M.getOrInsertFunction(
+      "__hwasan_loadN_explicit", VoidTy, IntptrTy, Int8Ty, IntptrTy);
   assert(FSANTaggingFunc.getCallee() &&
          "FSAN tagging function must be declared");
 }
@@ -721,14 +734,16 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
   Value *TagMismatch = nullptr;
   uint8_t MemTagMask = 0x3FU;
   uint64_t ExtendPattern = 0ULL;
+  LoadInst * LL; 
   // extend ptr tag
   switch (AccessSizeIndex) {
   case 0:
     // errs() << "[FSAN] 1B access \n";
     // InsertBefore->dump();
     // errs() << "\n";
-    R.MemTag = IRB.CreateLoad(R.PtrTag->getType(), Shadow);
-
+    LL = IRB.CreateLoad(R.PtrTag->getType(), Shadow);
+    LL->setVolatile(true);
+    R.MemTag = LL; // always fetch 64B
     TagMismatch = IRB.CreateICmpNE(
         R.PtrTag, IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(),
                                                            MemTagMask)));
@@ -741,7 +756,9 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     ExtendPattern = 0x0101U; // pattern to extend the tag for 2-byte access
     R.PtrTag =
         IRB.CreateMul(R.PtrTag, ConstantInt::get(Int16Ty, ExtendPattern));
-    R.MemTag = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
+    LL = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
+    LL->setVolatile(true);
+    R.MemTag = LL;
     TagMismatch = IRB.CreateICmpNE(
         R.PtrTag,
         IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(),
@@ -755,7 +772,9 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     ExtendPattern = 0x01010101UL; // pattern to extend the tag for 4-byte access
     R.PtrTag =
         IRB.CreateMul(R.PtrTag, ConstantInt::get(Int32Ty, ExtendPattern));
-    R.MemTag = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
+    LL = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
+    LL->setVolatile(true);
+    R.MemTag = LL;
     TagMismatch = IRB.CreateICmpNE(
         R.PtrTag,
         IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(),
@@ -770,7 +789,9 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
         0x0101010101010101ULL; // pattern to extend the tag for 8-byte access
     R.PtrTag =
         IRB.CreateMul(R.PtrTag, ConstantInt::get(Int64Ty, ExtendPattern));
-    R.MemTag = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
+    LL = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
+    LL->setVolatile(true);
+    R.MemTag = LL;
     TagMismatch = IRB.CreateICmpNE(
         R.PtrTag,
         IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(),
@@ -788,14 +809,16 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     APInt ExtendPattern(128, "01010101010101010101010101010101", 16);
     R.PtrTag =
         IRB.CreateMul(R.PtrTag, ConstantInt::get(Int128Ty, ExtendPattern));
-    R.MemTag = IRB.CreateLoad(R.PtrTag->getType(), Shadow);
+    LL = IRB.CreateLoad(R.PtrTag->getType(), Shadow);
+    LL->setVolatile(true);
+    R.MemTag = LL;
     APInt MaskPattern(128, "3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F", 16);
     R.MemTag = IRB.CreateAnd(R.MemTag, ConstantInt::get(Int128Ty, MaskPattern));
     TagMismatch = IRB.CreateICmpNE(R.PtrTag, R.MemTag);
     break;
   }
   assert(R.MemTag && "MemTag should have been set in the switch statement");
-
+  
   Value *MemoryIsTagged =
       IRB.CreateICmpNE(R.MemTag, ConstantInt::get(R.MemTag->getType(), 0x0UL));
   Value *PtrIsTagged =
@@ -866,18 +889,17 @@ bool memcpyIsOOB(MemTransferInst *MTI, const DataLayout &DL) {
 }
 
 void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
-  // bool untag_first = false;
   auto arg0 = MI->getOperand(0);
   auto arg1 = MI->getOperand(1);
   if (!MI->getMetadata("fsan.instrument")) {
-    errs() << "[FSAN] NO FSAN MD INTRINSIC: " << *MI << "\n";
-    auto debugLoc = MI->getDebugLoc();
-    if (debugLoc)
-      errs() << "\t[src loc] " << debugLoc->getFilename() << ":" << debugLoc->getLine()
-             << "\n";
+    // errs() << "[FSAN] NO FSAN MD INTRINSIC: " << *MI << "\n";
+    // auto debugLoc = MI->getDebugLoc();
+    // if (debugLoc)
+    //   errs() << "\t[src loc] " << debugLoc->getFilename() << ":"
+    //          << debugLoc->getLine() << "\n";
     return;
   }
-    
+
   // NOTE: the above may introduce FNs
   // NO FPs observed on SPEC though
 
@@ -1001,31 +1023,6 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
   return true;
 }
 
-/**
- * Applies RLT to memory
- */
-Value *HWAddressSanitizer::ApplyRLT(IRBuilder<> &IRB, Instruction *AI,
-                                    Type *rootType, const DataLayout &DL) {
-
-  auto structTy = cast<StructType>(rootType);
-  auto tagVector = M.getGlobalVariable(
-      structTy->getStructName().str() + ".fieldarmor.tagvec", true);
-
-  if (!tagVector) {
-    createTagVector(structTy, M);
-  }
-  tagVector = M.getGlobalVariable(
-      structTy->getStructName().str() + ".fieldarmor.tagvec", true);
-  assert(tagVector && "Tag vector must exist here - tagAlloca");
-
-  return IRB.CreateCall(
-      FSANTaggingFunc,
-      {IRB.CreatePointerCast(AI, PtrTy),
-       IRB.CreatePointerCast(tagVector, PtrTy),
-       ConstantInt::get(Int64Ty, DL.getTypeAllocSize(rootType)),
-       ConstantInt::get(Int64Ty, 1)});
-
-} // ApplyRLT
 
 void HWAddressSanitizer::untagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
                                      const DataLayout &DL) {
@@ -1045,8 +1042,12 @@ void HWAddressSanitizer::untagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
 void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
                                    const DataLayout &DL) {
   if (StructType *ST = dyn_cast<StructType>(AI->getAllocatedType())) {
-    auto TagVector = RetrieveOrCreateTagVector(ST, M);
+    auto *TagVector = RetrieveOrCreateTagVector(ST, M);
     assert(TagVector && "Tag vector must exist here - tagAlloca");
+    // auto SizeWithPadding = DL.getTypeAllocSize(ST);
+    // errs() << "[FSAN-STACK] ALLOCA\n\t" << *AI << "\n\tST " << *ST << "\n\tSZ "
+    //        << SizeWithPadding << " FUNCTION "
+    //        << demangle(AI->getFunction()->getName()) << "\n";
     IRB.CreateCall(FSANTaggingFunc,
                    {IRB.CreatePointerCast(AI, PtrTy),
                     IRB.CreatePointerCast(TagVector, PtrTy),
@@ -1066,12 +1067,16 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
     }
     auto *ST = dyn_cast<StructType>(InTY);
     assert(ST && "Innermost element type of array must be struct for RLT");
+    // auto SizeWithPadding = DL.getTypeAllocSize(AT);
+    // errs() << "[FSAN-STACK] ARR-ALLOCA\n\t" << *AI << "\n\tST " << *ST
+    //        << "\n\tSZ " << SizeWithPadding << " FUNCTION "
+    //        << demangle(AI->getFunction()->getName()) << "\n";
 
-    if (depth > 1) {
-      errs() << "[FSAN] TAG STV " << depth << "-D array, INTY " << *InTY
-             << ", nElems " << nElems << "\n";
-    }
-    
+    // if (depth > 1) {
+    //   errs() << "[FSAN] TAG STV " << depth << "-D array, INTY " << *InTY
+    //          << ", nElems " << nElems << "\n";
+    // }
+
     auto *TV = RetrieveOrCreateTagVector(ST, M);
     assert(TV && "Tag vector must exist here - tagAlloca");
 
@@ -1218,7 +1223,9 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
   for (auto &KV : SInfo.AllocasToInstrument) {
     auto N = I++;
     auto *AI = KV.first;
+    assert(AI && "Alloca must not be null");
     memtag::AllocaInfo &Info = KV.second;
+    assert(KV.second && "AllocaInfo must not be null");
     Value *Tag = nullptr;
     int depth = 0;
 
@@ -1255,11 +1262,14 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
         if (ST->getName().str().find("union.") == 0) {
           continue;
         }
+        if(ST->getName().str().empty()) {
+          errs() << "[FSAN] ALLOCA SKIP " << *AI << "\n";
+          continue;
+        }
       }
     } // cast AI
     else
       assert(false && "Allocas must be AllocaInsts");
-
     IRBuilder<> IRB(AI->getNextNonDebugInstruction());
     // NOTE: since root pointers are not tagged, no need for replacing the
     // pointer to the alloca with a tagged version.
@@ -1277,7 +1287,11 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
 
     // could be a struct or an array of structs. No unions, no literals
     tagAlloca(IRB, AI, DL);
-
+    if (ClFSAN_verbose) {
+      errs() << "[FSAN-STACK] ALLOCA #" << N << "\n\t" << *AI
+             << "\n\tSZ " << Size << " B\n\tFN "
+             << demangle(AI->getFunction()->getName()) << "\n";
+    }
     // AI->replaceUsesWithIf(Replacement, [AICast, AILong](const Use &U) {
     //   auto *User = U.getUser();
     //   return User != AILong && User != AICast &&
@@ -1297,6 +1311,8 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
       II->eraseFromParent();
     for (auto &II : Info.LifetimeEnd)
       II->eraseFromParent();
+    // TODO: check if this is good or bad for performance
+    // NOTE: I think it's legacy code + some stuff strictly necessary for NON 1-to-1 shadow memory schemas
     memtag::alignAndPadAlloca(Info, Mapping.getObjectAlignment());
 
     memtag::annotateDebugRecords(Info, retagMask(N));
@@ -1437,7 +1453,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
    * the type of the struct they point to)
    */
 
-  if (!SInfo.AllocasToInstrument.empty()) {
+  if (!SInfo.AllocasToInstrument.empty() && InstrumentStack) {
     const DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
     const PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
     const LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
@@ -1481,16 +1497,18 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       InstrumentCMP(CMPI); // KNOB
     }
   }
-
-  DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
-  PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
-  LoopInfo *LI = FAM.getCachedResult<LoopAnalysis>(F);
-  DomTreeUpdater DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy);
-  const DataLayout &DL = F.getDataLayout();
-  if (ClFSAN_memAccesses)
-    for (auto &Operand : OperandsToInstrument)
-      instrumentMemAccess(Operand, DTU, LI, DL); // KNOB
-  DTU.flush(); // TODO: does this have an interplay with optimizations?
+  if (ClFSAN_memAccesses) {
+    DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
+    PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
+    LoopInfo *LI = FAM.getCachedResult<LoopAnalysis>(F);
+    DomTreeUpdater DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy);
+    const DataLayout &DL = F.getDataLayout();
+    if (ClFSAN_memAccesses)
+      for (auto &Operand : OperandsToInstrument)
+        instrumentMemAccess(Operand, DTU, LI, DL); // KNOB
+    DTU.flush(); // TODO: does this have an interplay with optimizations?
+  }
+  
   ShadowBase = nullptr;
 }
 
@@ -1570,7 +1588,9 @@ bool isArrayOfAggregates(llvm::Type *T) {
 
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   auto nOperands = GEPI->getNumOperands();
-
+  Value *sonTag = nullptr;
+  Value *sonIdx = nullptr;  
+  bool guard = false;
   assert(nOperands <= 3);
   auto fatherType = GEPI->getSourceElementType();
   auto sonType = GEPI->getResultElementType();
@@ -1585,6 +1605,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     errs() << "\n";
     return;
   }
+
   IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
 
   Value *resultLong = IRB.CreatePointerCast(GEPI, IntptrTy);
@@ -1605,7 +1626,20 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   //     // setMetadata = false;
   //   }
   // }
-
+  // bool staticallyKnownToBeZero = false;
+  // llvm::KnownBits Known(64);
+  // llvm::computeKnownBits(resultLong, Known, M.getDataLayout());
+  // errs() << "KNOWN BITS FOR GEP: " << Known << "\n";
+  // if (Known.isZero()) {
+  //   staticallyKnownToBeZero = true;
+  // }
+  
+  // if(staticallyKnownToBeZero) {
+  //   errs() << "[FSAN] GEP on 0 ptr - fuck you \n";
+  //   GEPI->print(errs());
+  //   errs() << "\n";
+  //   return;
+  // }
   // else
   if (fatherType->isArrayTy()) {
     if (sonType->isAggregateType()) { /** GEP into array of aggregates */
@@ -1620,7 +1654,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     } // GEP into array of non-literal structs
 
     // else LEAVE THE PTR TAGGED!
-    
+
   } // GEP from array type
   else { /** father is not array */
     if (fatherType->isStructTy()) {
@@ -1649,7 +1683,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         }
       }
 
-      // GEPs on anon structs might be a symptom of type coercion, which is a common source of FPs
+      // GEPs on anon structs might be a symptom of type coercion, which is a
+      // common source of FPs
       if (ST && ST->hasName()) {
         auto demangledName = demangle(ST->getName().str());
         if ((demangledName.find("class.anon") != std::string::npos) ||
@@ -1661,16 +1696,18 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       // TESSERACT: blocklist GEPs to vtables using tagged pointers
       // JSON : blocklisting all GEPs to iterators to prevent FPs
 
-      Value *sonTag = nullptr;
+      sonTag = nullptr;
       auto sonIsScalar = !sonType->isStructTy() && !sonType->isVectorTy();
 
       bool sonIsArrayOfAggregates = isArrayOfAggregates(sonType);
       if (sonIsScalar && !sonIsArrayOfAggregates && tag) {
+        guard = true;
+        auto idx = 0;
         // GEP struct -> scalar
         auto op2 = GEPI->getOperand(2);
-        Value *sonIdx;
+
         if (ConstantInt *CI = dyn_cast<ConstantInt>(op2)) {
-          auto idx = CI->getZExtValue();
+          idx = CI->getZExtValue();
           if (idx == (TAG_MAX - 1)) {
             idx = 0;
           }
@@ -1730,8 +1767,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   //   dyn_cast<Instruction>(taggedPointer)
   //       ->setMetadata("fsan.instrument", MD_node);
 
-  GEPI->replaceUsesWithIf(taggedPointer, [resultLong, GEPI, isScalar, sonType,
-                                          setMetadata, MD_node](const Use &U) {
+  GEPI->replaceUsesWithIf(taggedPointer, [resultLong, GEPI, isScalar,
+                                          sonType](const Use &U) {
     auto *User = U.getUser();
     // TODO: I think this is BS
     bool isCallToMaskPtr = false;
@@ -1865,7 +1902,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
               }
             }
           }
-        }
+        } // if GEPOperator
       }
     }
     // safe &= !dyn_cast<GEPOperator>(User); // BAD idea, you introduce FNs.
@@ -2028,11 +2065,11 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       return;
   }
 
-  if (depth > 0) {
-    errs() << "[FSAN] TAG GV: " << GV->getName() << ", TY: " << *GVType << "\n";
-    errs() << "\t * " << depth << "-D array of structs" << "\n";
-    errs() << "\t * Number of elements: " << nElems << "\n";
-  }
+  // if (depth > 0) {
+  //   errs() << "[FSAN] TAG GV: " << GV->getName() << ", TY: " << *GVType << "\n";
+  //   errs() << "\t * " << depth << "-D array of structs" << "\n";
+  //   errs() << "\t * Number of elements: " << nElems << "\n";
+  // }
 
   // END of type check
   uint64_t SizeInBytes =
@@ -2112,12 +2149,12 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     appendToCompilerUsed(M, Descriptor);
   }
 
-  // uint8_t Tag = 0b10000000U;
   uint8_t Tag = RPTag; // global tags must be handled carefully, the linker does
                        // not know how to relocate it if the MSB is set!!!
   // in the asm, this gets evaluated to 2^^32. The linker, subsequently,
   // does the relocation magic and replaces that with something else like
   // the thing down here
+  // uint8_t Tag = 0b00000001;
   Constant *Aliasee = ConstantExpr::getIntToPtr(
       ConstantExpr::getAdd(
           ConstantExpr::getPtrToInt(NewGV, Int64Ty),

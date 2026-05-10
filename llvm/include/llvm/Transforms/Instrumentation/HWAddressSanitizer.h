@@ -206,6 +206,7 @@ private:
 
   void createTagVectors(); // FieldArmor
   FunctionCallee FSANTaggingFunc = nullptr;
+  FunctionCallee __hwasan_loadN_explicit_function = nullptr;
   // END FieldArmor
 
   bool selectiveInstrumentationShouldSkip(Function &F,

@@ -53,6 +53,8 @@ extern uptr __hwasan_shadow_memory_dynamic_address;
 SANITIZER_INTERFACE_ATTRIBUTE
 void __hwasan_loadN(uptr, uptr);
 SANITIZER_INTERFACE_ATTRIBUTE
+void __hwasan_loadN_explicit(uptr, uint8_t, uptr);
+SANITIZER_INTERFACE_ATTRIBUTE
 void __hwasan_load1(uptr);
 SANITIZER_INTERFACE_ATTRIBUTE
 void __hwasan_load2(uptr);

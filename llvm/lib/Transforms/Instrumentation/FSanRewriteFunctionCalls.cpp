@@ -1,5 +1,6 @@
 #include "llvm/Transforms/Instrumentation/FSanRewriteFunctionCalls.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
@@ -34,8 +35,8 @@ bool FSanRewriteFunctionCallsPass::isTypedMallocLike(CallBase *CB) {
   Value *V = CB->getCalledOperand()->stripPointerCasts();
   Function *Callee = dyn_cast<Function>(V);
   auto demangledName = Callee ? llvm::demangle(Callee->getName().str()) : "";
-  return (Callee &&
-          demangledName.find("typed_allocation") != std::string::npos); // label for typed fnctn
+  return (Callee && demangledName.find("typed_allocation") !=
+                        std::string::npos); // label for typed fnctn
 }
 
 bool FSanRewriteFunctionCallsPass::isTypedNewOperator(CallBase *CB) {
@@ -224,28 +225,29 @@ CallBase *rewriteCall(CallBase *CI, StructType *allocType, Value *arraySize,
     auto *UnwindDest = OldInv->getUnwindDest();
     Value *OldInvokedFunc; // = OldInv->getCalledOperand()->stripPointerCasts();
     FunctionType *OldInvokedFuncTy = nullptr;
-    
+
     // FETCH MALLOC SIGNATURE IF IT's MALLOC
-    if(formerAllocatorName == "malloc"){
+    if (formerAllocatorName == "malloc") {
       OldInvokedFunc = M.getFunction("malloc");
     }
-    if (formerAllocatorName == "calloc"){
+    if (formerAllocatorName == "calloc") {
       OldInvokedFunc = M.getFunction("calloc");
     }
     if (formerAllocatorName == "realloc") {
       OldInvokedFunc = M.getFunction("realloc");
-    }
-    else assert(false && "TODO  handle other allocators for invoke, currently only malloc");
+    } else
+      assert(false &&
+             "TODO  handle other allocators for invoke, currently only malloc");
     if (Function *OldInvokedFuncAsFn = dyn_cast<Function>(OldInvokedFunc)) {
       OldInvokedFuncTy = OldInvokedFuncAsFn->getFunctionType();
     }
 
     assert(OldInvokedFuncTy &&
            "Failed to get function type of old invoked function");
-    
+
     InvokeInst *NewInvoke =
-        InvokeInst::Create(OldInvokedFuncTy, OldInvokedFunc, Dest,
-                           UnwindDest, arguments, "invoke.rewrite");
+        InvokeInst::Create(OldInvokedFuncTy, OldInvokedFunc, Dest, UnwindDest,
+                           arguments, "invoke.rewrite");
     NewInvoke->setDebugLoc(OldInv->getDebugLoc());
     NewInvoke->insertBefore(OldInv);
     OldInv->replaceAllUsesWith(NewInvoke);
@@ -426,7 +428,6 @@ bool FSanRewriteFunctionCallsPass::ProcessMallocLikeCall(CallBase *CI,
     //   while (InsertPt != BB->end() && InsertPt->isDebugOrPseudoInst())
     //     ++InsertPt;
     // }
-    
 
     IRBuilder<> IRB(InsertPt);
     Value *ArraySize;

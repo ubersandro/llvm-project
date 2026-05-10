@@ -38,8 +38,8 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
 
   if (isLiteral || isUnion) {
     // literal, unions == all 0 tags
-    errs() << "[FSAN - TAG] NULL TAG ON STRUCT " << *ST
-           << " (literal: " << isLiteral << ", union: " << isUnion << ")\n";
+    // errs() << "[FSAN - TAG] NULL TAG ON STRUCT " << *ST
+    //        << " (literal: " << isLiteral << ", union: " << isUnion << ")\n";
     Tags = new u_int8_t[Size];
     memset(Tags, (unsigned char)0x00, Size);
   } else if (!clFSAN_BLOCKLIST_TAG_FILEPATH.getValue().empty()) {
@@ -47,9 +47,32 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
     if (BlocklistFile.is_open()) {
       std::string Line;
       while (std::getline(BlocklistFile, Line)) {
-        if (demangledTypeName.find(Line) != std::string::npos) {
+        // NOTE: we want to match struct.sockaddr, but not struct.sockaddr_in
+        // errs() << "[FSAN - TAG] N: " << demangledTypeName << " VS: " << Line
+        // << "\n";
+        auto LenLine = Line.length();
+        auto LenType = demangledTypeName.length();
+        bool containsAsterisk = Line.find('*') != std::string::npos;
+        if (containsAsterisk) {
+          // if the line contains an asterisk, we check if the demangled type
+          // name contains the line without the asterisk
+          auto LineWithoutAsterisk = Line;
+          LineWithoutAsterisk.erase(std::remove(LineWithoutAsterisk.begin(),
+                                                LineWithoutAsterisk.end(), '*'),
+                                    LineWithoutAsterisk.end());
+          if (demangledTypeName.find(LineWithoutAsterisk) !=
+              std::string::npos) {
+            Tags = new u_int8_t[Size];
+            memset(Tags, (unsigned char)0x00, Size);
+            errs() << "N:" << demangledTypeName << " VS:" << Line << "\n";
+            errs() << "[FSAN - TAG] NULL TAG ON STRUCT " << *ST
+                   << " (blocklisted by pattern: " << Line << ")\n";
+            break;
+          }
+        } else if (demangledTypeName.find(Line) == 0) {
           Tags = new u_int8_t[Size];
           memset(Tags, (unsigned char)0x00, Size);
+          errs() << "N:" << demangledTypeName << " VS:" << Line << "\n";
           errs() << "[FSAN - TAG] NULL TAG ON STRUCT " << *ST
                  << " (blocklisted by pattern: " << Line << ")\n";
           break;
