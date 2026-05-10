@@ -6494,8 +6494,7 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
     // TODO: not quite!
     llvm::Value* ArraySizeArg = FSAN::GetArraySizeFromAlloc(E, *this);
     args.add(RValue::get(ArraySizeArg),
-             getContext().getIntTypeForBitwidth(32, /*isSigned=*/true));
-
+             getContext().getIntTypeForBitwidth(64, /*isSigned=*/true));
     // extra arg $3 -> name of the replace function (e.g. malloc for malloc
     // ,realloc for realloc etc)
     auto FnNameStr = CalleeDecl->getName().str();

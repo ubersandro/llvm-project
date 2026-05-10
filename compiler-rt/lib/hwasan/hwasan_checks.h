@@ -197,16 +197,16 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   }
 
   unsigned int size = (unsigned int)sz;
+  VPrintf(2, "[check] Checking address %p of size %u with ptr tag %02x\n", (void*)p, size, ptr_tag);
   unsigned int chunks8B = size / 8;
   unsigned int remainder = size % 8;
   uint64_t ptr_tag_8B = ptr_tag * 0x0101010101010101ULL;
 
   uint64_t extendedMemTag;
   for (unsigned int i = 0; i < chunks8B; i++) {
-    extendedMemTag = *(uint64_t*)(baseShadow + i * 8) &
-                     0x3F3F3F3F3F3F3F3FUL;  // only get T bits
+    extendedMemTag = *(uint64_t*)(baseShadow + i * 8);  // only get T bits
     if (UNLIKELY(extendedMemTag != ptr_tag_8B)) {
-      VPrintf(0, "[HWASAN] Tag mismatch detected at address %p: ptr tag=%02x mem tag=%02x\n",
+      VPrintf(0, "[check] Tag mismatch detected at address %p: ptr tag=%04lx mem tag=%04lx\n",
               (void*)(p + i * 8), ptr_tag_8B, getT(extendedMemTag));
       SigTrap<EA, AT>(p, sz);
       if (EA == ErrorAction::Abort)
@@ -224,7 +224,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
     // to be lenient on b)
     // if (UNLIKELY(getT(mem_tag) != getT(ptr_tag))) {  //  && mem_tag != 0
     if (UNLIKELY(mem_tag != ptr_tag)) {  //  && mem_tag != 0
-      VPrintf(0, "[HWASAN] Tag mismatch detected at address %p: ptr tag=%02x mem tag=%02x\n",
+      VPrintf(0, "[check-tail] Tag mismatch detected at address %p: ptr tag=%02lx mem tag=%02lx\n",
               (void*)(p + i), ptr_tag, mem_tag);
       SigTrap<EA, AT>(p, sz);
       if (EA == ErrorAction::Abort)
@@ -247,7 +247,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   // NOTE: levels are masked for now, but they could be removed to make this
   // check even faster
 
-  uint8_t tag = GetTagFromPointer(p) & 0x3FUL;  // only get T bits
+  uint8_t tag = GetTagFromPointer(p);  // only get T bits
   uptr untagged_ptr = UntagAddr(p);             // this could be avoided
   uptr shadow_addr = MemToShadow(untagged_ptr);
   uint8_t ShadowTag = getT(*(uint8_t*)shadow_addr);
@@ -273,14 +273,11 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   }
   uint16_t TagShort = 0;
   uint16_t ShadowTagShort = 0;
-  uint16_t ShadowTagMaskShort = 0x3F3FUL;  // only get T bits
   uint32_t TagInt = 0;
   uint32_t ShadowTagInt = 0;
-  uint32_t ShadowTagMaskInt = 0x3F3F3F3FUL;
 
   uint64_t TagLong = 0;
   uint64_t ShadowTagLong = 0;
-  uint64_t ShadowTagMaskLong = 0x3F3F3F3F3F3F3F3FUL;
 
   switch (LogSize) {
     case 0: /*byte*/
@@ -289,13 +286,13 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
       break;
     case 1: /*2 bytes*/
       TagShort = (tag << 8) ^ tag;
-      ShadowTagShort = *(uint16_t*)shadow_addr & ShadowTagMaskShort;
+      ShadowTagShort = *(uint16_t*)shadow_addr;
       if (UNLIKELY(TagShort && ShadowTagShort && (TagShort != ShadowTagShort)))
         SigTrap<EA, AT, LogSize>(p);
       break;
     case 2: /*4 bytes*/
       TagInt = (tag << 24) ^ (tag << 16) ^ (tag << 8) ^ tag;
-      ShadowTagInt = *(uint32_t*)shadow_addr & ShadowTagMaskInt;
+      ShadowTagInt = *(uint32_t*)shadow_addr ;
       if (UNLIKELY(TagInt && ShadowTagInt && (TagInt != ShadowTagInt)))
         SigTrap<EA, AT, LogSize>(p);
       break;
@@ -304,7 +301,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
                 ((uint64_t)tag << 40) ^ ((uint64_t)tag << 32) ^
                 ((uint64_t)tag << 24) ^ ((uint64_t)tag << 16) ^
                 ((uint64_t)tag << 8) ^ (uint64_t)tag;
-      ShadowTagLong = *(uint64_t*)shadow_addr & ShadowTagMaskLong;
+      ShadowTagLong = *(uint64_t*)shadow_addr ;
       if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong)))
         SigTrap<EA, AT, LogSize>(p);
       break;
@@ -313,11 +310,11 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
                 ((uint64_t)tag << 40) ^ ((uint64_t)tag << 32) ^
                 ((uint64_t)tag << 24) ^ ((uint64_t)tag << 16) ^
                 ((uint64_t)tag << 8) ^ (uint64_t)tag;
-      ShadowTagLong = *(uint64_t*)shadow_addr & ShadowTagMaskLong;
+      ShadowTagLong = *(uint64_t*)shadow_addr ;
       if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong)))
         SigTrap<EA, AT, LogSize>(p);
       else {
-        ShadowTagLong = *(uint64_t*)(shadow_addr + 8) & ShadowTagMaskLong;
+        ShadowTagLong = *(uint64_t*)(shadow_addr + 8) ;
         if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong)))
           SigTrap<EA, AT, LogSize>(p);
       }

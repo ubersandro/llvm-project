@@ -16,8 +16,11 @@ static cl::opt<std::string> clFSAN_BLOCKLIST_TAG_FILEPATH(
     cl::Hidden, cl::init(""));
 
 namespace RuntimeTaggingSupport {
-#define TAG_MAX 64
-#define LEVEL_SHIFT 6 // DEBUG
+#if defined(__x86_64__)
+  #define TAG_MAX 64
+#else 
+  #define TAG_MAX 256
+#endif
 
 __attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
   auto *Int8Ty = Type::getInt8Ty(M.getContext());
@@ -225,7 +228,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
       } else {
         // scalar arrays get the same tag
         // NOTE: this case catches arrays with depth > MAX_DEPTH as well
-        auto Tag = (sonIdx) % TAG_MAX; //  | (fatherL << 4);
+        uint8_t Tag = (sonIdx) % TAG_MAX; //  | (fatherL << 4);
         if (Tag == 0) {
           Tag = 1;
         }

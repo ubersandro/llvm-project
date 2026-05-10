@@ -51,13 +51,6 @@ const char kHwasanPersonalityThunkName[] = "__hwasan_personality_thunk";
 const char kHwasanShadowMemoryDynamicAddress[] =
     "__hwasan_shadow_memory_dynamic_address";
 
-// Accesses sizes are powers of two: 1, 2, 4, 8, 16.
-static const size_t kNumberOfAccessSizes = 5;
-
-static const size_t kDefaultShadowScale = 0; // 1 to 1 mapping in shadow memory
-
-static const unsigned kShadowBaseAlignment = 32;
-
 static cl::opt<std::string>
     ClMemoryAccessCallbackPrefix("hwasan-memory-access-callback-prefix",
                                  cl::desc("Prefix for memory access callbacks"),
@@ -660,7 +653,12 @@ void HWAddressSanitizer::untagPointerOperand(Instruction *I, Value *Addr) {
 Value *HWAddressSanitizer::memToShadow(Value *Mem, IRBuilder<> &IRB) {
   Value *XorVal =
       IRB.CreateXor(Mem, ConstantInt::get(IntptrTy, TRANS_CONSTANT));
-  XorVal = IRB.CreateAdd(XorVal, ConstantInt::get(IntptrTy, OFFSET_MEM));
+  
+  #if defined (__x86_64__)
+  // OFFSET only applies to x86 builds
+    XorVal = IRB.CreateAdd(XorVal, ConstantInt::get(IntptrTy, OFFSET_MEM));
+  #endif
+
   return IRB.CreateIntToPtr(XorVal, PtrTy);
 }
 
@@ -732,7 +730,6 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
   Value *Shadow = memToShadow(R.PtrLong, IRB);
   R.MemTag = nullptr;
   Value *TagMismatch = nullptr;
-  uint8_t MemTagMask = 0x3FU;
   uint64_t ExtendPattern = 0ULL;
   LoadInst * LL; 
   // extend ptr tag
@@ -744,9 +741,7 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     LL = IRB.CreateLoad(R.PtrTag->getType(), Shadow);
     LL->setVolatile(true);
     R.MemTag = LL; // always fetch 64B
-    TagMismatch = IRB.CreateICmpNE(
-        R.PtrTag, IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(),
-                                                           MemTagMask)));
+    TagMismatch = IRB.CreateICmpNE(R.PtrTag, R.MemTag);
     break;
   case 1:
     // errs() << "[FSAN] 2B access \n";
@@ -759,10 +754,7 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     LL = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
     LL->setVolatile(true);
     R.MemTag = LL;
-    TagMismatch = IRB.CreateICmpNE(
-        R.PtrTag,
-        IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(),
-                                                 ExtendPattern * MemTagMask)));
+    TagMismatch = IRB.CreateICmpNE( R.PtrTag,R.MemTag);
     break;
   case 2:
     // errs() << "[FSAN] 4B access \n";
@@ -777,8 +769,7 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     R.MemTag = LL;
     TagMismatch = IRB.CreateICmpNE(
         R.PtrTag,
-        IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(),
-                                                 ExtendPattern * MemTagMask)));
+        R.MemTag); // for 4-byte access, only the lowest 4 bytes of the memory tag are relevant
     break;
   case 3:
     // errs() << "[FSAN] 8B access \n";
@@ -794,8 +785,7 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     R.MemTag = LL;
     TagMismatch = IRB.CreateICmpNE(
         R.PtrTag,
-        IRB.CreateAnd(R.MemTag, ConstantInt::get(R.PtrTag->getType(),
-                                                 MemTagMask * ExtendPattern)));
+        R.MemTag); // for 8-byte access, only the lowest 8 bytes of the memory tag are relevant
     break;
   case 4:
     // errs() << "[FSAN] 16B access \n";
@@ -812,8 +802,8 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     LL = IRB.CreateLoad(R.PtrTag->getType(), Shadow);
     LL->setVolatile(true);
     R.MemTag = LL;
-    APInt MaskPattern(128, "3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F", 16);
-    R.MemTag = IRB.CreateAnd(R.MemTag, ConstantInt::get(Int128Ty, MaskPattern));
+    // APInt MaskPattern(128, "3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F", 16);
+    // R.MemTag = IRB.CreateAnd(R.MemTag, ConstantInt::get(Int128Ty, MaskPattern));
     TagMismatch = IRB.CreateICmpNE(R.PtrTag, R.MemTag);
     break;
   }
@@ -1225,7 +1215,7 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     auto *AI = KV.first;
     assert(AI && "Alloca must not be null");
     memtag::AllocaInfo &Info = KV.second;
-    assert(KV.second && "AllocaInfo must not be null");
+    // assert(KV.second != nullptr && "AllocaInfo must not be null");
     Value *Tag = nullptr;
     int depth = 0;
 
@@ -1256,6 +1246,19 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
       if (IsArray && TY->isStructTy()) {
         // multi-dim array of structs -> check if struct is safe
         StructType *ST = dyn_cast<StructType>(TY);
+        if (ST->isLiteral()) {
+          continue;
+        }
+        if (ST->getName().str().find("union.") == 0) {
+          continue;
+        }
+        if(ST->getName().str().empty()) {
+          errs() << "[FSAN] ALLOCA SKIP " << *AI << "\n";
+          continue;
+        }
+      }
+      else if(allocatedType->isStructTy()) {
+        StructType *ST = dyn_cast<StructType>(allocatedType);
         if (ST->isLiteral()) {
           continue;
         }
@@ -1613,46 +1616,15 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   Value *taggedPointer = nullptr;
   bool isScalar = false;
   bool setMetadata = true;
-  // TODO: investigate "register"
-  // if (nOperands == 2) {
-  //   // if GEPPING from ptr to struct, untag
-  //   // TODO: ge
-  //   if (sonType->isStructTy()) {
-  //     errs() << "[FSAN] WARNING: GEP from ptr to struct, skipping
-  //     instrumentation for this GEP: "; GEPI->print(errs()); errs() << "\n";
-  //     Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
-  //     taggedPointer = untaggedResult;
-  //     endResultName = gepName + ".fsan.struct";
-  //     // setMetadata = false;
-  //   }
-  // }
-  // bool staticallyKnownToBeZero = false;
-  // llvm::KnownBits Known(64);
-  // llvm::computeKnownBits(resultLong, Known, M.getDataLayout());
-  // errs() << "KNOWN BITS FOR GEP: " << Known << "\n";
-  // if (Known.isZero()) {
-  //   staticallyKnownToBeZero = true;
-  // }
-  
-  // if(staticallyKnownToBeZero) {
-  //   errs() << "[FSAN] GEP on 0 ptr - fuck you \n";
-  //   GEPI->print(errs());
-  //   errs() << "\n";
-  //   return;
-  // }
-  // else
+
   if (fatherType->isArrayTy()) {
     if (sonType->isAggregateType()) { /** GEP into array of aggregates */
       // NOTE: this should trigger whenever gepping into array of structs, and
       // array of arrays
-      // Q: is there a way of statically knowing is the ptr is tagged BEFORE
-      // untagging?
       Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
       taggedPointer = untaggedResult;
       endResultName = gepName + ".fsan.array.struct";
-      // setMetadata = false;
     } // GEP into array of non-literal structs
-
     // else LEAVE THE PTR TAGGED!
 
   } // GEP from array type
@@ -1702,12 +1674,12 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       bool sonIsArrayOfAggregates = isArrayOfAggregates(sonType);
       if (sonIsScalar && !sonIsArrayOfAggregates && tag) {
         guard = true;
-        auto idx = 0;
+        uint16_t idx = 0;
         // GEP struct -> scalar
         auto op2 = GEPI->getOperand(2);
 
         if (ConstantInt *CI = dyn_cast<ConstantInt>(op2)) {
-          idx = CI->getZExtValue();
+          idx = (uint16_t) CI->getZExtValue();
           if (idx == (TAG_MAX - 1)) {
             idx = 0;
           }
@@ -2121,8 +2093,6 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
                 DescriptorPos)), // NOTE: when descriptor pos is 0, omitted
         Int32Ty);
 
-    assert(!struct_name.empty() &&
-           "Struct name must be valid to instrument global variable.");
 
     assert(STType &&
            "Struct type must be valid to instrument global variable.");

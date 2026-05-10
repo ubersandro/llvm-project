@@ -122,7 +122,11 @@ static void InitializeShadowBaseAddress(uptr shadow_size_bytes) {
     }
   } else {
     // on x86, this is start of the lowest portion of shadow memory
+    #if defined(__x86_64__)
     __hwasan_shadow_memory_dynamic_address = kHighShadowStart;
+    #else
+    __hwasan_shadow_memory_dynamic_address = 0x4000000000ULL;
+    #endif
   }
 }
 
@@ -244,25 +248,42 @@ void InitializeOsSupport() {
 }
 
 bool InitShadow() {
-  // Define the entire memory range.
-  // Determine shadow memory base offset.
-  int k = 44;
-  kLowMemStart = 0x0;
-  kLowMemEnd = (1ULL << k) - 1ULL + OFFSET_MEM;
-  kHighShadowStart = kLowMemEnd + 1;
-  kHighShadowEnd = kHighShadowStart + (1ULL << k) - 1ULL;
-  kLowShadowStart = kHighShadowEnd + 1;  // FIX
-  kLowShadowEnd = kLowMemEnd ^ TRANS_CONSTANT;
-  kHighMemStart = kHighShadowStart ^ TRANS_CONSTANT;
-  kHighMemEnd = GetHighMemEnd();    // 1<<48 -1
-  InitializeShadowBaseAddress(-1);  // @ale: shrink shadow memory size
-  CHECK_EQ(kHighMemStart % GetMmapGranularity(), 0);
-  CHECK_GT(kHighMemStart, kHighShadowEnd);
-  CHECK_GT(kHighShadowEnd, kHighShadowStart);
-  CHECK_GT(kHighShadowStart, kLowMemEnd);
-  CHECK_GT(kLowMemEnd, kLowMemStart);
-  CHECK_GT(kLowShadowEnd, kLowShadowStart);
-  CHECK_GT(kLowShadowStart, kLowMemEnd);
+  // NOTE: memory mapping for x86 and ARM is different!
+  #if defined(__x86_64__)
+    int k = 44;
+    kLowMemStart = 0x0;
+    kLowMemEnd = (1ULL << k) - 1ULL + OFFSET_MEM;
+    kHighShadowStart = kLowMemEnd + 1;
+    kHighShadowEnd = kHighShadowStart + (1ULL << k) - 1ULL;
+    kLowShadowStart = kHighShadowEnd + 1;  // FIX
+    kLowShadowEnd = kLowMemEnd ^ TRANS_CONSTANT;
+    kHighMemStart = kHighShadowStart ^ TRANS_CONSTANT;
+    kHighMemEnd = GetHighMemEnd();    // 1<<48 -1
+    InitializeShadowBaseAddress(-1);  // @ale: shrink shadow memory size
+    CHECK_EQ(kHighMemStart % GetMmapGranularity(), 0);
+    CHECK_GT(kHighMemStart, kHighShadowEnd);
+    CHECK_GT(kHighShadowEnd, kHighShadowStart);
+    CHECK_GT(kHighShadowStart, kLowMemEnd);
+    CHECK_GT(kLowMemEnd, kLowMemStart);
+    CHECK_GT(kLowShadowEnd, kLowShadowStart);
+    CHECK_GT(kLowShadowStart, kLowMemEnd);
+  
+  # elif defined(__aarch64__)
+  
+    kHighMemEnd = GetHighMemEnd();
+    InitializeShadowBaseAddress(MemToShadowSize(kHighMemEnd) >> 1);
+    VPrintf(1, "HWASan hardcoded shadow base address: %p\n",
+            (void*)__hwasan_shadow_memory_dynamic_address);
+    uptr sizeOfInterval = 0x3fffffffffff + 1;
+    kLowMemStart = 0;
+    kLowMemEnd = sizeOfInterval - 1;
+    kLowShadowStart = sizeOfInterval;
+    kLowShadowEnd = kLowShadowStart + sizeOfInterval - 1;
+    kHighShadowStart = 0xb00000000000;
+    kHighShadowEnd = kHighShadowStart + sizeOfInterval - 1;
+    kHighMemStart = 0xf00000010000;
+  
+  #  endif
 
   // Reserve shadow memory.
   ReserveShadowMemoryRange(kLowShadowStart, kLowShadowEnd,
@@ -305,6 +326,9 @@ void __attribute__((destructor)) __hwasan_finish() {
 void InitThreads() {
   CHECK(__hwasan_shadow_memory_dynamic_address);
   uptr guard_page_size = GetMmapGranularity();
+  
+  #if defined(__x86_64__)
+
   VPrintf(1, "kShadowBaseAlignment: %d\n", kShadowBaseAlignment);
   uptr base = 0x100000000000ULL;
   uptr thread_space_start = base - (1ULL << kShadowBaseAlignment);
@@ -319,6 +343,18 @@ void InitThreads() {
   ProtectGap(thread_space_end,
              __hwasan_shadow_memory_dynamic_address - thread_space_end);
   ProtectGap(thread_space_start - guard_page_size, guard_page_size);
+  
+  # else 
+  uptr thread_space_start =
+      __hwasan_shadow_memory_dynamic_address - (1ULL << kShadowBaseAlignment);
+  uptr thread_space_end =
+      __hwasan_shadow_memory_dynamic_address - guard_page_size;
+  ReserveShadowMemoryRange(thread_space_start, thread_space_end - 1,
+                           "hwasan threads", /*madvise_shadow*/ false);
+  ProtectGap(thread_space_end,
+             __hwasan_shadow_memory_dynamic_address - thread_space_end);
+  # endif
+
   InitThreadList(thread_space_start, thread_space_end - thread_space_start);
   hwasanThreadList().CreateCurrentThread();
 }

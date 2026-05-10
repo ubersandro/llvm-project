@@ -14,7 +14,13 @@
 #ifndef HWASAN_MAPPING_H
 #define HWASAN_MAPPING_H
 #define TRANS_CONSTANT 0x400000000000ULL
+
+#ifdef __aarch64__
+#define OFFSET_MEM 0x0UL
+#else
 #define OFFSET_MEM 0x1000UL
+#endif 
+
 #include "hwasan_interface_internal.h"
 #include "sanitizer_common/sanitizer_internal_defs.h"
 

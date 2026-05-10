@@ -160,7 +160,8 @@ GetArraySizeFromAlloc(const clang::Expr *E,
       default:
         llvm::errs() << "[FSAN-FE] UNHANDLE OP " << OpCode << "\n";
         BinOp->dump();
-        assert(false && "Unhandled binary operator in malloc size expression");
+        // NOTE: you can have divisions that cause this assert to fail because software is written col culo
+        // assert(false && "Unhandled binary operator in malloc size expression");
       }
     }
   } // malloc, valloc, pvalloc

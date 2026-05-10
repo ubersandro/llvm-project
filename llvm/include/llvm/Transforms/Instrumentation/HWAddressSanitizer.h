@@ -75,7 +75,12 @@ namespace llvm {
 class Module;
 class StringRef;
 class raw_ostream;
-#define TAG_MAX 64
+#if defined(__x86_64__)
+  #define TAG_MAX 64 // x86 has 6 bits for tagging
+#elif defined(__aarch64__)
+  #define TAG_MAX 256
+#endif 
+
 struct HWAddressSanitizerOptions {
   HWAddressSanitizerOptions()
       : HWAddressSanitizerOptions(false, false, false){};
