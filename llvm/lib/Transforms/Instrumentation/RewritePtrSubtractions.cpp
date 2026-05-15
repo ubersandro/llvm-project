@@ -12,8 +12,8 @@ cl::opt<bool> ClRewritePtrSubs(
         "Rewrite pointer subtractions to untag pointers before subtraction."));
 
 void inline processOperand(Instruction *BOP, Value *OP, int idx,
-                           uint64_t TagMaskByte,
-                           int PointerTagShift, Module &M ) {
+                           uint64_t TagMaskByte, int PointerTagShift,
+                           Module &M) {
   if (PtrToIntInst *PTI = dyn_cast<PtrToIntInst>(OP)) {
     // UNTAG
     uint64_t mask = ~(TagMaskByte << PointerTagShift);
@@ -25,6 +25,7 @@ void inline processOperand(Instruction *BOP, Value *OP, int idx,
 }
 
 bool RewritePtrSubtractionsPass::InstrumentBOP(BinaryOperator *BOP, Module &M) {
+  
   auto DL = M.getDataLayout();
   auto *OP0 = BOP->getOperand(0);
   auto *OP1 = BOP->getOperand(1);
@@ -33,6 +34,8 @@ bool RewritePtrSubtractionsPass::InstrumentBOP(BinaryOperator *BOP, Module &M) {
   BothPtr = dyn_cast<PtrToIntInst>(OP0) && dyn_cast<PtrToIntInst>(OP1);
   if (!BothPtr)
     return false;
+  errs() << "[==] Instrumenting BinaryOperator: " << *BOP
+         << "  FUNC = " << BOP->getFunction()->getName() << "\n";
   processOperand(BOP, OP0, 0, TagMaskByte, PointerTagShift, M);
   processOperand(BOP, OP1, 1, TagMaskByte, PointerTagShift, M);
   return true;
@@ -60,6 +63,8 @@ bool RewritePtrSubtractionsPass::InstrumentCMP(CmpInst *CI, Module &M) {
   auto cmpType = op1->getType();
   auto op2 = CI->getOperand(1);
   if (cmpType->isPointerTy()) {
+    errs() << "[==] Instrumenting CmpInst: " << *CI
+           << ", FUNC = " << CI->getFunction()->getName() << "\n";
     IRBuilder<> IRB(CI);
     Value *untaggedPtr1 = untagPointerIntrinsic(IRB, op1, M);
     CI->replaceUsesOfWith(op1, untaggedPtr1);

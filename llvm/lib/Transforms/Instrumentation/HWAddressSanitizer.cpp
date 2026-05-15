@@ -162,15 +162,17 @@ static cl::opt<bool> ClFSAN_PtrTagging("fsan-instrument-ptr-tagging",
 static cl::opt<bool>
     ClFSAN_GEP("fsan-instrument-geps",
                cl::desc("instrument getelementptr instructions"), cl::Hidden,
-               cl::init(ClFSAN_PtrTagging));
+               cl::init(ClFSAN_PtrTagging.getNumOccurrences() > 0));
 
-static cl::opt<bool> ClFSAN_BOP("fsan-instrument-bops",
-                                cl::desc("instrument binary op instructions"),
-                                cl::Hidden, cl::init(ClFSAN_PtrTagging));
+static cl::opt<bool>
+    ClFSAN_BOP("fsan-instrument-bops",
+               cl::desc("instrument binary op instructions"), cl::Hidden,
+               cl::init(ClFSAN_PtrTagging.getNumOccurrences() > 0));
 
-static cl::opt<bool> ClFSAN_CMP("fsan-instrument-cmp",
-                                cl::desc("instrument compare instructions"),
-                                cl::Hidden, cl::init(ClFSAN_PtrTagging));
+static cl::opt<bool>
+    ClFSAN_CMP("fsan-instrument-cmp",
+               cl::desc("instrument compare instructions"), cl::Hidden,
+               cl::init(ClFSAN_PtrTagging.getNumOccurrences() > 0));
 
 using namespace OffsetPorcodidio;
 static cl::opt<OffsetKind> ClMappingOffsetDynamic(
@@ -1425,12 +1427,13 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   if (F.empty())
     return;
-  bool isCppConstructor = F.getName().str().find("C2E") != std::string::npos ||
-                          F.getName().str().find("C1E") != std::string::npos;
-  if (isCppConstructor) {
-    errs() << "[FSAN] Skipping C++ constructor: " << F.getName() << "\n";
-    return;
-  }
+  // bool isCppConstructor = F.getName().str().find("C2E") != std::string::npos
+  // ||
+  //                         F.getName().str().find("C1E") != std::string::npos;
+  // if (isCppConstructor) {
+  //   errs() << "[FSAN] Skipping C++ constructor: " << F.getName() << "\n";
+  //   return;
+  // }
   NumTotalFuncs++;
   OptimizationRemarkEmitter &ORE =
       FAM.getResult<OptimizationRemarkEmitterAnalysis>(F);
@@ -1742,6 +1745,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   FatherLevel = extractLevelFromPointer(IRB, GEPI->getOperand(0));
 
   if (fatherType->isArrayTy()) {
+    // return; // DEBUG
     // R1: if returning pointer to aggregate L=L+1. If aggregate is struct, also
     // set R.
     auto GEPNAME = GEPI->hasName() ? GEPI->getName().str()
@@ -1786,7 +1790,6 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
                      IRB.CreatePtrToInt(untaggedResult, IntptrTy), Tag);
 
     } // GEP into array of non-literal structs
-    // else ?
   } // GEP from array type
 
   else { /** father is not array */
@@ -1794,15 +1797,15 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       StructType *ST = dyn_cast<StructType>(fatherType);
       bool tag = true;
 
-      if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
-        tag = false;
-        GEPI->setMetadata("fsan_skip_gep", MDNode::get(M.getContext(), {}));
-      }
+      // if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
+      //   tag = false;
+      //   GEPI->setMetadata("fsan_skip_gep", MDNode::get(M.getContext(), {}));
+      // }
 
-      if (ST && ST->hasName() && ST->getName().str().find("union.") == 0) {
-        tag = false;
-        GEPI->setMetadata("fsan_skip_gep", MDNode::get(M.getContext(), {}));
-      }
+      // if (ST && ST->hasName() && ST->getName().str().find("union.") == 0) {
+      //   tag = false;
+      //   GEPI->setMetadata("fsan_skip_gep", MDNode::get(M.getContext(), {}));
+      // }
 
       // if (ST && ST->hasName()) {
       //   auto demangledName = demangle(ST->getName().str());
@@ -1853,18 +1856,19 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
                  "Non-constant GEP index not supported in struct GEPs for now");
         }
 
-        Value *untaggedResLong = untagPointerIntrinsic(IRB, GEPI);
-        untaggedResLong = IRB.CreatePtrToInt(untaggedResLong, IntptrTy);
+        Value *untagged = untagPointerIntrinsic(IRB, GEPI);
+        Value *untaggedLong = IRB.CreatePtrToInt(untagged, IntptrTy);
         FatherLevel = IRB.CreateShl(FatherLevel, TBits); // adj L bits
         sonTag = IRB.CreateOr(sonTag, FatherLevel);
-        taggedPointer =
-            tagPointer(IRB, GEPI->getType(), untaggedResLong, sonTag);
+        taggedPointer = tagPointer(IRB, GEPI->getType(), untaggedLong, sonTag);
         endResultName = gepName + ".fsan.scalar";
         isScalar = true;
       } // GEP struct -> scalar
       else if (!tag) {
         // TODO
+        // return; // DEBUG
       } else {
+        // return; // DEBUG
         if (sonType->isAggregateType()) {
           /** GEP: struct -> aggregate */
           // L = L + 1
@@ -1933,7 +1937,35 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     // errs() << "\n";
     return; // TODO: handle corner cases
   }
-  taggedPointer = MaskFuckingPointer(IRB, taggedPointer);
+  // taggedPointer = MaskFuckingPointer(IRB, taggedPointer);
+  llvm::Type *ptrTy = taggedPointer->getType();
+
+  // 2. Define the FunctionType representing the assembly block's signature.
+  // It takes the candidate pointer as an argument and returns the frozen
+  // pointer.
+  llvm::FunctionType *asmFnTy =
+      llvm::FunctionType::get(ptrTy,   // Return type
+                              {ptrTy}, // Argument types
+                              false    // Is variadic
+      );
+
+  // 3. Create the InlineAsm object
+  llvm::InlineAsm *tagBarrierAsm = llvm::InlineAsm::get(
+      asmFnTy, // The function signature we just built
+      "",      // The assembly string (empty, zero-cost at runtime)
+      "=r,r",  // Output and Input constraints
+      true     // hasSideEffects (corresponds to 'sideeffect' in IR)
+  );
+
+  // 4. Generate the call instruction using your IRBuilder
+  llvm::Value *taggedPtr =
+      IRB.CreateCall(asmFnTy,         // Explicitly provide the function type
+                     tagBarrierAsm,   // The InlineAsm value
+                     {taggedPointer}, // The input argument list
+                     "tagged_ptr" // Optional name for the resulting IR register
+      );
+
+  // 'taggedPtr' now contains the optimization-resistant pointer
 
   taggedPointer->setName(endResultName);
 
@@ -2096,6 +2128,26 @@ void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
     Value *untaggedPtr2 = untagPointerIntrinsic(IRB, op2);
     CI->replaceUsesOfWith(op2, untaggedPtr2);
     NumInstrumentedCMPs++;
+  } else {
+    auto NameOp1 = op1->hasName() ? op1->getName().str() : "";
+    auto NameOp2 = op2->hasName() ? op2->getName().str() : "";
+    if (NameOp1.find("magicptr") != std::string::npos ||
+        NameOp2.find("magicptr") != std::string::npos) {
+      // simplifycfg can generate CMPs where ptrs are cast directly to int and
+      // have "magicptr" in their name
+
+      // errs() << "[FSAN] CMP magicptr: " << *CI << ", ty: ";
+      // cmpType->print(errs());
+      // errs() << "\n";
+
+      IRBuilder<> IRB(CI);
+      auto *Mask = ConstantInt::get(cmpType, ~(TagMaskByte << PointerTagShift));
+      auto untaggedPtr1 = IRB.CreateAnd(op1, Mask);
+      CI->replaceUsesOfWith(op1, untaggedPtr1);
+      auto untaggedPtr2 = IRB.CreateAnd(op2, Mask);
+      CI->replaceUsesOfWith(op2, untaggedPtr2);
+      NumInstrumentedCMPs++;
+    }
   }
 } // InstrumentCMP
 
@@ -2316,9 +2368,7 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     appendToCompilerUsed(M, Descriptor);
   }
   uint8_t Tag = 0;
-  bool isArray = depth > 0;
-  if (!isArray)
-    Tag = RPTag;
+  Tag = RPTag; // NOTE: both structs and arrays of structs have RP set
 
   Constant *Aliasee = ConstantExpr::getIntToPtr(
       ConstantExpr::getAdd(
