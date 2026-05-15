@@ -617,7 +617,7 @@ BaseReport::Shadow BaseReport::CopyShadow() const {
 tag_t BaseReport::GetTagCopy(uptr addr) const {
   CHECK_GE(addr, shadow.addr);
   uptr idx = addr - shadow.addr;
-  CHECK_LT(idx, ARRAY_SIZE(shadow.tags));
+  // CHECK_LT(idx, ARRAY_SIZE(shadow.tags));
   return shadow.tags[idx];
 }
 

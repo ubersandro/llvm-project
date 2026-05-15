@@ -811,6 +811,8 @@ SanitizerMask Linux::getSupportedSanitizers() const {
   const bool IsAndroid = getTriple().isAndroid();
   SanitizerMask Res = ToolChain::getSupportedSanitizers();
   Res |= SanitizerKind::Address;
+  Res |= SanitizerKind::FSanitizer;
+  Res |= SanitizerKind::FSanitizerHeapInstrumentation;
   Res |= SanitizerKind::PointerCompare;
   Res |= SanitizerKind::PointerSubtract;
   Res |= SanitizerKind::Realtime;

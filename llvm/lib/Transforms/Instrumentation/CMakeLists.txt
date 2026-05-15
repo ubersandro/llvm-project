@@ -28,6 +28,7 @@ add_llvm_component_library(LLVMInstrumentation
   RuntimeTaggingSupport.cpp
   RealtimeSanitizer.cpp
   FSanRewriteFunctionCalls.cpp
+  RewritePtrSubtractions.cpp
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms
 

@@ -1341,7 +1341,9 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
   // NOTE: a call is emitted also for placement new!
   // FSAN
   auto calleeName = CalleeDecl->getQualifiedNameAsString();
-  bool isEnabled = CGF.SanOpts.has(SanitizerKind::HWAddress); 
+  bool isEnabled =
+      CGF.SanOpts.has(SanitizerKind::FSanitizer) &&
+      CGF.SanOpts.has(SanitizerKind::FSanitizerHeapInstrumentation);
   if (isEnabled && calleeName.find("operator new") != std::string::npos) {
     auto &ctx = CGF.getContext();
     if (!typeName.empty()) {
@@ -1630,9 +1632,9 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   bool guard = false;
 
   QualType allocType = getContext().getBaseElementType(E->getAllocatedType());
-  auto IRType = ConvertTypeForMem(allocType);
-  std::string IRTypeName = IRType->isStructTy() ? IRType->getStructName().str()
-                                                : allocType.getAsString();
+  // auto IRType = ConvertTypeForMem(allocType);
+  // std::string IRTypeName = IRType->isStructTy() ? IRType->getStructName().str()
+  //                                               : allocType.getAsString();
   // 1. Build a call to the allocation function.
   FunctionDecl *allocator = E->getOperatorNew();
   // llvm::errs() << "\t[DBG-FE] Allocator: "

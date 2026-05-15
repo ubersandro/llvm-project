@@ -20,7 +20,6 @@
 #include "sanitizer_common/sanitizer_common.h"
 #include "sanitizer_common/sanitizer_internal_defs.h"
 
-
 namespace __hwasan {
 
 enum class ErrorAction { Abort, Recover };
@@ -153,21 +152,28 @@ PossiblyShortTagMatches(tag_t mem_tag, uptr ptr, uptr sz) {
   return *(u8*)(ptr | (kShadowAlignment - 1)) == ptr_tag;
 }
 
-#define getT(tag) (tag & 0b00111111UL)
-#define getL(tag) (tag & 0b00110000UL) >> 4
-#define getR(tag) (tag & 0b01000000UL) >> 6
+#if defined(__aarch64__)
+#  define T_BITS 5UL
+#  define L_BITS 2UL
+#  define L_MASK (0b11U << T_BITS)
+#else
+#  define T_BITS 3UL
+#  define L_BITS 2UL
+#  define L_MASK (0b11UL << T_BITS)
+#endif
+#define R_MASK (1UL << (T_BITS + L_BITS))
+#define getT(tag) (tag & ((1UL << T_BITS) - 1))
+#define getL(tag) ((tag & L_MASK) >> T_BITS)
+#define getR(tag) ((tag & R_MASK) >> (T_BITS + L_BITS))
 
 template <ErrorAction EA, AccessType AT>
 __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
                                                                       uptr sz) {
-  if (sz == 0 || !InTaggableRegion(p)) {
-    return;
-  }
-
   unsigned char* untagged_ptr = (unsigned char*)(p & ~kAddressTagMask);
   tag_t ptr_tag = GetTagFromPointer(p);
 
-  if (UNLIKELY(ptr_tag == 0)) {
+  if (UNLIKELY(ptr_tag == 0 ||
+               getT(ptr_tag) == 0)) {  // TODO: remove getT, implement stopgap
 #ifdef PERFORMANCE_DEBUGGING
     atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
     if (atomic_load(&checks_on_untagged_ptr, memory_order_relaxed) == 0) {
@@ -195,36 +201,58 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
 #endif
     return;
   }
-
+  bool RSet = getR(ptr_tag);
+  if (RSet) {
+    // uint8_t level = getL(ptr_tag);
+    // if (level > 0) {
+    //   // TODO
+    // }
+    return;
+  }
   unsigned int size = (unsigned int)sz;
-  VPrintf(2, "[check] Checking address %p of size %u with ptr tag %02x\n", (void*)p, size, ptr_tag);
   unsigned int chunks8B = size / 8;
   unsigned int remainder = size % 8;
-  uint64_t ptr_tag_8B = ptr_tag * 0x0101010101010101ULL;
 
-  uint64_t extendedMemTag;
+  uint8_t ptr_L = getL(ptr_tag);
+  uint8_t mem_L = getL(mem_tag);
+  bool L_MISMATCH = (ptr_L >= mem_L);
+  VPrintf(2, "[DBG-CHECK] L bits: ptr_L=%02x mem_L=%02x\n", ptr_L, mem_L);
+
+  uint64_t extension_mask = 0x0101010101010101ULL;
+  uint64_t ptr_T_8B = ptr_tag * extension_mask;
+  uint64_t MASK = (1ULL << (T_BITS + L_BITS)) - 1;
+
+  // uint64_t ExtendedMASK = MASK * extension_mask;
+  uint64_t extendedMemTag = (*(uint64_t*)baseShadow);  // only get bits you want
+
   for (unsigned int i = 0; i < chunks8B; i++) {
-    extendedMemTag = *(uint64_t*)(baseShadow + i * 8);  // only get T bits
-    if (UNLIKELY(extendedMemTag != ptr_tag_8B)) {
-      VPrintf(0, "[check] Tag mismatch detected at address %p: ptr tag=%04lx mem tag=%04lx\n",
-              (void*)(p + i * 8), ptr_tag_8B, getT(extendedMemTag));
+    extendedMemTag =
+        (*(uint64_t*)(baseShadow + i * 8));  // only get bits you want
+
+    if (UNLIKELY((extendedMemTag != ptr_T_8B) && L_MISMATCH)) {
+      VPrintf(0,
+              "[CheckAddressSized] Tag mismatch detected at address %p: ptr "
+              "tag=%016lx mem tag=%016lx\n",
+              (void*)(p + i * 8), ptr_T_8B, extendedMemTag);
       SigTrap<EA, AT>(p, sz);
       if (EA == ErrorAction::Abort)
         __builtin_unreachable();
     }
   }  // for
 
+  ptr_tag = ptr_tag & MASK;  // only get bits you want
   uptr curShadow = baseShadow + chunks8B * 8;
   // uptr curShadow = baseShadow;
   for (unsigned int i = 0; i < remainder; i++) {
     // for (unsigned int i = 0; i < size; i++) {
-    tag_t mem_tag = *(tag_t*)(curShadow + i);
+    tag_t mem_tag = (*(tag_t*)(curShadow + i)) & MASK;
     // NOTE: memtag can become 0 at some point if a) going out of bounds on
     // the current object b) flexible array member. We tolerate a), but have
     // to be lenient on b)
-    // if (UNLIKELY(getT(mem_tag) != getT(ptr_tag))) {  //  && mem_tag != 0
-    if (UNLIKELY(mem_tag != ptr_tag)) {  //  && mem_tag != 0
-      VPrintf(0, "[check-tail] Tag mismatch detected at address %p: ptr tag=%02lx mem tag=%02lx\n",
+    if (UNLIKELY((mem_tag != ptr_tag) && L_MISMATCH)) {  // DEBUG
+      VPrintf(0,
+              "[check-tail] Tag mismatch detected at address %p: ptr tag=%02lx "
+              "mem tag=%02lx\n",
               (void*)(p + i), ptr_tag, mem_tag);
       SigTrap<EA, AT>(p, sz);
       if (EA == ErrorAction::Abort)
@@ -242,89 +270,156 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
 
 template <ErrorAction EA, AccessType AT, unsigned LogSize>
 __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
-  if (!InTaggableRegion(p))
-    return;
   // NOTE: levels are masked for now, but they could be removed to make this
   // check even faster
 
-  uint8_t tag = GetTagFromPointer(p);  // only get T bits
-  uptr untagged_ptr = UntagAddr(p);             // this could be avoided
+  uint8_t tag = GetTagFromPointer(p);
+  uptr untagged_ptr = UntagAddr(p);  // this could be avoided
   uptr shadow_addr = MemToShadow(untagged_ptr);
-  uint8_t ShadowTag = getT(*(uint8_t*)shadow_addr);
+  uint8_t ShadowTag = (*(uint8_t*)shadow_addr);
   // DEBUG
   if (UNLIKELY(ShadowTag == 0)) {
-    atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
+    // atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
 
-    if (atomic_load(&checks_on_uninited_shadow, memory_order_relaxed) == 0) {
-      // overflow detected
-      atomic_fetch_add(&overflows_on_uninited_shadow_checks, 1ULL,
-                       memory_order_relaxed);
-    }
+    // if (atomic_load(&checks_on_uninited_shadow, memory_order_relaxed) == 0) {
+    //   // overflow detected
+    //   atomic_fetch_add(&overflows_on_uninited_shadow_checks, 1ULL,
+    //                    memory_order_relaxed);
+    // }
     return;
   }
   if (UNLIKELY(GetTagFromPointer(p) == 0)) {
-    atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
-    if (atomic_load(&checks_on_untagged_ptr, memory_order_relaxed) == 0) {
-      // overflow detected
-      atomic_fetch_add(&overflows_on_untagged_ptr_checks, 1ULL,
-                       memory_order_relaxed);
-    }
+    // atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
+    // if (atomic_load(&checks_on_untagged_ptr, memory_order_relaxed) == 0) {
+    //   // overflow detected
+    //   atomic_fetch_add(&overflows_on_untagged_ptr_checks, 1ULL,
+    //                    memory_order_relaxed);
+    // }
     return;
   }
+
+  bool isRP = getR(tag);
+  if (isRP) {
+    // VPrintf(2, "[CheckAddress-DBG] R PTR %p\n", (void*)p);
+    return;
+  }
+  auto ptr_L = getL(tag);
+  auto mem_L = getL(ShadowTag);
+
+  bool L_MISMATCH = (ptr_L >= mem_L);
+
+  uint8_t MASK = (1ULL << T_BITS) - 1;  // ONLY T
+
+  uint8_t ShadowTagByte = 0;
+  uint8_t TagByte = tag;
+  uint8_t MaskTagByte = MASK;
+
   uint16_t TagShort = 0;
   uint16_t ShadowTagShort = 0;
+  uint16_t MaskTagShort = MASK * 0x0101U;
+
   uint32_t TagInt = 0;
   uint32_t ShadowTagInt = 0;
+  uint32_t MaskTagInt = MASK * 0x01010101U;
 
   uint64_t TagLong = 0;
   uint64_t ShadowTagLong = 0;
+  uint64_t MaskTagLong = MASK * 0x0101010101010101ULL;
 
   switch (LogSize) {
     case 0: /*byte*/
-      if (UNLIKELY(tag && ShadowTag && tag != ShadowTag))
+      if (UNLIKELY(TagByte && ShadowTagByte &&
+                   (TagByte & MASK) != (ShadowTagByte & MASK) && L_MISMATCH)) {
+        VPrintf(0,
+                "[check-byte] Tag mismatch detected at address %p: ptr "
+                "tag=%02x mem tag=%02x, PL= %02x ML=%02x\n",
+                (void*)p, TagByte, ShadowTagByte, ptr_L, mem_L);
         SigTrap<EA, AT, LogSize>(p);
+      }
       break;
     case 1: /*2 bytes*/
-      TagShort = (tag << 8) ^ tag;
+      TagShort = (TagByte << 8) ^ TagByte;
+      TagShort = TagShort & MaskTagShort;
       ShadowTagShort = *(uint16_t*)shadow_addr;
-      if (UNLIKELY(TagShort && ShadowTagShort && (TagShort != ShadowTagShort)))
+      ShadowTagShort = ShadowTagShort & MaskTagShort;
+      if (UNLIKELY(TagShort && ShadowTagShort && (TagShort != ShadowTagShort) &&
+                   L_MISMATCH)) {
+        VPrintf(0,
+                "[check-short] Tag mismatch detected at address %p: ptr "
+                "tag=%04x mem tag=%04x, PL= %02x ML=%02x\n",
+                (void*)p, TagShort, ShadowTagShort, ptr_L, mem_L);
         SigTrap<EA, AT, LogSize>(p);
+      }
       break;
+
     case 2: /*4 bytes*/
-      TagInt = (tag << 24) ^ (tag << 16) ^ (tag << 8) ^ tag;
-      ShadowTagInt = *(uint32_t*)shadow_addr ;
-      if (UNLIKELY(TagInt && ShadowTagInt && (TagInt != ShadowTagInt)))
+      TagInt = (TagByte << 24) ^ (TagByte << 16) ^ (TagByte << 8) ^ TagByte;
+      TagInt = TagInt & MaskTagInt;
+      ShadowTagInt = *(uint32_t*)shadow_addr;
+      ShadowTagInt = ShadowTagInt & MaskTagInt;
+      if (UNLIKELY(TagInt && ShadowTagInt && (TagInt != ShadowTagInt) &&
+                   L_MISMATCH)) {
+        VPrintf(0,
+                "[check-int] Tag mismatch detected at address %p: ptr "
+                "tag=%04lx mem tag=%04lx, PL= %02x ML=%02x\n",
+                (void*)p, TagInt, ShadowTagInt, ptr_L, mem_L);
         SigTrap<EA, AT, LogSize>(p);
+      }
+
       break;
     case 3: /*8 bytes*/
-      TagLong = ((uint64_t)tag << 56) ^ ((uint64_t)tag << 48) ^
-                ((uint64_t)tag << 40) ^ ((uint64_t)tag << 32) ^
-                ((uint64_t)tag << 24) ^ ((uint64_t)tag << 16) ^
-                ((uint64_t)tag << 8) ^ (uint64_t)tag;
-      ShadowTagLong = *(uint64_t*)shadow_addr ;
-      if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong)))
+      TagLong = ((uint64_t)TagByte << 56) ^ ((uint64_t)TagByte << 48) ^
+                ((uint64_t)TagByte << 40) ^ ((uint64_t)TagByte << 32) ^
+                ((uint64_t)TagByte << 24) ^ ((uint64_t)TagByte << 16) ^
+                ((uint64_t)TagByte << 8) ^ (uint64_t)TagByte;
+      TagLong = TagLong & MaskTagLong;
+      ShadowTagLong = *(uint64_t*)shadow_addr;
+      ShadowTagLong = ShadowTagLong & MaskTagLong;
+      if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong) &&
+                   L_MISMATCH)) {
+        VPrintf(0,
+                "[check-long] Tag mismatch detected at address %p: ptr "
+                "tag=%016lx mem tag=%016lx, PL= %02x ML=%02x\n",
+                (void*)p, TagLong, ShadowTagLong, ptr_L, mem_L);
         SigTrap<EA, AT, LogSize>(p);
+      }
       break;
     case 4: /*16 bytes*/
-      TagLong = ((uint64_t)tag << 56) ^ ((uint64_t)tag << 48) ^
-                ((uint64_t)tag << 40) ^ ((uint64_t)tag << 32) ^
-                ((uint64_t)tag << 24) ^ ((uint64_t)tag << 16) ^
-                ((uint64_t)tag << 8) ^ (uint64_t)tag;
-      ShadowTagLong = *(uint64_t*)shadow_addr ;
-      if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong)))
+      TagLong = ((uint64_t)TagByte << 56) ^ ((uint64_t)TagByte << 48) ^
+                ((uint64_t)TagByte << 40) ^ ((uint64_t)TagByte << 32) ^
+                ((uint64_t)TagByte << 24) ^ ((uint64_t)TagByte << 16) ^
+                ((uint64_t)TagByte << 8) ^ (uint64_t)TagByte;
+      ShadowTagLong = *(uint64_t*)shadow_addr;
+      TagLong = TagLong & MaskTagLong;
+      ShadowTagLong = ShadowTagLong & MaskTagLong;
+      if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong)) &&
+          L_MISMATCH) {
+        VPrintf(0,
+                "[check-16B] Tag mismatch detected at address %p: ptr "
+                "tag=%016lx mem tag=%016lx, PL= %02x ML=%02x\n",
+                (void*)(p), TagLong, ShadowTagLong, ptr_L, mem_L);
         SigTrap<EA, AT, LogSize>(p);
+      }
+
       else {
-        ShadowTagLong = *(uint64_t*)(shadow_addr + 8) ;
-        if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong)))
+        ShadowTagLong = *(uint64_t*)(shadow_addr + 8);
+        ShadowTagLong = ShadowTagLong & MaskTagLong;
+        if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong) &&
+                     L_MISMATCH)) {
+          VPrintf(0,
+                  "[check-16B] Tag mismatch detected at address %p: ptr "
+                  "tag=%016lx mem tag=%016lx, PL= %02x ML=%02x\n",
+                  (void*)(p + 8), TagLong, ShadowTagLong, ptr_L, mem_L);
           SigTrap<EA, AT, LogSize>(p);
+        }
       }
       break;
   }
-  atomic_fetch_add(&total_checks, 1ULL, memory_order_relaxed);
-  if (atomic_load(&total_checks, memory_order_relaxed) == 0) {
-    // overflow detected
-    atomic_fetch_add(&overflows_on_total_checks, 1ULL, memory_order_relaxed);
-  }
+  // atomic_fetch_add(&total_checks, 1ULL, memory_order_relaxed);
+  // if (atomic_load(&total_checks, memory_order_relaxed) == 0) {
+  //   // overflow detected
+  //   atomic_fetch_add(&overflows_on_total_checks, 1ULL, memory_order_relaxed);
+  // }
 }
 
 }  // end namespace __hwasan

@@ -6462,7 +6462,8 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
   RValue Call;
   // FSAN MALLOC
   auto CalleeDecl = dyn_cast_or_null<FunctionDecl>(TargetDecl);
-  bool enabled = SanOpts.has(SanitizerKind::HWAddress);
+  bool enabled = SanOpts.has(SanitizerKind::FSanitizer) &&
+                 SanOpts.has(SanitizerKind::FSanitizerHeapInstrumentation);
   if (enabled && CalleeDecl && FSAN::isAllocFD(CalleeDecl)) {
     // NOTE: this is too early for figuring out the assignment as well, because
     // of how the parser works.

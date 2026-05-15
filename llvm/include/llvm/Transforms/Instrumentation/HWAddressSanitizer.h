@@ -76,18 +76,19 @@ class Module;
 class StringRef;
 class raw_ostream;
 #if defined(__x86_64__)
-  #define TAG_MAX 64 // x86 has 6 bits for tagging
+#define TAG_MAX 64 // x86 has 6 bits for tagging
 #elif defined(__aarch64__)
-  #define TAG_MAX 256
-#endif 
+#define TAG_MAX (1ULL << 5)
+// NOTE: we use some of the bits for tagging, the others for levels
+#endif
 
 struct HWAddressSanitizerOptions {
   HWAddressSanitizerOptions()
-      : HWAddressSanitizerOptions(false, false, false){};
+      : HWAddressSanitizerOptions(false, false, false) {};
   HWAddressSanitizerOptions(bool CompileKernel, bool Recover,
                             bool DisableOptimization)
       : CompileKernel(CompileKernel), Recover(Recover),
-        DisableOptimization(DisableOptimization){};
+        DisableOptimization(DisableOptimization) {};
   bool CompileKernel;
   bool Recover;
   bool DisableOptimization;
@@ -99,7 +100,7 @@ struct HWAddressSanitizerOptions {
 class HWAddressSanitizerPass : public PassInfoMixin<HWAddressSanitizerPass> {
 public:
   explicit HWAddressSanitizerPass(HWAddressSanitizerOptions Options)
-      : Options(Options){};
+      : Options(Options) {};
   LLVM_ABI PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
   static bool isRequired() { return true; }
   LLVM_ABI void
@@ -191,8 +192,13 @@ private:
     Value *MemTag = nullptr;
   };
 
-  // FieldArmor addenda
-  u_int64_t RPTag = 0x0LU;
+// FieldArmor addenda
+#if defined(__aarch64__)
+  u_int64_t RPTag = 0x1UL << 7;
+#else
+  u_int64_t RPTag = 0x1UL << 5;
+#endif
+
   void InstrumentGEP(GetElementPtrInst *GEPI);
   void InstrumentBOP(BinaryOperator *BOP);
   void processOperand(Instruction *BOP, Value *OP1, int idx);
@@ -259,9 +265,15 @@ private:
   Value *tagPointer(IRBuilder<> &IRB, Type *Ty, Value *PtrLong, Value *Tag);
   Value *untagPointer(IRBuilder<> &IRB, Value *PtrLong);
   Value *untagPointerIntrinsic(IRBuilder<> &IRB, Value *Ptr);
+  Value *tagPointerIntrinsic(IRBuilder<> &IRB, Value *UntaggedPtr, uint8_t Tag);
   bool instrumentStack(memtag::StackInfo &Info, const DominatorTree &DT,
                        const PostDominatorTree &PDT, const LoopInfo &LI,
                        const DataLayout &DL);
+  Value *extractLevelFromPointer(IRBuilder<> &IRB, Value *Ptr);
+  Value *zeroOutLevelBits(IRBuilder<> &IRB, Value *Ptr);
+  Value *AddOneModuloSomething(IRBuilder<> &IRB, Value *Addendum,
+                               uint64_t Mask);
+  Value *MaskFuckingPointer(IRBuilder<> &IRB, Value *Ptr, uint64_t Mask);
   bool instrumentLandingPads(SmallVectorImpl<Instruction *> &RetVec);
   Value *getNextTagWithCall(IRBuilder<> &IRB); // not sure I still need this
 
@@ -347,6 +359,11 @@ private:
   std::optional<uint8_t> MatchAllTag;
 
   unsigned PointerTagShift;
+  unsigned LevelShift;
+  uint64_t LevelMask;
+  unsigned TBits;
+  unsigned LBits;
+
   uint64_t TagMaskByte;
 
   Function *HwasanCtorFunction;

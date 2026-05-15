@@ -10,28 +10,27 @@
 /// This file is a part of HWAddressSanitizer, an address basic correctness
 /// checker based on tagged addressing.
 //===----------------------------------------------------------------------===//
+#include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
+#include "llvm/BinaryFormat/ELF.h"
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstIterator.h"
-// #include "llvm/Support/Casting.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Instrumentation/RuntimeTaggingSupport.hpp"
 #include <cstdint>
-#include <sys/types.h>
-// #include <cstdint>
-#define TRANS_CONSTANT 0x400000000000ULL // 1<<46, 0x400000000000
-#define OFFSET_MEM 0x1000ULL
-#include "llvm/BinaryFormat/ELF.h"
-#include "llvm/Demangle/Demangle.h"
-#include "llvm/Support/CommandLine.h"
-#include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
 #include <fstream>
 #include <set>
+#include <sys/types.h>
+
+#define TRANS_CONSTANT 0x400000000000ULL // 1<<46, 0x400000000000
+#define OFFSET_MEM 0x1000ULL
 
 static llvm::cl::opt<std::string> FilterFilePath(
     "hwasan-filter-file",
@@ -386,6 +385,11 @@ void HWAddressSanitizer::initializeModule() {
   }
 
   PointerTagShift = IsX86_64 ? 57 : 56;
+  TBits = IsX86_64 ? 3 : 5;
+  LBits = 2;
+  LevelMask = ((1UL << LBits) - 1);
+
+  LevelShift = IsX86_64 ? 3 : 5;
   TagMaskByte = IsX86_64 ? 0x3F : 0xFF;
   Mapping.init(TargetTriple, InstrumentWithCalls, CompileKernel);
 
@@ -396,7 +400,6 @@ void HWAddressSanitizer::initializeModule() {
   createHwasanCtorComdat(); // creates the routine ctor with a call into the
                             // runtime function __hwasan_init
 
-  // createTagVectors();
   if (ClFSAN_globals) {
     instrumentGlobals();
   }
@@ -653,11 +656,11 @@ void HWAddressSanitizer::untagPointerOperand(Instruction *I, Value *Addr) {
 Value *HWAddressSanitizer::memToShadow(Value *Mem, IRBuilder<> &IRB) {
   Value *XorVal =
       IRB.CreateXor(Mem, ConstantInt::get(IntptrTy, TRANS_CONSTANT));
-  
-  #if defined (__x86_64__)
+
+#if defined(__x86_64__)
   // OFFSET only applies to x86 builds
-    XorVal = IRB.CreateAdd(XorVal, ConstantInt::get(IntptrTy, OFFSET_MEM));
-  #endif
+  XorVal = IRB.CreateAdd(XorVal, ConstantInt::get(IntptrTy, OFFSET_MEM));
+#endif
 
   return IRB.CreateIntToPtr(XorVal, PtrTy);
 }
@@ -731,7 +734,7 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
   R.MemTag = nullptr;
   Value *TagMismatch = nullptr;
   uint64_t ExtendPattern = 0ULL;
-  LoadInst * LL; 
+  LoadInst *LL;
   // extend ptr tag
   switch (AccessSizeIndex) {
   case 0:
@@ -754,7 +757,7 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     LL = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
     LL->setVolatile(true);
     R.MemTag = LL;
-    TagMismatch = IRB.CreateICmpNE( R.PtrTag,R.MemTag);
+    TagMismatch = IRB.CreateICmpNE(R.PtrTag, R.MemTag);
     break;
   case 2:
     // errs() << "[FSAN] 4B access \n";
@@ -767,9 +770,10 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     LL = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
     LL->setVolatile(true);
     R.MemTag = LL;
-    TagMismatch = IRB.CreateICmpNE(
-        R.PtrTag,
-        R.MemTag); // for 4-byte access, only the lowest 4 bytes of the memory tag are relevant
+    TagMismatch =
+        IRB.CreateICmpNE(R.PtrTag,
+                         R.MemTag); // for 4-byte access, only the lowest 4
+                                    // bytes of the memory tag are relevant
     break;
   case 3:
     // errs() << "[FSAN] 8B access \n";
@@ -783,9 +787,10 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     LL = IRB.CreateLoad(R.PtrTag->getType(), Shadow); // always fetch 64B
     LL->setVolatile(true);
     R.MemTag = LL;
-    TagMismatch = IRB.CreateICmpNE(
-        R.PtrTag,
-        R.MemTag); // for 8-byte access, only the lowest 8 bytes of the memory tag are relevant
+    TagMismatch =
+        IRB.CreateICmpNE(R.PtrTag,
+                         R.MemTag); // for 8-byte access, only the lowest 8
+                                    // bytes of the memory tag are relevant
     break;
   case 4:
     // errs() << "[FSAN] 16B access \n";
@@ -803,12 +808,13 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
     LL->setVolatile(true);
     R.MemTag = LL;
     // APInt MaskPattern(128, "3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F", 16);
-    // R.MemTag = IRB.CreateAnd(R.MemTag, ConstantInt::get(Int128Ty, MaskPattern));
+    // R.MemTag = IRB.CreateAnd(R.MemTag, ConstantInt::get(Int128Ty,
+    // MaskPattern));
     TagMismatch = IRB.CreateICmpNE(R.PtrTag, R.MemTag);
     break;
   }
   assert(R.MemTag && "MemTag should have been set in the switch statement");
-  
+
   Value *MemoryIsTagged =
       IRB.CreateICmpNE(R.MemTag, ConstantInt::get(R.MemTag->getType(), 0x0UL));
   Value *PtrIsTagged =
@@ -1013,7 +1019,6 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
   return true;
 }
 
-
 void HWAddressSanitizer::untagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
                                      const DataLayout &DL) {
   /** Apply tag 0 to the previously tagged memory, immaterially of the type.
@@ -1032,12 +1037,9 @@ void HWAddressSanitizer::untagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
 void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
                                    const DataLayout &DL) {
   if (StructType *ST = dyn_cast<StructType>(AI->getAllocatedType())) {
-    auto *TagVector = RetrieveOrCreateTagVector(ST, M);
+    // force base depth = 0
+    auto *TagVector = RetrieveOrCreateTagVector(ST, M, /*depth=*/0);
     assert(TagVector && "Tag vector must exist here - tagAlloca");
-    // auto SizeWithPadding = DL.getTypeAllocSize(ST);
-    // errs() << "[FSAN-STACK] ALLOCA\n\t" << *AI << "\n\tST " << *ST << "\n\tSZ "
-    //        << SizeWithPadding << " FUNCTION "
-    //        << demangle(AI->getFunction()->getName()) << "\n";
     IRB.CreateCall(FSANTaggingFunc,
                    {IRB.CreatePointerCast(AI, PtrTy),
                     IRB.CreatePointerCast(TagVector, PtrTy),
@@ -1067,7 +1069,7 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
     //          << ", nElems " << nElems << "\n";
     // }
 
-    auto *TV = RetrieveOrCreateTagVector(ST, M);
+    auto *TV = RetrieveOrCreateTagVector(ST, M, depth);
     assert(TV && "Tag vector must exist here - tagAlloca");
 
     IRB.CreateCall(FSANTaggingFunc,
@@ -1129,9 +1131,9 @@ Value *HWAddressSanitizer::tagPointer(IRBuilder<> &IRB, Type *Ty,
 
   Value *TaggedPtrLong;
   Value *ShiftedTag = IRB.CreateShl(Tag, PointerTagShift);
-  ShiftedTag->setName("ShiftedTag");
+  // ShiftedTag->setName("ShiftedTag");
   TaggedPtrLong = IRB.CreateOr(PtrLong, ShiftedTag);
-  TaggedPtrLong->setName("TaggedPtrLong");
+  // TaggedPtrLong->setName("TaggedPtrLong");
   return IRB.CreateIntToPtr(TaggedPtrLong, Ty);
 }
 
@@ -1161,7 +1163,42 @@ inline Value *HWAddressSanitizer::untagPointerIntrinsic(IRBuilder<> &IRB,
               (MaskedPtr->getType()->getPointerAddressSpace() ==
                Ptr->getType()->getPointerAddressSpace());
   assert(cond && "PTRMASK FUCKED UP");
+  MaskedPtr->setName(Ptr->getName() + ".untagged");
   return MaskedPtr;
+}
+
+// 0xFFFFFFFFFFFFFFFF
+
+inline Value *
+HWAddressSanitizer::MaskFuckingPointer(IRBuilder<> &IRB, Value *Ptr,
+                                       uint64_t Mask = 0xFFFFFFFFFFFFFFFFULL) {
+
+  Type *PtrTy = Ptr->getType();
+  unsigned PtrBits = M.getDataLayout().getPointerTypeSizeInBits(PtrTy);
+  Type *MaskTy = IntegerType::get(M.getContext(), PtrBits);
+  Value *MaskVal = ConstantInt::get(MaskTy, Mask);
+  // SIGNATURE: declare ptrty llvm.ptrmask(ptrty %ptr, intty %mask) speculatable
+  // memory(none)
+  Function *PtrMask =
+      Intrinsic::getDeclaration(&M, Intrinsic::ptrmask, {PtrTy, MaskTy});
+  Value *MaskedPtr = IRB.CreateCall(PtrMask, {Ptr, MaskVal});
+  return MaskedPtr;
+}
+
+Value *HWAddressSanitizer::tagPointerIntrinsic(IRBuilder<> &IRB,
+                                               Value *UntaggedPtr,
+                                               uint8_t Tag) {
+
+  // Type *PtrTy = UntaggedPtr->getType();
+  // unsigned PtrBits = M.getDataLayout().getPointerTypeSizeInBits(PtrTy);
+  // Type *MaskTy = IntegerType::get(M.getContext(), PtrBits);
+  // Value *MaskVal = ConstantInt::get(MaskTy, (Tag << PointerTagShift)z
+  // bool cond = MaskedPtr->getType() == Ptr->getType() &&
+  //             (MaskedPtr->getType()->getPointerAddressSpace() ==
+  //              Ptr->getType()->getPointerAddressSpace());
+  // assert(cond && "PTRMASK FUCKED UP");
+  // return MaskedPtr;
+  return nullptr;
 }
 
 Value *HWAddressSanitizer::getHwasanThreadSlotPtr(IRBuilder<> &IRB) {
@@ -1246,18 +1283,37 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
       if (IsArray && TY->isStructTy()) {
         // multi-dim array of structs -> check if struct is safe
         StructType *ST = dyn_cast<StructType>(TY);
+        {
+          // NOTE: compound literal structs are annoying!
+          // H: try and catch them assuming they are accessed via GEPs on packed
+          // structs
+          // also SKIPPING UNNAMED STRUCT GEP INSTRUMENTATION should catch this
+          // pattern
+          for (auto U : AI->users()) {
+            if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
+
+              if (StructType *ST2 =
+                      dyn_cast<StructType>(GEP->getSourceElementType())) {
+                if (ST2->isPacked()) {
+                  errs() << "[FSAN] ALLOCA SKIP " << *AI
+                         << " COMPOUND LITERAL: " << *GEP << "\n";
+                  continue;
+                }
+              }
+            }
+          }
+        }
         if (ST->isLiteral()) {
           continue;
         }
         if (ST->getName().str().find("union.") == 0) {
           continue;
         }
-        if(ST->getName().str().empty()) {
+        if (ST->getName().str().empty()) {
           errs() << "[FSAN] ALLOCA SKIP " << *AI << "\n";
           continue;
         }
-      }
-      else if(allocatedType->isStructTy()) {
+      } else if (allocatedType->isStructTy()) {
         StructType *ST = dyn_cast<StructType>(allocatedType);
         if (ST->isLiteral()) {
           continue;
@@ -1265,7 +1321,7 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
         if (ST->getName().str().find("union.") == 0) {
           continue;
         }
-        if(ST->getName().str().empty()) {
+        if (ST->getName().str().empty()) {
           errs() << "[FSAN] ALLOCA SKIP " << *AI << "\n";
           continue;
         }
@@ -1273,6 +1329,7 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     } // cast AI
     else
       assert(false && "Allocas must be AllocaInsts");
+
     IRBuilder<> IRB(AI->getNextNonDebugInstruction());
     // NOTE: since root pointers are not tagged, no need for replacing the
     // pointer to the alloca with a tagged version.
@@ -1289,17 +1346,26 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     llvm::for_each(Info.LifetimeEnd, HandleLifetime);
 
     // could be a struct or an array of structs. No unions, no literals
-    tagAlloca(IRB, AI, DL);
+
     if (ClFSAN_verbose) {
-      errs() << "[FSAN-STACK] ALLOCA #" << N << "\n\t" << *AI
-             << "\n\tSZ " << Size << " B\n\tFN "
-             << demangle(AI->getFunction()->getName()) << "\n";
+      errs() << "[FSAN-STACK] ALLOCA #" << N << "\n\t" << *AI << "\n\tSZ "
+             << Size << " B\n\tFN " << demangle(AI->getFunction()->getName())
+             << "\n";
+      auto *Type = AI->getAllocatedType();
     }
-    // AI->replaceUsesWithIf(Replacement, [AICast, AILong](const Use &U) {
-    //   auto *User = U.getUser();
-    //   return User != AILong && User != AICast &&
-    //   !isa<LifetimeIntrinsic>(User);
-    // });
+
+    // ALL ALLOCAS PTRS are tagged when they're an aggregate
+    auto *AILong = IRB.CreatePtrToInt(AI, IntptrTy);
+    auto *TaggedAlloca = tagPointer(IRB, AI->getType(), AILong,
+                                    ConstantInt::get(IntptrTy, RPTag));
+    TaggedAlloca->setName(AI->getName() + ".tagged");
+
+    AI->replaceUsesWithIf(TaggedAlloca, [AICast, AILong](const Use &U) {
+      auto *User = U.getUser();
+      return User != AILong && User != AICast && !isa<LifetimeIntrinsic>(User);
+    });
+
+    tagAlloca(IRB, AI, DL);
 
     auto TagEnd = [&](Instruction *Node) {
       IRB.SetInsertPoint(Node);
@@ -1315,7 +1381,8 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     for (auto &II : Info.LifetimeEnd)
       II->eraseFromParent();
     // TODO: check if this is good or bad for performance
-    // NOTE: I think it's legacy code + some stuff strictly necessary for NON 1-to-1 shadow memory schemas
+    // NOTE: I think it's legacy code + some stuff strictly necessary for NON
+    // 1-to-1 shadow memory schemas
     memtag::alignAndPadAlloca(Info, Mapping.getObjectAlignment());
 
     memtag::annotateDebugRecords(Info, retagMask(N));
@@ -1358,6 +1425,12 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   if (F.empty())
     return;
+  bool isCppConstructor = F.getName().str().find("C2E") != std::string::npos ||
+                          F.getName().str().find("C1E") != std::string::npos;
+  if (isCppConstructor) {
+    errs() << "[FSAN] Skipping C++ constructor: " << F.getName() << "\n";
+    return;
+  }
   NumTotalFuncs++;
   OptimizationRemarkEmitter &ORE =
       FAM.getResult<OptimizationRemarkEmitterAnalysis>(F);
@@ -1511,7 +1584,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
         instrumentMemAccess(Operand, DTU, LI, DL); // KNOB
     DTU.flush(); // TODO: does this have an interplay with optimizations?
   }
-  
+
   ShadowBase = nullptr;
 }
 
@@ -1589,10 +1662,55 @@ bool isArrayOfAggregates(llvm::Type *T) {
   return T->isAggregateType();
 }
 
+// returns int value
+Value *HWAddressSanitizer::extractLevelFromPointer(IRBuilder<> &IRB,
+                                                   Value *Ptr) {
+  // Extract the tag from the pointer using llvm.ptrmask with a mask that
+  // isolates the LEVEL bits in the tag.
+  Type *PtrTy = Ptr->getType();
+  unsigned PtrBits = M.getDataLayout().getPointerTypeSizeInBits(PtrTy);
+  Type *MaskTy = IntegerType::get(M.getContext(), PtrBits);
+  uint64_t PtrMaskForLevel = LevelMask << (PointerTagShift + TBits);
+  Value *MaskVal = ConstantInt::get(
+      MaskTy, PtrMaskForLevel); // preserve L bits, not even R, still shifted
+  Function *PtrMaskFcn =
+      Intrinsic::getDeclaration(&M, Intrinsic::ptrmask, {PtrTy, MaskTy});
+  Value *LevelShifted = IRB.CreateCall(PtrMaskFcn, {Ptr, MaskVal});
+  Value *LevelShiftedInt = IRB.CreatePtrToInt(LevelShifted, IntptrTy);
+  Value *Level = IRB.CreateLShr(LevelShiftedInt, PointerTagShift + TBits);
+  Level->setName("Level");
+  return Level;
+}
+
+Value *HWAddressSanitizer::zeroOutLevelBits(IRBuilder<> &IRB, Value *Ptr) {
+  // ZERO level bits
+  Type *PtrTy = Ptr->getType();
+  unsigned PtrBits = M.getDataLayout().getPointerTypeSizeInBits(PtrTy);
+  Type *MaskTy = IntegerType::get(M.getContext(), PtrBits);
+  uint64_t PtrMaskForLevel = LevelMask << (PointerTagShift + TBits);
+  Value *MaskVal = ConstantInt::get(
+      MaskTy, ~PtrMaskForLevel); // preserve L bits, not even R, still shifted
+  Function *PtrMaskFcn =
+      Intrinsic::getDeclaration(&M, Intrinsic::ptrmask, {PtrTy, MaskTy});
+  Value *PointerWithNoLevel = IRB.CreateCall(PtrMaskFcn, {Ptr, MaskVal});
+  return PointerWithNoLevel;
+}
+
+Value *HWAddressSanitizer::AddOneModuloSomething(IRBuilder<> &IRB,
+                                                 Value *Addendum,
+                                                 uint64_t Mask) {
+  Value *PlusOne =
+      IRB.CreateAdd(Addendum, ConstantInt::get(Addendum->getType(), 1));
+  PlusOne = IRB.CreateAnd(PlusOne, ConstantInt::get(PlusOne->getType(),
+                                                    LevelMask)); // % LEVEL MAX
+  return PlusOne;
+}
+
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   auto nOperands = GEPI->getNumOperands();
   Value *sonTag = nullptr;
-  Value *sonIdx = nullptr;  
+  Value *sonIdx = nullptr;
+
   bool guard = false;
   assert(nOperands <= 3);
   auto fatherType = GEPI->getSourceElementType();
@@ -1606,80 +1724,124 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
               "skipping instrumentation for this GEP: ";
     GEPI->print(errs());
     errs() << "\n";
+    // TODO: implement blocklisting properly
     return;
   }
 
   IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
+  // errs() << "[FSAN] INSTRUMENTING GEP: " << *GEPI << "\n";
+  // errs () << "\tFATHER TYPE: " << *fatherType << "\n";
+  // errs() << "\tSON TYPE: " << *sonType << "\n";
 
   Value *resultLong = IRB.CreatePointerCast(GEPI, IntptrTy);
   std::string endResultName = "";
   Value *taggedPointer = nullptr;
   bool isScalar = false;
-  bool setMetadata = true;
+
+  Value *FatherLevel = nullptr;
+  FatherLevel = extractLevelFromPointer(IRB, GEPI->getOperand(0));
 
   if (fatherType->isArrayTy()) {
+    // R1: if returning pointer to aggregate L=L+1. If aggregate is struct, also
+    // set R.
+    auto GEPNAME = GEPI->hasName() ? GEPI->getName().str()
+                                   : "gep." + itostr(NumInstrumentedGEPs);
+
     if (sonType->isAggregateType()) { /** GEP into array of aggregates */
       // NOTE: this should trigger whenever gepping into array of structs, and
-      // array of arrays
-      Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
-      taggedPointer = untaggedResult;
-      endResultName = gepName + ".fsan.array.struct";
-    } // GEP into array of non-literal structs
-    // else LEAVE THE PTR TAGGED!
+      // array of arrays etc.
 
+      // LEVEL is always increcemented
+      // R always set when aggregate or aggregate of aggregates
+
+      bool isArray = sonType->isArrayTy();
+      auto Operand = GEPI->getPointerOperand();
+      bool SrcIsDecay =
+          Operand->getName().find("arraydecay") != std::string::npos;
+      bool DstIsStruct = sonType->isStructTy();
+      Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
+      Value *Tag = nullptr;
+      // EXAMPLE of decay add
+      // %add.ptr.i = getelementptr inbounds nuw %struct.pix_pos, ptr
+      // %arraydecay.fsan.array, i64 1, !dbg !9444 bool isDecayAdd =
+      // GEPI->getName().str().find("add.ptr") != std::string::npos;
+      // errs() << "GEP NAME: " << GEPI->getName() << "\n";
+      // errs() << *GEPI << "\n";
+      if (GEPNAME.find("arraydecay") != std::string::npos) {
+        if (ClFSAN_verbose) {
+          errs() << "ARRAY DECAY GEP: ";
+          GEPI->print(errs());
+          errs() << "\n";
+        }
+        Tag = AddOneModuloSomething(IRB, FatherLevel, LevelMask);
+      } else {
+        Tag = AddOneModuloSomething(IRB, FatherLevel, LevelMask);
+      }
+
+      Tag = IRB.CreateShl(Tag, TBits);                            // ADJ L
+      Tag = IRB.CreateOr(Tag, ConstantInt::get(IntptrTy, RPTag)); // set R
+      endResultName = gepName + ".fsan.array";
+      taggedPointer =
+          tagPointer(IRB, GEPI->getType(),
+                     IRB.CreatePtrToInt(untaggedResult, IntptrTy), Tag);
+
+    } // GEP into array of non-literal structs
+    // else ?
   } // GEP from array type
+
   else { /** father is not array */
     if (fatherType->isStructTy()) {
       StructType *ST = dyn_cast<StructType>(fatherType);
       bool tag = true;
 
       if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
-        // LIMIT THE IMPACT OF TYPE COERCION, remove some FPs
         tag = false;
+        GEPI->setMetadata("fsan_skip_gep", MDNode::get(M.getContext(), {}));
       }
 
       if (ST && ST->hasName() && ST->getName().str().find("union.") == 0) {
         tag = false;
+        GEPI->setMetadata("fsan_skip_gep", MDNode::get(M.getContext(), {}));
       }
 
-      if (ST && ST->hasName()) {
-        auto demangledName = demangle(ST->getName().str());
-        for (auto &pattern : FilterSet) {
-          if (demangledName.find(pattern) != std::string::npos) {
-            errs() << "[FSAN] GEP BLOCK: " << pattern << ", GEP: ";
-            GEPI->print(errs());
-            errs() << "\n";
-            tag = false;
-            break;
-          }
-        }
-      }
+      // if (ST && ST->hasName()) {
+      //   auto demangledName = demangle(ST->getName().str());
+      //   for (auto &pattern : FilterSet) {
+      //     // TODO: finish this
+      //     if (demangledName.find(pattern) != std::string::npos) {
+      //       errs() << "[FSAN] GEP BLOCK: " << pattern << ", GEP: ";
+      //       GEPI->print(errs());
+      //       errs() << "\n";
+      //       tag = false;
+      //       break;
+      //     }
+      //   }
+      // }
 
       // GEPs on anon structs might be a symptom of type coercion, which is a
       // common source of FPs
-      if (ST && ST->hasName()) {
-        auto demangledName = demangle(ST->getName().str());
-        if ((demangledName.find("class.anon") != std::string::npos) ||
-            (demangledName.find("struct.anon") != std::string::npos)) {
-          tag = false;
-        }
-      }
-
-      // TESSERACT: blocklist GEPs to vtables using tagged pointers
-      // JSON : blocklisting all GEPs to iterators to prevent FPs
+      // if (ST && ST->hasName()) {
+      //   auto demangledName = demangle(ST->getName().str());
+      //   if ((demangledName.find("class.anon") != std::string::npos) ||
+      //       (demangledName.find("struct.anon") != std::string::npos)) {
+      //     errs() << "[FSAN] GEP BLOCK: anon struct, GEP: ";
+      //     GEPI->print(errs());
+      //     errs() << "\n";
+      //     tag = false;
+      //   }
+      // }
 
       sonTag = nullptr;
       auto sonIsScalar = !sonType->isStructTy() && !sonType->isVectorTy();
 
       bool sonIsArrayOfAggregates = isArrayOfAggregates(sonType);
       if (sonIsScalar && !sonIsArrayOfAggregates && tag) {
-        guard = true;
-        uint16_t idx = 0;
-        // GEP struct -> scalar
+        // guard = true;
+        uint64_t idx = -1;
         auto op2 = GEPI->getOperand(2);
 
         if (ConstantInt *CI = dyn_cast<ConstantInt>(op2)) {
-          idx = (uint16_t) CI->getZExtValue();
+          idx = (uint64_t)CI->getZExtValue();
           if (idx == (TAG_MAX - 1)) {
             idx = 0;
           }
@@ -1691,53 +1853,89 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
                  "Non-constant GEP index not supported in struct GEPs for now");
         }
 
-        Value *untaggedResLong = untagPointer(IRB, resultLong);
+        Value *untaggedResLong = untagPointerIntrinsic(IRB, GEPI);
+        untaggedResLong = IRB.CreatePtrToInt(untaggedResLong, IntptrTy);
+        FatherLevel = IRB.CreateShl(FatherLevel, TBits); // adj L bits
+        sonTag = IRB.CreateOr(sonTag, FatherLevel);
         taggedPointer =
             tagPointer(IRB, GEPI->getType(), untaggedResLong, sonTag);
         endResultName = gepName + ".fsan.scalar";
         isScalar = true;
       } // GEP struct -> scalar
-      else {
-        // NOTE: ignoring here opens up to FPs if the original pointer was
-        // tagged for whatever reason.
-        // NOTE: when NOT instrumenting memory accesses, one of the benchmarks
-        // segfaults. It's either full of BS and UB, or something is unsafe,
-        // but only in that specific case. No worries if running with mem ops
-        // instrumented.
-        if (sonType->isStructTy()) {
+      else if (!tag) {
+        // TODO
+      } else {
+        if (sonType->isAggregateType()) {
+          /** GEP: struct -> aggregate */
+          // L = L + 1
+          // set R
           Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
-          taggedPointer = untaggedResult;
-          endResultName = gepName + ".fsan.struct";
-        } // son is a struct
-        else if (sonIsArrayOfAggregates) {
-          // NOTE: this creates FNs if filtering out too much.
-          Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
-          taggedPointer = untaggedResult;
-          endResultName = gepName + ".fsan.array.struct";
-        } // son is array of aggregates
+          Value *Tag = nullptr;
+          bool isDecayAdd =
+              GEPI->getName().str().find("add.ptr") != std::string::npos;
+          bool IsArrayIdx =
+              GEPI->hasName() &&
+              GEPI->getName().str().find("arrayidx") != std::string::npos;
+          if (isDecayAdd || IsArrayIdx) {
+            if (ClFSAN_verbose) {
+              errs() << "ARRAY DECAY + STRUCT GEP: ";
+              GEPI->print(errs());
+              errs() << "\n";
+            }
+
+            Tag = FatherLevel;
+          }
+
+          else {
+            Tag =
+                AddOneModuloSomething(IRB, FatherLevel, LevelMask); // L = L + 1
+          }
+
+          Tag = IRB.CreateShl(Tag, TBits);
+          Tag = IRB.CreateOr(Tag, ConstantInt::get(IntptrTy, RPTag)); // set R
+          taggedPointer =
+              tagPointer(IRB, GEPI->getType(),
+                         IRB.CreatePtrToInt(untaggedResult, IntptrTy), Tag);
+          endResultName = gepName + ".fsan.aggregate";
+        }
       } // else - son is not scalar
 
     } // FATHER IS STRUCT
     else {
-      // GEP type might be i8, i32, ptr etc.
-      // NOTE: in these cases, we choose not to tag
-      // NOTE: something fishy happens with vtables
-      // errs() << "[FSAN] SKIPPING : GEP from UNK TYPE: ";
-      // GEPI->print(errs());
-      // errs() << "\n";
+      if (ClFSAN_verbose) {
+        errs() << "[FSAN] OTHER GEP " << "\n\tGEP: ";
+        GEPI->print(errs());
+        errs() << "\n\tSRC: ";
+        errs() << *(GEPI->getOperand(0)) << "\n";
+        errs() << "\n\tSRC TYPE: ";
+        GEPI->getSourceElementType()->print(errs());
+        errs() << "\n\tDST TYPE: ";
+        GEPI->getResultElementType()->print(errs());
+        errs() << "\n";
+        // EXAMPLE getelementptr inbounds i8, ptr %ins.tagged, i64 %vbase.offset
+        auto IdxOperand = GEPI->getOperand(1);
+        auto NameIdxOperand =
+            IdxOperand->hasName() ? IdxOperand->getName().str() : "";
+        if (NameIdxOperand.find("vbase.offset") != std::string::npos) {
+          errs() << "\t\tGEP ON BASE OF VIRTUAL INHERITANCE\n";
+          errs() << "NAME OF IDX OPERAND: " << NameIdxOperand << "\n";
+          // TODO: how do I figure out nesting level??
+        }
+      }
+
       return;
     }
   } // else - father is not an array
 
-  if (!taggedPointer)
+  if (!taggedPointer) {
+    // errs() << "[FSAN] WARNING: tagged pointer unset ";
+    // GEPI->print(errs());
+    // errs() << "\n";
     return; // TODO: handle corner cases
+  }
+  taggedPointer = MaskFuckingPointer(IRB, taggedPointer);
 
   taggedPointer->setName(endResultName);
-  auto *MD_node =
-      MDNode::get(*C, ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 1)));
-  // if (setMetadata)
-  //   dyn_cast<Instruction>(taggedPointer)
-  //       ->setMetadata("fsan.instrument", MD_node);
 
   GEPI->replaceUsesWithIf(taggedPointer, [resultLong, GEPI, isScalar,
                                           sonType](const Use &U) {
@@ -2038,9 +2236,9 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   }
 
   // if (depth > 0) {
-  //   errs() << "[FSAN] TAG GV: " << GV->getName() << ", TY: " << *GVType << "\n";
-  //   errs() << "\t * " << depth << "-D array of structs" << "\n";
-  //   errs() << "\t * Number of elements: " << nElems << "\n";
+  //   errs() << "[FSAN] TAG GV: " << GV->getName() << ", TY: " << *GVType <<
+  //   "\n"; errs() << "\t * " << depth << "-D array of structs" << "\n"; errs()
+  //   << "\t * Number of elements: " << nElems << "\n";
   // }
 
   // END of type check
@@ -2093,11 +2291,10 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
                 DescriptorPos)), // NOTE: when descriptor pos is 0, omitted
         Int32Ty);
 
-
     assert(STType &&
            "Struct type must be valid to instrument global variable.");
     GlobalVariable *TagVector =
-        dyn_cast<GlobalVariable>(RetrieveOrCreateTagVector(STType, M));
+        dyn_cast<GlobalVariable>(RetrieveOrCreateTagVector(STType, M, depth));
     assert(TagVector &&
            "Tag vector global must exist and be properly initialized.");
     auto *TVRelPtr = ConstantExpr::getTrunc(
@@ -2118,13 +2315,11 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     // Descriptor->setAlignment(Align(16)); // doesnt really matter
     appendToCompilerUsed(M, Descriptor);
   }
+  uint8_t Tag = 0;
+  bool isArray = depth > 0;
+  if (!isArray)
+    Tag = RPTag;
 
-  uint8_t Tag = RPTag; // global tags must be handled carefully, the linker does
-                       // not know how to relocate it if the MSB is set!!!
-  // in the asm, this gets evaluated to 2^^32. The linker, subsequently,
-  // does the relocation magic and replaces that with something else like
-  // the thing down here
-  // uint8_t Tag = 0b00000001;
   Constant *Aliasee = ConstantExpr::getIntToPtr(
       ConstantExpr::getAdd(
           ConstantExpr::getPtrToInt(NewGV, Int64Ty),
@@ -2297,17 +2492,5 @@ void HWAddressSanitizer::ShadowMapping::init(Triple &TargetTriple,
       !(ClMappingOffsetDynamic.getNumOccurrences() > 0 &&
         ClMappingOffsetDynamic.getPosition() > ClMappingOffset.getPosition())) {
     SetFixed(ClMappingOffset);
-  }
-}
-
-void HWAddressSanitizer::createTagVectors() {
-  // TODO: move to lazy init!!!
-  auto StructTypes = M.getIdentifiedStructTypes();
-  for (auto *T : StructTypes) {
-    StructType *ST = dyn_cast<StructType>(T);
-    if (!ST->isSized()) {
-      continue;
-    }
-    createTagVector(T, M);
   }
 }

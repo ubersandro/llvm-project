@@ -17,15 +17,20 @@ static cl::opt<std::string> clFSAN_BLOCKLIST_TAG_FILEPATH(
 
 namespace RuntimeTaggingSupport {
 #if defined(__x86_64__)
-  #define TAG_MAX 64
-#else 
-  #define TAG_MAX 256
+uint64_t TBits = 3;
+#define MAX_T (1 << TBits)
+#else
+uint64_t TBits = 5;
+uint64_t LBits = 2;
+uint64_t MAX_LEVEL = (1 << LBits);
+uint64_t MAX_T = (1 << TBits); // 0b100000
 #endif
 
-__attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
+__attribute__((noinline)) void createTagVector(StructType *ST, Module &M,
+                                               int depth) {
   auto *Int8Ty = Type::getInt8Ty(M.getContext());
 
-  std::string TagVecName = ST->getStructName().str() + ".fieldarmor.tagvec";
+  std::string TagVecName = ST->getStructName().str() + ".fieldarmor.tagvec.depth" + std::to_string(depth);
   auto *TagVec = M.getGlobalVariable(TagVecName, true);
   if (TagVec)
     return;
@@ -51,10 +56,6 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
       std::string Line;
       while (std::getline(BlocklistFile, Line)) {
         // NOTE: we want to match struct.sockaddr, but not struct.sockaddr_in
-        // errs() << "[FSAN - TAG] N: " << demangledTypeName << " VS: " << Line
-        // << "\n";
-        auto LenLine = Line.length();
-        auto LenType = demangledTypeName.length();
         bool containsAsterisk = Line.find('*') != std::string::npos;
         if (containsAsterisk) {
           // if the line contains an asterisk, we check if the demangled type
@@ -67,17 +68,11 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
               std::string::npos) {
             Tags = new u_int8_t[Size];
             memset(Tags, (unsigned char)0x00, Size);
-            errs() << "N:" << demangledTypeName << " VS:" << Line << "\n";
-            errs() << "[FSAN - TAG] NULL TAG ON STRUCT " << *ST
-                   << " (blocklisted by pattern: " << Line << ")\n";
             break;
           }
         } else if (demangledTypeName.find(Line) == 0) {
           Tags = new u_int8_t[Size];
           memset(Tags, (unsigned char)0x00, Size);
-          errs() << "N:" << demangledTypeName << " VS:" << Line << "\n";
-          errs() << "[FSAN - TAG] NULL TAG ON STRUCT " << *ST
-                 << " (blocklisted by pattern: " << Line << ")\n";
           break;
         }
       }
@@ -86,7 +81,7 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
 
   // if at the end of the checks, no Tags, then compute
   if (!Tags)
-    Tags = ComputeTags(ST, M);
+    Tags = ComputeTags(ST, M, depth);
 
   assert(Tags && "Tags array must be valid after computation.");
 
@@ -105,19 +100,23 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M) {
   appendToCompilerUsed(M, NewlyCreatedTVGV);
 }
 
-__attribute__((noinline)) Value *RetrieveOrCreateTagVector(StructType *ST,
-                                                           Module &M) {
-  auto *TagVector = M.getGlobalVariable(
-      ST->getStructName().str() + ".fieldarmor.tagvec", true);
+__attribute__((noinline)) Value *
+RetrieveOrCreateTagVector(StructType *ST, Module &M, int depth) {
+  // base sol 1: 1 tag vec for each level of nesting of a structure
+  auto TagVecName = ST->getStructName().str() + ".fieldarmor.tagvec.depth" +
+                    std::to_string(depth);
+
+  auto *TagVector = M.getGlobalVariable(TagVecName, true);
   if (!TagVector) {
-    createTagVector(ST, M);
+    createTagVector(ST, M, depth);
     TagVector = M.getGlobalVariable(
-        ST->getStructName().str() + ".fieldarmor.tagvec", true);
+        TagVecName, true);
   }
   return TagVector;
 }
 
-__attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
+__attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
+                                                int depth) {
   // TODO: remove the 0 tag from everywhere else
   DataLayout DL = M.getDataLayout();
   u_int8_t *Tags = new u_int8_t[DL.getTypeAllocSize(Ty)];
@@ -131,8 +130,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
   auto FieldsOffsets = DL.getStructLayout(Ty)->getMemberOffsets();
 
   uint8_t fatherT = 0;
-  uint8_t fatherL = 0;
-  uint16_t sonIdx = 1;
+  uint8_t fatherL = depth & (MAX_LEVEL - 1); // modulo MAX_LEVEL --> level-aware
+  uint32_t sonIdx = 1;
   // NOTE: 2^^16 max number of fields
   if (FieldsOffsets.size() >= (1 << 16) - 1) {
     /** Too many fields :( */
@@ -163,7 +162,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
     auto CurFieldIsUnion = CurFieldStructType && !CurFieldIsLiteral &&
                            (CurFieldStructType->getName().find("union.") == 0);
 
-    if (CurFieldStructType && !CurFieldIsLiteral && !CurFieldIsUnion) {
+    if (CurFieldStructType != nullptr && !CurFieldIsLiteral &&
+        !CurFieldIsUnion) {
       uint8_t Count = 0;
       auto ContainedSubTypes = CurFieldType->getNumContainedTypes();
 
@@ -171,22 +171,23 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
           DL.getStructLayout(cast<StructType>(CurFieldType))
               ->getMemberOffsets();
       size_t CurContainedSubTy = 0;
+      auto NextL = (fatherL + 1) & (MAX_LEVEL - 1); // modulo MAX_LEVEL
 
       for (Type *SSty : llvm::reverse(CurFieldType->subtypes())) {
         CurContainedSubTy =
             ContainedSubTyOffsets[ContainedSubTypes - Count - 1] +
             CurFieldOffset;
-        AggQueue.push_front(std::make_tuple(SSty, 0, (fatherL + 1) % 4,
-                                            ContainedSubTypes - Count,
-                                            CurContainedSubTy));
+        AggQueue.push_front(std::make_tuple(
+            SSty, 0, NextL, ContainedSubTypes - Count, CurContainedSubTy));
         Count++;
       } // for subtype
     } // if son struct
 
     else if (CurFieldType->isArrayTy()) {
-      // NOTE: depth 4 is arbitrary
+      // NOTE: depth 12 is arbitrary
       const int MaxDepth = 12;
-      int CurDepth = 1;
+      int CurDepth = 1; // structs are always one level deeper wrt to the array
+                        // they belong to
 
       auto *CurArrayType = dyn_cast<ArrayType>(CurFieldType);
       u_int64_t Elements = CurArrayType->getNumElements();
@@ -198,7 +199,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
         Elements *= CurArrayType->getNumElements();
         CurDepth++;
       }
-
+      auto OverallDepth =
+          (CurDepth + 1 + fatherL) & (MAX_LEVEL - 1); // modulo MAX_LEVEL
       // check type
       if (ElemType->isStructTy()) {
         // retrieve or create tag vector for struct type
@@ -219,6 +221,9 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
             assert(ElemTag &&
                    "Element tag must be a constant integer in the tag vector.");
             auto ElemTagValue = ElemTag->getZExtValue();
+            // ADJUST LEVEL TO NEW NESTING SITUATION
+            ElemTagValue &= (MAX_T - 1); // modulo MAX_T
+            ElemTagValue |= (OverallDepth << TBits);
             assert(ElemTagValue <= 0xff &&
                    "Element tag value must fit in a byte.");
             Tags[ElemOffset + H] = static_cast<uint8_t>(ElemTagValue);
@@ -228,10 +233,11 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
       } else {
         // scalar arrays get the same tag
         // NOTE: this case catches arrays with depth > MAX_DEPTH as well
-        uint8_t Tag = (sonIdx) % TAG_MAX; //  | (fatherL << 4);
+        uint8_t Tag = (sonIdx) & (MAX_T - 1); // modulo MAX_T
         if (Tag == 0) {
           Tag = 1;
         }
+        Tag |= (fatherL << TBits);
         size_t ArraySize = DL.getTypeAllocSize(CurFieldType);
 
         memset(&Tags[CurFieldOffset], Tag, ArraySize);
@@ -248,7 +254,6 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
           // NOTE: the field might overlap with compiler-inserted padding
           // TODO:double check that this makes sense in STD
           if (ArrayFieldElems == 0 || !clFSAN_FAM) {
-            errs() << "[FSAN - TAG] FLEX MEMBER IN " << *Ty << "\n";
             auto RemainderBytes = DL.getTypeAllocSize(Ty) - CurFieldOffset;
             if (clFSAN_FAM)
               memset(&Tags[CurFieldOffset], 0x00, RemainderBytes);
@@ -266,12 +271,12 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M) {
         memset(&Tags[CurFieldOffset], 0x00, DL.getTypeAllocSize(CurFieldType));
       } else {
         // scalar field
-        uint8_t CurFieldT = (sonIdx) % TAG_MAX;
+        uint8_t CurFieldT = sonIdx & (MAX_T - 1); // modulo MAX_T
         if (CurFieldT == 0) {
-          CurFieldT = 1; // avoid 0 tag for scalar fields, which is the
-                         // default tag for padding and unions/literal structs
+          CurFieldT = 1U; // avoid 0 tag for scalar fields, which is the
+                          // default tag for padding and unions/literal structs
         }
-        uint8_t CurFieldTag = CurFieldT; // | (fatherL << 4);
+        uint8_t CurFieldTag = CurFieldT | (fatherL << TBits);
         int CurFieldSize = DL.getTypeAllocSize(CurFieldType);
         memset(&Tags[CurFieldOffset], CurFieldTag, CurFieldSize);
       }

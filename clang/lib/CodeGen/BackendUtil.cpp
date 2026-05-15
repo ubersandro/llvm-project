@@ -67,6 +67,7 @@
 #include "llvm/Transforms/Instrumentation/BoundsChecking.h"
 #include "llvm/Transforms/Instrumentation/DataFlowSanitizer.h"
 #include "llvm/Transforms/Instrumentation/FSanRewriteFunctionCalls.h"
+#include "llvm/Transforms/Instrumentation/RewritePtrSubtractions.h"
 #include "llvm/Transforms/Instrumentation/GCOVProfiler.h"
 #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
 #include "llvm/Transforms/Instrumentation/InstrProfiling.h"
@@ -1117,6 +1118,11 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     if (LangOpts.Sanitize.has(SanitizerKind::HWAddress)) {
       MPM.addPass(FSanRewriteFunctionCallsPass());
     }
+    
+    // untag pointers in ptr subtractions
+    if (LangOpts.Sanitize.has(SanitizerKind::FSanitizer)) {
+      MPM.addPass(RewritePtrSubtractionsPass());
+    }
 
     if (CodeGenOpts.FatLTO) {
       MPM.addPass(PB.buildFatLTODefaultPipeline(
@@ -1207,7 +1213,6 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
   //   // errs() << "Adding HWAddressSanitizer rewrite pass\n";
   //   MPM.addPass(FSanRewriteFunctionCallsPass());
   // }
-  
 
   // Now that we have all of the passes ready, run them.
   {
