@@ -34,8 +34,14 @@
 #  define HWASAN_WITH_INTERCEPTORS 1
 #endif
 
+#if defined(__aarch64__)
+#  define BITS 7
+#else
+#  define BITS 5
+#endif
+
 #ifndef RPTag
-#  define RPTag 0x0Lu
+#  define RPTag (1ULL << BITS)
 #endif
 
 #ifndef HWASAN_REPLACE_OPERATORS_NEW_AND_DELETE

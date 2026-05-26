@@ -162,17 +162,15 @@ static cl::opt<bool> ClFSAN_PtrTagging("fsan-instrument-ptr-tagging",
 static cl::opt<bool>
     ClFSAN_GEP("fsan-instrument-geps",
                cl::desc("instrument getelementptr instructions"), cl::Hidden,
-               cl::init(ClFSAN_PtrTagging.getNumOccurrences() > 0));
+               cl::init(true));
 
-static cl::opt<bool>
-    ClFSAN_BOP("fsan-instrument-bops",
-               cl::desc("instrument binary op instructions"), cl::Hidden,
-               cl::init(ClFSAN_PtrTagging.getNumOccurrences() > 0));
+static cl::opt<bool> ClFSAN_BOP("fsan-instrument-bops",
+                                cl::desc("instrument binary op instructions"),
+                                cl::Hidden, cl::init(true));
 
-static cl::opt<bool>
-    ClFSAN_CMP("fsan-instrument-cmp",
-               cl::desc("instrument compare instructions"), cl::Hidden,
-               cl::init(ClFSAN_PtrTagging.getNumOccurrences() > 0));
+static cl::opt<bool> ClFSAN_CMP("fsan-instrument-cmp",
+                                cl::desc("instrument compare instructions"),
+                                cl::Hidden, cl::init(true));
 
 using namespace OffsetPorcodidio;
 static cl::opt<OffsetKind> ClMappingOffsetDynamic(
@@ -1358,6 +1356,7 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
 
     // ALL ALLOCAS PTRS are tagged when they're an aggregate
     auto *AILong = IRB.CreatePtrToInt(AI, IntptrTy);
+    // LEVEL 0, T 0, R is set
     auto *TaggedAlloca = tagPointer(IRB, AI->getType(), AILong,
                                     ConstantInt::get(IntptrTy, RPTag));
     TaggedAlloca->setName(AI->getName() + ".tagged");
@@ -1410,6 +1409,15 @@ static void emitRemark(const Function &F, OptimizationRemarkEmitter &ORE,
     });
   }
 }
+bool isCallToBuiltinFunction(Instruction *Inst) {
+  if (auto *CI = dyn_cast<CallBase>(Inst)) {
+    if (Function *Callee = CI->getCalledFunction()) {
+      return Callee->hasName() &&
+             (Callee->getName().str().find("builtin") != std::string::npos);
+    }
+  }
+  return false;
+}
 
 void HWAddressSanitizer::sanitizeFunction(Function &F,
                                           FunctionAnalysisManager &FAM) {
@@ -1442,6 +1450,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   SmallVector<InterestingMemoryOperand, 16> OperandsToInstrument;
   SmallVector<MemIntrinsic *, 16> IntrinToInstrument;
+  SmallVector<Instruction *, 16> BuiltinsToCheck;
   SmallVector<Instruction *, 8> LandingPadVec;
 
   // FieldArmor
@@ -1476,7 +1485,9 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
       // if (!ignoreMemIntrinsic(ORE, MI))
       IntrinToInstrument.push_back(MI);
-
+    if (isCallToBuiltinFunction(&Inst)) {
+      BuiltinsToCheck.push_back(&Inst);
+    }
     if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(&Inst)) {
       GEPsToInstrument.push_back(GEPI);
     }
@@ -1489,6 +1500,12 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
         // NOTE: only subs, because adding ptrs should be against the standard
         // NOTE: ptr subtractions make sense only if the two pointers point to
         // (parts of) the same object. Ow they are just undefined behavior.
+        BOPsToInstrument.push_back(BO);
+      }
+      if (BO->getOpcode() == Instruction::Add) {
+        // NOTE: only add, because adding ptrs should be against the standard
+        // NOTE: ptr additions make sense only if one of the two operands is an
+        // integer offset. Ow they are just undefined behavior.
         BOPsToInstrument.push_back(BO);
       }
     }
@@ -1515,7 +1532,9 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   }
 
   if (SInfo.AllocasToInstrument.empty() && OperandsToInstrument.empty() &&
-      IntrinToInstrument.empty())
+      IntrinToInstrument.empty() && GEPsToInstrument.empty() &&
+      CMPsToInstrument.empty() && BOPsToInstrument.empty() &&
+      ConstGEPsToInstrument.empty() && BuiltinsToCheck.empty())
     return;
 
   assert(!ShadowBase);
@@ -1557,6 +1576,10 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   if (ClFSAN_memIntr && !IntrinToInstrument.empty()) {
     for (auto *Inst : IntrinToInstrument)
       instrumentMemIntrinsic(Inst); // KNOB
+  }
+  if (!BuiltinsToCheck.empty()) {
+    for (auto *Inst : BuiltinsToCheck)
+      errs() << "[FSAN-DBG] Builtin call: " << *Inst << "\n";
   }
 
   if (ClFSAN_GEP) {
@@ -1643,15 +1666,114 @@ void HWAddressSanitizer::processOperand(Instruction *BOP, Value *OP, int idx) {
   }
 }
 
+PtrToIntInst *getBasePtrToInt(Value *V, int Depth = 0) {
+  // Prevent infinite loops in case of phi nodes/cycles
+  if (Depth > 5)
+    return nullptr;
+
+  // Base case: We found the ptrtoint!
+  if (auto *PTI = dyn_cast<PtrToIntInst>(V)) {
+    return PTI;
+  }
+
+  // If it's an instruction (like add, sub, mul), look at its operands
+  if (auto *I = dyn_cast<Instruction>(V)) {
+    switch (I->getOpcode()) {
+    case Instruction::Add:
+    case Instruction::Sub:
+      // Check left operand
+      if (auto *Left = getBasePtrToInt(I->getOperand(0), Depth + 1))
+        return Left;
+      // Check right operand
+      if (auto *Right = getBasePtrToInt(I->getOperand(1), Depth + 1))
+        return Right;
+      break;
+    // You can add logic for PHI nodes or Trunc/ZExt if needed
+    default:
+      break;
+    }
+  }
+
+  return nullptr;
+}
+
+bool checkIfPtr(Value *V) { return getBasePtrToInt(V) != nullptr; }
+
+// detectin and handling arithmetics is still an open problem and very hard to
+// tackle at IR
 void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
   auto DL = M.getDataLayout();
   auto *OP0 = BOP->getOperand(0);
   auto *OP1 = BOP->getOperand(1);
+  {
+    if (BOP->getOpcode() == Instruction::Add) {
+      /**
+       * BOPsToInstrument
+       * %282 = ptrtoint ptr %281 to i64, !dbg !866067
+       * ...
+       * %291 = load ptr, ptr %__pos_.i.fsan.scalar, align 8
+       *  %292 = ptrtoint ptr %291 to i64,
+          %293 = add i64 %282, -4, !dbg !866071
+          %.neg = sub i64 0, %292, !dbg !866071
+          %294 = add i64 %293, %.neg, !dbg !866071 <-
+          %295 = lshr i64 %294, 2, !dbg !866071
+          %296 = mul nuw i64 %295, 4, !dbg !866071
+          %297 = add i64 %296, 4, !dbg !866071
+          tail call void @llvm.memset.p0.i64(ptr align 4 %291, i8 -1, i64 %297,
+       i1 false)
+       */
+      bool IsOp0Neg = OP0->hasName() &&
+                      OP0->getName().str().find(".neg") != std::string::npos;
+      bool IsOp1Neg = OP1->hasName() &&
+                      OP1->getName().str().find(".neg") != std::string::npos;
+      if (IsOp0Neg || IsOp1Neg) {
+        assert(!(IsOp0Neg && IsOp1Neg) && "Both operands cannot be negations");
+        Value *NegOp = IsOp0Neg ? OP0 : OP1;
+        Value *OtherOp = IsOp0Neg ? OP1 : OP0;
+        bool isOP0ptr = checkIfPtr(OtherOp);
+        bool isOP1ptr = checkIfPtr(OtherOp);
+
+        if ((isOP0ptr || isOP1ptr)) {
+          // do something ...
+          PtrToIntInst *PTIOther = getBasePtrToInt(OtherOp);
+          PtrToIntInst *PTINeg = getBasePtrToInt(NegOp);
+          if (PTIOther && PTINeg) {
+
+            auto *PtrOther = PTIOther->getOperand(0);
+            auto *PtrNeg = PTINeg->getOperand(0);
+
+            IRBuilder<> IRBOther(PTIOther);
+            auto *NewPtrOther = untagPointerIntrinsic(IRBOther, PtrOther);
+            PTIOther->setOperand(0, NewPtrOther);
+
+            IRBuilder<> IRBNeg(PTINeg);
+            auto *NewPtrNeg = untagPointerIntrinsic(IRBNeg, PtrNeg);
+            PTINeg->setOperand(0, NewPtrNeg);
+
+            errs() << "[FSAN] Instrumented BOP with negation: " << *BOP << "\n";
+          }
+        }
+      } // IsOp0Neg || IsOp1Neg
+    }
+  } // CASE ADDITION
+
   // if both operands are pointers, untag them before the subtraction
   bool BothPtr = false;
   BothPtr = dyn_cast<PtrToIntInst>(OP0) && dyn_cast<PtrToIntInst>(OP1);
+
+  bool IsPtr0 = dyn_cast<PtrToIntInst>(OP0) != nullptr;
+  {
+    // check if constexpr ptrtoint -> GLOBALS
+    if (ConstantExpr *CE0 = dyn_cast<ConstantExpr>(OP0))
+      if (CE0->getOpcode() == Instruction::PtrToInt)
+        IsPtr0 = true;
+    if (ConstantExpr *CE1 = dyn_cast<ConstantExpr>(OP1))
+      if (CE1->getOpcode() == Instruction::PtrToInt)
+        BothPtr = IsPtr0 && true;
+  }
   if (!BothPtr)
     return;
+
   processOperand(BOP, OP0, 0);
   processOperand(BOP, OP1, 1);
 }
@@ -1716,53 +1838,50 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
   bool guard = false;
   assert(nOperands <= 3);
-  auto fatherType = GEPI->getSourceElementType();
-  auto sonType = GEPI->getResultElementType();
-  auto gepName = GEPI->hasName() ? GEPI->getName().str()
+  auto SrcType = GEPI->getSourceElementType();
+  auto DstType = GEPI->getResultElementType();
+  auto GEPNAME = GEPI->hasName() ? GEPI->getName().str()
                                  : "gep." + itostr(NumInstrumentedGEPs);
+  auto PTR_OP_NAME = GEPI->getPointerOperand()->hasName()
+                         ? GEPI->getPointerOperand()->getName().str()
+                         : "gep.ptr.op." + itostr(NumInstrumentedGEPs);
+  // if (PTR_OP_NAME.find("agg.tmp") != std::string::npos && ClFSAN_verbose) {
+  //   dumpGEPDebug(GEPI);
+  // }
 
   if (GEPI->getType()->isVectorTy()) {
-    // NOTE: if loops are being vectorized, this will happen
-    errs() << "[FSAN] WARNING: GEP with vector result type not handled, "
-              "skipping instrumentation for this GEP: ";
+    // NOTE: if loops are being vectorized, this will happen. TODO.
+    errs() << "[FSAN] UNHANDLED GEP with vector result type: ";
     GEPI->print(errs());
     errs() << "\n";
-    // TODO: implement blocklisting properly
     return;
   }
 
   IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
-  // errs() << "[FSAN] INSTRUMENTING GEP: " << *GEPI << "\n";
-  // errs () << "\tFATHER TYPE: " << *fatherType << "\n";
-  // errs() << "\tSON TYPE: " << *sonType << "\n";
 
-  Value *resultLong = IRB.CreatePointerCast(GEPI, IntptrTy);
   std::string endResultName = "";
   Value *taggedPointer = nullptr;
   bool isScalar = false;
 
+  // compute this only where needed
   Value *FatherLevel = nullptr;
-  FatherLevel = extractLevelFromPointer(IRB, GEPI->getOperand(0));
 
-  if (fatherType->isArrayTy()) {
-    // return; // DEBUG
-    // R1: if returning pointer to aggregate L=L+1. If aggregate is struct, also
-    // set R.
-    auto GEPNAME = GEPI->hasName() ? GEPI->getName().str()
-                                   : "gep." + itostr(NumInstrumentedGEPs);
+  // NOTE: aggregates here are either structs or arrays of structs.
+  if (SrcType->isArrayTy()) {
+    // if array of structs, L=L+1, R set, T unused
+    // if array of non-structs, L=L, R=0, T=idx
+    bool isAggregateOfStructs = isArrayOfAggregates(DstType);
 
-    if (sonType->isAggregateType()) { /** GEP into array of aggregates */
-      // NOTE: this should trigger whenever gepping into array of structs, and
-      // array of arrays etc.
-
-      // LEVEL is always increcemented
-      // R always set when aggregate or aggregate of aggregates
-
-      bool isArray = sonType->isArrayTy();
+    if (DstType->isStructTy() ||
+        (isAggregateOfStructs)) { /** GEP into array of aggregates -> could be
+                                     struct or array */
+      // L=L+1
+      // R always set
+      // T unused
       auto Operand = GEPI->getPointerOperand();
-      bool SrcIsDecay =
-          Operand->getName().find("arraydecay") != std::string::npos;
-      bool DstIsStruct = sonType->isStructTy();
+      // bool SrcIsDecay =
+      //     Operand->getName().find("arraydecay") != std::string::npos;
+      bool DstIsStruct = DstType->isStructTy();
       Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
       Value *Tag = nullptr;
       // EXAMPLE of decay add
@@ -1771,36 +1890,60 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       // GEPI->getName().str().find("add.ptr") != std::string::npos;
       // errs() << "GEP NAME: " << GEPI->getName() << "\n";
       // errs() << *GEPI << "\n";
-      if (GEPNAME.find("arraydecay") != std::string::npos) {
+      // if (SrcIsDecay) {
+      //   if (ClFSAN_verbose) {
+      //     errs() << "[FSAN] ARRAY DECAY GEP: ";
+      //     GEPI->print(errs());
+      //     errs() << "\n";
+      //   }
+      // }
+
+      bool isDecayAdd =
+          GEPI->getName().str().find("add.ptr") != std::string::npos;
+      bool IsArrayIdx = GEPI->hasName() && GEPI->getName().str().find(
+                                               "arrayidx") != std::string::npos;
+      FatherLevel = extractLevelFromPointer(IRB, GEPI->getOperand(0));
+      if (isDecayAdd || IsArrayIdx) {
         if (ClFSAN_verbose) {
-          errs() << "ARRAY DECAY GEP: ";
+          errs() << "ARRAY DECAY + STRUCT GEP: ";
           GEPI->print(errs());
           errs() << "\n";
         }
+
+        Tag = FatherLevel;
+      } else
         Tag = AddOneModuloSomething(IRB, FatherLevel, LevelMask);
-      } else {
-        Tag = AddOneModuloSomething(IRB, FatherLevel, LevelMask);
-      }
 
       Tag = IRB.CreateShl(Tag, TBits);                            // ADJ L
       Tag = IRB.CreateOr(Tag, ConstantInt::get(IntptrTy, RPTag)); // set R
-      endResultName = gepName + ".fsan.array";
+      // TODO: use T for disambiguating decay
+      endResultName = GEPNAME + ".fsan" + (DstIsStruct ? ".struct" : ".array");
       taggedPointer =
           tagPointer(IRB, GEPI->getType(),
                      IRB.CreatePtrToInt(untaggedResult, IntptrTy), Tag);
+    } // GEP array->aggregate
+    else {
+      // // L = L, R = 0, T = idx
+      taggedPointer = GEPI;
+      endResultName = GEPNAME + ".fsan.scalar.array";
+    }
 
-    } // GEP into array of non-literal structs
   } // GEP from array type
 
   else { /** father is not array */
-    if (fatherType->isStructTy()) {
-      StructType *ST = dyn_cast<StructType>(fatherType);
+    if (SrcType->isStructTy()) {
+      StructType *ST = dyn_cast<StructType>(SrcType);
       bool tag = true;
 
-      // if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
-      //   tag = false;
-      //   GEPI->setMetadata("fsan_skip_gep", MDNode::get(M.getContext(), {}));
-      // }
+      if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
+        // IDEA: remove FPs caused by type coercion when frontend implements
+        // efficient copy
+        tag = false;
+        GEPI->setMetadata("fsan_skip_gep", MDNode::get(M.getContext(), {}));
+        taggedPointer =
+            IRB.CreatePtrToInt(untagPointerIntrinsic(IRB, GEPI), IntptrTy);
+        endResultName = GEPNAME + ".fsan.untagged";
+      }
 
       // if (ST && ST->hasName() && ST->getName().str().find("union.") == 0) {
       //   tag = false;
@@ -1833,20 +1976,20 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       //     tag = false;
       //   }
       // }
+      // TODO: introduce tunables for the above cases
 
       sonTag = nullptr;
-      auto sonIsScalar = !sonType->isStructTy() && !sonType->isVectorTy();
+      auto sonIsScalar = !DstType->isStructTy() && !DstType->isVectorTy();
+      bool sonIsArrayOfAggregates = isArrayOfAggregates(DstType);
 
-      bool sonIsArrayOfAggregates = isArrayOfAggregates(sonType);
       if (sonIsScalar && !sonIsArrayOfAggregates && tag) {
-        // guard = true;
         uint64_t idx = -1;
         auto op2 = GEPI->getOperand(2);
 
         if (ConstantInt *CI = dyn_cast<ConstantInt>(op2)) {
           idx = (uint64_t)CI->getZExtValue();
           if (idx == (TAG_MAX - 1)) {
-            idx = 0;
+            idx = 0; // ADJ tag to prevent null T
           }
           sonTag = ConstantInt::get(
               IntptrTy,
@@ -1858,18 +2001,26 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
         Value *untagged = untagPointerIntrinsic(IRB, GEPI);
         Value *untaggedLong = IRB.CreatePtrToInt(untagged, IntptrTy);
+        FatherLevel = extractLevelFromPointer(IRB, GEPI->getOperand(0));
         FatherLevel = IRB.CreateShl(FatherLevel, TBits); // adj L bits
         sonTag = IRB.CreateOr(sonTag, FatherLevel);
         taggedPointer = tagPointer(IRB, GEPI->getType(), untaggedLong, sonTag);
-        endResultName = gepName + ".fsan.scalar";
+        endResultName = GEPNAME + ".fsan.scalar";
         isScalar = true;
       } // GEP struct -> scalar
       else if (!tag) {
         // TODO
-        // return; // DEBUG
+        // errs() << "[FSAN] UNTAGGED "
+        //      << "GEP: ";
+        // GEPI->print(errs());
+        // errs() << "\n";
+        taggedPointer = untagPointerIntrinsic(IRB, GEPI), IntptrTy;
+        endResultName = GEPNAME + ".fsan.untagged";
       } else {
-        // return; // DEBUG
-        if (sonType->isAggregateType()) {
+        // tag = 1
+        // result is either aggregate or array of aggregates -> L=L+1, R set, T
+        // unused
+        if (DstType->isAggregateType()) {
           /** GEP: struct -> aggregate */
           // L = L + 1
           // set R
@@ -1880,6 +2031,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           bool IsArrayIdx =
               GEPI->hasName() &&
               GEPI->getName().str().find("arrayidx") != std::string::npos;
+          FatherLevel = extractLevelFromPointer(IRB, GEPI->getOperand(0));
           if (isDecayAdd || IsArrayIdx) {
             if (ClFSAN_verbose) {
               errs() << "ARRAY DECAY + STRUCT GEP: ";
@@ -1900,12 +2052,14 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           taggedPointer =
               tagPointer(IRB, GEPI->getType(),
                          IRB.CreatePtrToInt(untaggedResult, IntptrTy), Tag);
-          endResultName = gepName + ".fsan.aggregate";
+          endResultName = GEPNAME + ".fsan" +
+                          (DstType->isStructTy() ? ".struct" : ".array");
         }
       } // else - son is not scalar
 
     } // FATHER IS STRUCT
     else {
+      // SRC Type is neither an array nor a struct -> what is it then?
       if (ClFSAN_verbose) {
         errs() << "[FSAN] OTHER GEP " << "\n\tGEP: ";
         GEPI->print(errs());
@@ -1938,6 +2092,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     return; // TODO: handle corner cases
   }
   // taggedPointer = MaskFuckingPointer(IRB, taggedPointer);
+  assert(taggedPointer->isPointerTy() &&
+         "Tagged pointer must be of pointer type");
   llvm::Type *ptrTy = taggedPointer->getType();
 
   // 2. Define the FunctionType representing the assembly block's signature.
@@ -1969,31 +2125,44 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
   taggedPointer->setName(endResultName);
 
-  GEPI->replaceUsesWithIf(taggedPointer, [resultLong, GEPI, isScalar,
-                                          sonType](const Use &U) {
+  GEPI->replaceUsesWithIf(taggedPointer, [GEPI, isScalar,
+                                          DstType](const Use &U) {
     auto *User = U.getUser();
-    // TODO: I think this is BS
+    // do not replace in these calls, they are used to remove tag
     bool isCallToMaskPtr = false;
+
     if (CallBase *CB = dyn_cast<CallBase>(User)) {
       if (CB->getCalledFunction() && CB->getCalledFunction()->hasName() &&
           CB->getCalledFunction()->getName().find("llvm.ptrmask") !=
               std::string::npos) {
         isCallToMaskPtr = true;
       }
-    }
+    } // call to mask ptr
 
-    bool safe =
-        User != resultLong && !isa<LifetimeIntrinsic>(User) && !isCallToMaskPtr;
+    bool safe = !isa<LifetimeIntrinsic>(User) && !isCallToMaskPtr;
+
     if (isScalar) {
       // when used on a widened load, this produces FPs.
       // widened loads are produced right away by the FrontEnd
       // they are by-design FPs
       auto DL = GEPI->getModule()->getDataLayout();
-      uint64_t fieldSize = DL.getTypeAllocSize(sonType);
+      uint64_t fieldSize = DL.getTypeAllocSize(DstType);
       if (LoadInst *LI = dyn_cast<LoadInst>(User)) {
         // TODO: these have to be triaged
         auto loadSize = DL.getTypeAllocSize(LI->getType());
         if (loadSize > fieldSize) {
+          // TODO: document this -> new example of type coercion ignored before
+          // because I was not instrumenting every alloca
+          auto GEP_PTR_OP_NAME =
+              GEPI->getPointerOperand()->hasName()
+                  ? GEPI->getPointerOperand()->getName().str()
+                  : "gep.ptr.op." + itostr(NumInstrumentedGEPs);
+          if (GEP_PTR_OP_NAME.find("agg.tmp") != std::string::npos) {
+            errs() << "[FSAN] UNSAFE LOAD USER OF GEP ON AGGREGATE: ";
+            GEPI->print(errs());
+            errs() << "\n";
+            safe = false;
+          }
           // errs() << "UNSAFE LOAD USER";
           // LI->print(errs());
           // errs() << "\n";
@@ -2002,7 +2171,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           //   auto line = srcLoc.getLine();
           //   auto col = srcLoc.getCol();
           //   auto filename = srcLoc->getFilename();
-          //   errs() << "UNSAFE LOAD LOCATION: " << filename << ":" << line <<
+          //   errs() << "UNSAFE LOAD LOCATION: " << filename << ":" << line
+          //   <<
           //   ":"
           //          << col << "\n";
           // }
@@ -2016,21 +2186,44 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           // errs() << "\nLOAD: ";
           // LI->print(errs());
           // errs() << "\n";
-          for (auto *USER_LOAD : LI->users()) {
-            // errs() << "\t\tLOAD USER: ";
-            // USER_LOAD->print(errs());
-            if (StoreInst *SI = dyn_cast<StoreInst>(USER_LOAD)) {
-              // errs() << "NOT REPLACING" << " STORE SIZE: " <<
-              // DL.getTypeAllocSize(SI->getValueOperand()->getType()) << "\n";
-              return false; // NOT safe to replace as it might be a store to
-                            // load forwarding done by the frontend through type
-                            // coercion
-              // NOTE: stored type must be same size as the loaded type
-              // NOTE:
-            }
-            // errs() << "\n";
-          }
-        }
+          else
+            for (auto *USER_LOAD : LI->users()) {
+              // errs() << "\t\tLOAD USER: ";
+              // USER_LOAD->print(errs());
+              if (StoreInst *SI = dyn_cast<StoreInst>(USER_LOAD)) {
+                errs() << "[*] DETECTED TYPE COERCION STORE USER OF UNSAFE LOAD"
+                       << "\n";
+                GEPI->print(errs());
+                errs() << "\n";
+                auto debugLoc = SI->getDebugLoc();
+                if (debugLoc) {
+                  auto line = debugLoc.getLine();
+                  auto col = debugLoc.getCol();
+                  auto filename = debugLoc->getFilename();
+                  errs() << "\t LOCATION: " << filename << ":" << line << ":"
+                         << col << "\n";
+                }
+                return false; // NOT safe to replace as it might be a store to
+                              // load forwarding done by the frontend through
+                              // type coercion
+                // NOTE: stored type must be same size as the loaded type
+                // NOTE:
+              }
+              if (CallInst *CIUser = dyn_cast<CallInst>(USER_LOAD)) {
+                // pass by value of a struct using type coercion
+                errs() << "[*] DETECTED CALL USER OF UNSAFE LOAD, POSSIBLE "
+                          "PASS BY VALUE WITH TYPE COERCION"
+                       << "\n";
+                GEPI->print(errs());
+                errs() << "\n";
+                CIUser->print(errs());
+                errs() << "\n";
+                return false;
+              }
+              // errs() << "\n";
+            } // for load users
+
+        } // loadsize > field size
         // TODO: is the UNSAFE load the result of type coercion?
 
         // safe = safe && (fieldSize >= loadSize); // DEBUG
@@ -2050,7 +2243,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
               //   auto line = srcLoc.getLine();
               //   auto col = srcLoc.getCol();
               //   auto filename = srcLoc->getFilename();
-              //   errs() << "UNSAFE LOAD LOCATION: " << filename << ":" << line
+              //   errs() << "UNSAFE LOAD LOCATION: " << filename << ":" <<
+              //   line
               //          << ":" << col << "\n";
               // }
               for (auto *USER_LOAD : LI->users()) {
@@ -2058,11 +2252,12 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
                 // USER_LOAD->print(errs());
                 if (StoreInst *SI = dyn_cast<StoreInst>(USER_LOAD)) {
                   // errs() << "NOT REPLACING" << " STORE SIZE: " <<
-                  // DL.getTypeAllocSize(SI->getValueOperand()->getType()) <<
+                  // DL.getTypeAllocSize(SI->getValueOperand()->getType())
+                  // <<
                   // "\n";
-                  return false; // NOT safe to replace as it might be a store to
-                                // load forwarding done by the frontend through
-                                // type coercion
+                  return false; // NOT safe to replace as it might be a
+                                // store to load forwarding done by the
+                                // frontend through type coercion
                   // NOTE: stored type must be same size as the loaded type
                   // NOTE:
                 }
@@ -2073,7 +2268,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           }
         }
       }
-    }
+    } // is scalar
+
     if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
       if (SI->getPointerOperand() == GEPI) {
 
@@ -2096,9 +2292,8 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
                     dyn_cast<GlobalVariable>(CE->getOperand(0))) {
               if (GV->hasName() &&
                   demangle(GV->getName().str()).find("vtable for") == 0) {
-                // errs() << "[FSAN-DBG] GEP ALERT: TAGGED PTR ON VTABLE GEP: ";
-                // User->print(errs());
-                // errs() << "\n";
+                // errs() << "[FSAN-DBG] GEP ALERT: TAGGED PTR ON VTABLE
+                // GEP: "; User->print(errs()); errs() << "\n";
 
                 safe = false;
               }
@@ -2106,11 +2301,14 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           }
         } // if GEPOperator
       }
+    } // store in VTable
+    if (!safe) {
+      if (ClFSAN_verbose) {
+        errs() << "[FSAN] NOT REPLACING USE IN USER: ";
+        User->print(errs());
+        errs() << "\n";
+      }
     }
-    // safe &= !dyn_cast<GEPOperator>(User); // BAD idea, you introduce FNs.
-    // if (safe && setMetadata) {
-    //   GEPI->setMetadata("fsan.instrument", MD_node);
-    // }
     return safe;
   });
   NumInstrumentedGEPs++;

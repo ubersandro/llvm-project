@@ -606,9 +606,10 @@ bool FSanRewriteFunctionCallsPass::ProcessNewCall(CallBase *I, Module &M) {
                "Failed to retrieve or create tag vector for struct type");
         Value *whereToTagFrom = NewCI;
         bool isNewArray = demangledName.find("new[]") != std::string::npos;
-
+        Value *Offset = nullptr;
+       
         if (isNewArray && needsOffsetForCookie) {
-          Value *Offset = IRB.CreateGEP(IRB.getInt8Ty(), // element type: i8 (1
+          Offset = IRB.CreateGEP(IRB.getInt8Ty(), // element type: i8 (1
                                                          // byte per index unit)
                                         NewCI,           // base pointer
                                         IRB.getInt64(8), // offset by 8 bytes
@@ -616,14 +617,28 @@ bool FSanRewriteFunctionCallsPass::ProcessNewCall(CallBase *I, Module &M) {
           whereToTagFrom = Offset;
         }
 
-        IRB.CreateCall(fsan_tag_memory,
-                       {IRB.CreatePointerCast(whereToTagFrom, PtrTy),
-                        IRB.CreatePointerCast(TagVector, PtrTy),
-                        ConstantInt::get(Int64Ty, tSize), ArraySize});
+        auto *Tagged = IRB.CreateCall(
+            fsan_tag_memory, {IRB.CreatePointerCast(whereToTagFrom, PtrTy),
+                              IRB.CreatePointerCast(TagVector, PtrTy),
+                              ConstantInt::get(Int64Ty, tSize), ArraySize});
         // llvm::errs() << "[FieldArmor] TAGGING NEW:\n\t" << *NewCI
         //              << "\n\t\tSTRUCT: " << allocType->getStructName()
         //              << "\n\t\tARR_SZ: " << *ArraySize << "\n";
-        NewCI->setName(NewCI->getName() + ".tagged");
+        Tagged->setName(NewCI->getName() + ".tagged");
+        // NewCI->replaceUsesWithIf(Tagged, [NewCI, Offset](const Use &U) {
+        //   auto *User = U.getUser();
+        //   bool isCallToFSANTagMemory =
+        //       isa<CallInst>(User) &&
+        //       cast<CallInst>(User)->getCalledFunction() &&
+        //       cast<CallInst>(User)->getCalledFunction()->hasName() &&
+        //       cast<CallInst>(User)->getCalledFunction()->getName().str().find(
+        //           "fsan_tag_memory") != std::string::npos;
+        //   bool safe = !isa<LifetimeIntrinsic>(User);
+        //   safe &= !isa<DbgInfoIntrinsic>(User);
+        //   safe &= !isCallToFSANTagMemory;
+        //   safe &= (Offset!=nullptr && User != Offset) || Offset == nullptr;
+        //   return safe;
+        // });
         changed = true;
       } // if allocType
       else

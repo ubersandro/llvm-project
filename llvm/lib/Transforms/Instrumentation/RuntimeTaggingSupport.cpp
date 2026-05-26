@@ -14,11 +14,18 @@ static cl::opt<std::string> clFSAN_BLOCKLIST_TAG_FILEPATH(
     cl::desc("Path to the blocklist tag file, which contains struct names to "
              "blocklist from tagging"),
     cl::Hidden, cl::init(""));
+static cl::opt<bool> clFSAN_SKIP_ANON_STRUCTS(
+    "fsan-skip-anon-structs",
+    cl::desc("Skip tagging anonymous structs and classes (i.e., those whose "
+             "name starts with struct.anon or class.anon)"),
+    cl::Hidden, cl::init(false));
 
 namespace RuntimeTaggingSupport {
 #if defined(__x86_64__)
 uint64_t TBits = 3;
-#define MAX_T (1 << TBits)
+uint64_t LBits = 2;
+uint64_t MAX_LEVEL = (1 << LBits);
+uint64_t MAX_T = (1 << TBits); // 0b100000
 #else
 uint64_t TBits = 5;
 uint64_t LBits = 2;
@@ -30,7 +37,8 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M,
                                                int depth) {
   auto *Int8Ty = Type::getInt8Ty(M.getContext());
 
-  std::string TagVecName = ST->getStructName().str() + ".fieldarmor.tagvec.depth" + std::to_string(depth);
+  std::string TagVecName = ST->getStructName().str() +
+                           ".fieldarmor.tagvec.depth" + std::to_string(depth);
   auto *TagVec = M.getGlobalVariable(TagVecName, true);
   if (TagVec)
     return;
@@ -42,9 +50,15 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M,
 
   bool isUnion =
       !isLiteral && ST->getName().str().find("union.") != std::string::npos;
+  auto isAnonStructOrClass = ST->getName().str().find("struct.anon") == 0 ||
+                             ST->getName().str().find("class.anon") == 0;
+  bool SkipAnonStruct =
+      isAnonStructOrClass && clFSAN_SKIP_ANON_STRUCTS.getValue();
+  if (SkipAnonStruct)
+    errs() << "[FSAN - TAG] Skipping anonymous struct " << *ST << "\n";
   auto demangledTypeName = demangle(ST->getStructName().str());
 
-  if (isLiteral || isUnion) {
+  if (isLiteral || isUnion || SkipAnonStruct) {
     // literal, unions == all 0 tags
     // errs() << "[FSAN - TAG] NULL TAG ON STRUCT " << *ST
     //        << " (literal: " << isLiteral << ", union: " << isUnion << ")\n";
@@ -68,11 +82,15 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M,
               std::string::npos) {
             Tags = new u_int8_t[Size];
             memset(Tags, (unsigned char)0x00, Size);
+            errs() << "[FSAN - TAG] NULL TAG ON STRUCT " << *ST
+                   << " (matched blocklist line: " << Line << ")\n";
             break;
           }
         } else if (demangledTypeName.find(Line) == 0) {
           Tags = new u_int8_t[Size];
           memset(Tags, (unsigned char)0x00, Size);
+          errs() << "[FSAN - TAG] NULL TAG ON STRUCT " << *ST
+                 << " (matched blocklist line: " << Line << ")\n";
           break;
         }
       }
@@ -109,8 +127,7 @@ RetrieveOrCreateTagVector(StructType *ST, Module &M, int depth) {
   auto *TagVector = M.getGlobalVariable(TagVecName, true);
   if (!TagVector) {
     createTagVector(ST, M, depth);
-    TagVector = M.getGlobalVariable(
-        TagVecName, true);
+    TagVector = M.getGlobalVariable(TagVecName, true);
   }
   return TagVector;
 }
@@ -161,9 +178,50 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         CurFieldStructType && CurFieldStructType->isLiteral();
     auto CurFieldIsUnion = CurFieldStructType && !CurFieldIsLiteral &&
                            (CurFieldStructType->getName().find("union.") == 0);
+    bool CurFieldIsBlockListedStruct = false;
 
+    {
+      if (CurFieldStructType &&
+          !clFSAN_BLOCKLIST_TAG_FILEPATH.getValue().empty()) {
+        auto demangledTypeName =
+            demangle(CurFieldStructType->getStructName().str());
+        auto Size = M.getDataLayout().getTypeAllocSize(CurFieldStructType);
+        std::ifstream BlocklistFile(clFSAN_BLOCKLIST_TAG_FILEPATH.getValue());
+        if (BlocklistFile.is_open()) {
+          std::string Line;
+          while (std::getline(BlocklistFile, Line)) {
+            // NOTE: we want to match struct.sockaddr, but not
+            // struct.sockaddr_in
+            bool containsAsterisk = Line.find('*') != std::string::npos;
+            if (containsAsterisk) {
+              // if the line contains an asterisk, we check if the demangled
+              // type name contains the line without the asterisk
+              auto LineWithoutAsterisk = Line;
+              LineWithoutAsterisk.erase(std::remove(LineWithoutAsterisk.begin(),
+                                                    LineWithoutAsterisk.end(),
+                                                    '*'),
+                                        LineWithoutAsterisk.end());
+              if (demangledTypeName.find(LineWithoutAsterisk) !=
+                  std::string::npos) {
+                errs() << "[FSAN - TAG] NULL TAG ON STRUCT "
+                       << *CurFieldStructType
+                       << " (matched blocklist line: " << Line << ")\n";
+                CurFieldIsBlockListedStruct = true;
+                break;
+              }
+            } else if (demangledTypeName.find(Line) == 0) {
+              errs() << "[FSAN - TAG] NULL TAG ON STRUCT "
+                     << *CurFieldStructType
+                     << " (matched blocklist line: " << Line << ")\n";
+              CurFieldIsBlockListedStruct = true;
+              break;
+            }
+          }
+        }
+      }
+    }
     if (CurFieldStructType != nullptr && !CurFieldIsLiteral &&
-        !CurFieldIsUnion) {
+        !CurFieldIsUnion && !CurFieldIsBlockListedStruct) {
       uint8_t Count = 0;
       auto ContainedSubTypes = CurFieldType->getNumContainedTypes();
 
@@ -222,8 +280,10 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
                    "Element tag must be a constant integer in the tag vector.");
             auto ElemTagValue = ElemTag->getZExtValue();
             // ADJUST LEVEL TO NEW NESTING SITUATION
-            ElemTagValue &= (MAX_T - 1); // modulo MAX_T
-            ElemTagValue |= (OverallDepth << TBits);
+            // ElemTagValue &= (MAX_T - 1); // modulo MAX_T
+            if(ElemTagValue!=0)
+              ElemTagValue |= (OverallDepth << TBits);
+
             assert(ElemTagValue <= 0xff &&
                    "Element tag value must fit in a byte.");
             Tags[ElemOffset + H] = static_cast<uint8_t>(ElemTagValue);
@@ -266,7 +326,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
 
     else {
       // case : scalar fields, literal structs, unions == ALL SCALAR
-      if (CurFieldType->isStructTy() || CurFieldIsLiteral || CurFieldIsUnion) {
+      if (CurFieldType->isStructTy()  &&  (CurFieldIsLiteral || CurFieldIsUnion ||
+          CurFieldIsBlockListedStruct)) {
         // union, literal
         memset(&Tags[CurFieldOffset], 0x00, DL.getTypeAllocSize(CurFieldType));
       } else {

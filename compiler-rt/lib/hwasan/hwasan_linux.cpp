@@ -581,7 +581,7 @@ uptr TagMemory_mod(void* p, uptr size, void* tag_vector, uptr array_size) {
   } else {
     internal_memset((void*)(MemToShadow((uptr)p)), 0, size * array_size);
   }
-  return ptr ? tagged : (uptr)p;
+  return ptr && p ? tagged : (uptr)p;
 }
 
 uptr TagMemoryAligned(uptr p, uptr size, tag_t tag) {
