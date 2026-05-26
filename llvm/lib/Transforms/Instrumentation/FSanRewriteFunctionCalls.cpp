@@ -27,7 +27,7 @@ using namespace llvm;
 #define DEBUG_TYPE "fsan-rewrite"
 STATISTIC(NumCallsRewritten, "Number of allocator calls rewritten");
 
-static cl::opt<bool> ClInstrumentHeap("fsan-instrument-heap",
+static cl::opt<bool> ClInstrumentHeap("fsan-heap",
                                       cl::desc("instrument heap"), cl::Hidden,
                                       cl::init(true));
 
@@ -677,6 +677,8 @@ FSanRewriteFunctionCallsPass::run(Module &M, ModuleAnalysisManager &MAM) {
   bool changed = false;
   if (!ClInstrumentHeap)
     return PreservedAnalyses::all();
+  errs () << "[FSAN] Running FSanRewriteFunctionCallsPass on module: " << M.getName()
+         << "\n";
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;

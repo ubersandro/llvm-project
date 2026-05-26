@@ -75,6 +75,10 @@ static cl::opt<bool>
                              cl::init(true));
 // NO MEM ACCESSES + NO BOP -> 510 crashes for SEGV
 
+static cl::opt<bool> ClFSAN_heap("fsan-instrument-heap",
+                                 cl::desc("instrument heap"), cl::Hidden,
+                                 cl::init(true));
+
 static cl::opt<bool> ClFSAN_memIntr("fsan-instrument-mem-intrinsics",
                                     cl::desc("instrument memory intrinsics"),
                                     cl::Hidden, cl::init(true));
@@ -226,6 +230,7 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
     HWASan.sanitizeFunction(F, FAM);
   }
 
+  // TODO: this needs changes for sure
   PreservedAnalyses PA = PreservedAnalyses::none();
   // DominatorTreeAnalysis, PostDominatorTreeAnalysis, and LoopAnalysis
   // are incrementally updated throughout this pass whenever
@@ -239,6 +244,568 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
   PA.abandon<GlobalsAA>();
   return PA;
 }
+bool CheckOnCookie(Value *V) {
+  if (Constant *name = dyn_cast<Constant>(V)) {
+    if (ConstantDataArray *dataArray =
+            dyn_cast<ConstantDataArray>(name->getOperand(0))) {
+      if (dataArray->isString()) {
+        StringRef str = dataArray->getAsString();
+        // remove trailing nullbyte
+        std::string pinoPalettaStr = str.str().substr(0, str.size() - 1);
+        return pinoPalettaStr ==
+               "PINO_PALETTA"; // Q: will this work with null term?
+      }
+    }
+  }
+
+  return false;
+}
+
+bool HWAddressSanitizer::RewriteMallocLikeCall(CallBase *CI) {
+  auto Int64Ty = Type::getInt64Ty(M.getContext());
+  PointerType *PtrTy = PointerType::getUnqual(M.getContext());
+  StructType *allocType = nullptr;
+  std::string structName = "";
+  std::string formerAllocatorName = "";
+
+  Value *strPtr = nullptr;
+  Value *arraySize = nullptr;
+  Value *formerFunction = nullptr;
+
+  auto nArgs = CI->arg_size();
+  if (nArgs < 3) {
+    errs() << "\t\t[FSAN] NOT ENOUGH ARGS FOR TYPED ALLOCATOR? " << *CI << "\n";
+    assert(false && "Expected at least 3 arguments for typed allocator call");
+  }
+
+  int strIdx = (int)nArgs - 3;
+  int arraySizeIdx = (int)nArgs - 2;
+  int formerFunctionIdx = (int)nArgs - 1;
+
+  for (unsigned i = 0; i < CI->arg_size(); i++) {
+    Value *arg = CI->getArgOperand(i);
+    if ((int)i == strIdx)
+      strPtr = arg;
+    if ((int)i == arraySizeIdx)
+      arraySize = arg;
+    if ((int)i == formerFunctionIdx)
+      formerFunction = arg;
+  }
+
+  if (!strPtr || !arraySize || !formerFunction)
+    assert(false &&
+           "Failed to extract necessary arguments for typed allocator call");
+
+  // flag to skip tagging if not a struct/class or if union
+  bool dontTag = false;
+  if (Constant *name = dyn_cast<Constant>(strPtr)) {
+    if (ConstantDataArray *dataArray =
+            dyn_cast<ConstantDataArray>(name->getOperand(0))) {
+      if (dataArray->isString()) {
+        StringRef structNameRef = dataArray->getAsString();
+        bool hasNullTerminator =
+            !structNameRef.empty() && structNameRef.back() == '\0';
+        if (hasNullTerminator)
+          structName = structNameRef.str().substr(0, structNameRef.size() - 1);
+
+        if (structName.find("struct") != std::string::npos ||
+            structName.find("class") != std::string::npos) {
+          allocType = StructType::getTypeByName(CI->getModule()->getContext(),
+                                                structName);
+          assert(allocType && "Failed to find struct type by name in module");
+          dontTag = false;
+        } // it's struct or class
+        else {
+          dontTag = true;
+        }
+      }
+    }
+  }
+
+  if (Constant *name = dyn_cast<Constant>(formerFunction)) {
+    if (ConstantDataArray *dataArray =
+            dyn_cast<ConstantDataArray>(name->getOperand(0))) {
+      if (dataArray->isString()) {
+        StringRef ref = dataArray->getAsString();
+        formerAllocatorName = ref.str();
+        formerAllocatorName =
+            formerAllocatorName.substr(0, formerAllocatorName.size() - 1);
+      }
+    }
+  }
+
+  CallBase *NewCI = RewriteCall(CI, arraySize, formerAllocatorName,
+                                nullptr); // no offset for cookie
+  assert(NewCI && "Expected the rewritten call to be an instruction");
+
+  auto oldName = NewCI->hasName() ? NewCI->getName().str() : "noname";
+  NewCI->setName(oldName + ".fieldarmor.rewrite");
+  bool changed = true;
+
+  if (allocType && !dontTag && !allocType->isOpaque()) {
+    auto *NextInst = NewCI->getNextNonDebugInstruction();
+    Instruction *InsertPt = nullptr;
+    BasicBlock *BB;
+
+    if (InvokeInst *Invoke = dyn_cast<InvokeInst>(NewCI)) {
+      BasicBlock *NormalDest = Invoke->getNormalDest();
+      if (NormalDest)
+        InsertPt = &NormalDest->front(); // insert at the beginning
+                                         // of the normal dest block
+      else
+        InsertPt = Invoke; // fallback to inserting after the invoke
+                           // if no normal dest
+    } else
+      InsertPt = NewCI->getNextNonDebugInstruction(); // insert right after
+                                                      // the new call
+    IRBuilder<> IRB(InsertPt);
+    Value *ArraySize = nullptr;
+    int32_t extractedArraySize = 0;
+    if (ConstantInt *CInt = dyn_cast<ConstantInt>(arraySize)) {
+      extractedArraySize = CInt->getZExtValue();
+      if (extractedArraySize != -1)
+        ArraySize = ConstantInt::get(Int64Ty, extractedArraySize);
+      else
+        ArraySize = GetArraySize(NewCI, formerAllocatorName, allocType, IRB);
+    } else
+      ArraySize = GetArraySize(NewCI, formerAllocatorName, allocType, IRB);
+    assert(ArraySize != nullptr &&
+           "Failed to compute array size for typed allocation");
+
+    TypeSize tSize = M.getDataLayout().getTypeAllocSize(allocType);
+
+    FunctionCallee fsan_tag_memory = M.getOrInsertFunction(
+        "fsan_tag_memory", Int64Ty, PtrTy, PtrTy, Int64Ty, Int64Ty);
+    auto *TagVector =
+        RuntimeTaggingSupport::RetrieveOrCreateTagVector(allocType, M);
+    assert(TagVector &&
+           "Failed to retrieve or create tag vector for struct type");
+    auto *call = IRB.CreateCall(fsan_tag_memory,
+                                {IRB.CreatePointerCast(NewCI, PtrTy),
+                                 IRB.CreatePointerCast(TagVector, PtrTy),
+                                 ConstantInt::get(Int64Ty, tSize), ArraySize});
+    Value *NewCILong = IRB.CreatePtrToInt(NewCI, IntptrTy);
+    Value *TaggedNewCI = tagPointer(IRB, NewCI->getType(), NewCILong,
+                                    ConstantInt::get(IntptrTy, RPTag));
+    NewCI->replaceUsesWithIf(TaggedNewCI, [NewCI,
+                                           NewCILong](const Use &U) {
+      auto *User = U.getUser();
+      bool isCallToFSANTagMemory =
+          isa<CallInst>(User) && cast<CallInst>(User)->getCalledFunction() &&
+          cast<CallInst>(User)->getCalledFunction()->hasName() &&
+          cast<CallInst>(User)->getCalledFunction()->getName().str().find(
+              "fsan_tag_memory") != std::string::npos;
+      bool safe = !isa<LifetimeIntrinsic>(User);
+      safe &= !isa<DbgInfoIntrinsic>(User);
+      safe &= !isCallToFSANTagMemory;
+      safe &= (User != NewCILong);
+      return safe;
+    });
+
+    if (ClFSAN_verbose)
+      errs() << "\t\t[FSAN] malloc-like tag\n\t" << *call
+             << "\n\ttype: " << structName << "\n\tarray size: " << *ArraySize
+             << "\n";
+  }
+  return changed;
+} // RewriteMallocLikeCall
+
+bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
+  Value *V = I->getCalledOperand()->stripPointerCasts();
+  bool changed = false;
+  Function *Callee = dyn_cast<Function>(V);
+  if (Callee) {
+    assert(Callee->hasName() &&
+           "Expected callee to have a name in RewriteNewCall");
+    std::string AllocatorName = demangle(Callee->getName().str());
+
+    if (AllocatorName.find("nothrow") != std::string::npos) {
+      errs() << "\t\t[FSAN] NOTHROW NEW " << *I << ", TODO\n";
+      return false;
+    }
+
+    auto size = I->arg_size();
+    if (size <= 1) {
+      errs() << "\t\t[FSAN] 1 arg new " << *I << ", TODO\n";
+      return false;
+    }
+
+    bool cookieIsThere = CheckOnCookie(I->getArgOperand(size - 1));
+    auto lastArg =
+        cookieIsThere
+            ? I->getArgOperand(I->arg_size() - 2)
+            : I->getArgOperand(I->arg_size() - 1); // typeName or COOKIE!!!
+
+    std::string structName = "";
+    StructType *allocType = nullptr; // this will be null for unhandled cases
+
+    if (Constant *name = dyn_cast<Constant>(lastArg)) {
+      if (ConstantDataArray *dataArray =
+              dyn_cast<ConstantDataArray>(name->getOperand(0))) {
+        if (dataArray->isString()) {
+          StringRef structNameRef = dataArray->getAsString();
+          structName = structNameRef.str().substr(0, structNameRef.size() - 1);
+          allocType =
+              StructType::getTypeByName(Callee->getContext(), structName);
+        } else {
+
+          if (PHINode *phi = dyn_cast<PHINode>(lastArg)) {
+            auto *name = phi->getIncomingValue(0);
+            if (Constant *nameConst = dyn_cast<Constant>(name)) {
+              if (ConstantDataArray *dataArray =
+                      dyn_cast<ConstantDataArray>(nameConst->getOperand(0))) {
+                if (dataArray->isString()) {
+                  StringRef structNameRef = dataArray->getAsString();
+                  std::string structName =
+                      structNameRef.str().substr(0, structNameRef.size() - 1);
+                  allocType = StructType::getTypeByName(Callee->getContext(),
+                                                        structName);
+                }
+              }
+            }
+          } else
+            assert(false && "Expected last argument to be a string constant in "
+                            "RewriteNewCall");
+        }
+      }
+    } // if constant last arg
+
+    bool needsOffsetForCookie = cookieIsThere;
+    CallBase *NewCI =
+        RewriteCall(I, nullptr, AllocatorName, &needsOffsetForCookie);
+    bool isUnion =
+        (!structName.empty() && structName.find("union") != std::string::npos);
+
+    if (isUnion) {
+      errs() << "\t\t[FSAN] NEW of a union type " << *I
+             << ", skipping tagging for now\n";
+      return true;
+    }
+
+    if (allocType && allocType->isStructTy() && !allocType->isOpaque()) {
+      Instruction *InsertPt = nullptr;
+
+      if (InvokeInst *Invoke = dyn_cast<InvokeInst>(NewCI)) {
+        BasicBlock *NormalDest = Invoke->getNormalDest();
+        if (NormalDest)
+          InsertPt = &NormalDest->front(); // insert at the beginning
+                                           // of the normal dest block
+        else
+          InsertPt = Invoke; // fallback to inserting after the invoke
+                             // if no normal dest
+      } else
+        InsertPt = NewCI->getNextNonDebugInstruction(); // insert right after
+                                                        // the new call
+      assert(InsertPt && "Failed to find insertion point for tagging after "
+                         "new operator call");
+      IRBuilder<> IRB(InsertPt);
+
+      // TODO: check on array size post FP
+      Value *ArraySize = GetArraySize(NewCI, AllocatorName, allocType, IRB);
+      assert(ArraySize != nullptr &&
+             "Failed to compute array size for typed allocation");
+      TypeSize tSize = M.getDataLayout().getTypeAllocSize(allocType);
+      auto Int64Ty = Type::getInt64Ty(M.getContext());
+      PointerType *PtrTy = PointerType::getUnqual(M.getContext());
+      FunctionCallee fsan_tag_memory = M.getOrInsertFunction(
+          "fsan_tag_memory", Int64Ty, PtrTy, PtrTy, Int64Ty, Int64Ty);
+      auto *TagVector =
+          RuntimeTaggingSupport::RetrieveOrCreateTagVector(allocType, M);
+      assert(TagVector &&
+             "Failed to retrieve or create tag vector for struct type");
+      Value *whereToTagFrom = NewCI;
+      bool isNewArray = AllocatorName.find("new[]") != std::string::npos;
+      Value *Offset = nullptr;
+
+      if (isNewArray && needsOffsetForCookie) {
+        Offset = IRB.CreateGEP(IRB.getInt8Ty(), // element type: i8 (1
+                                                // byte per index unit)
+                               NewCI,           // base pointer
+                               IRB.getInt64(8), // offset by 8 bytes
+                               "cookie_ptr");
+        whereToTagFrom = Offset;
+      }
+
+      IRB.CreateCall(fsan_tag_memory,
+                     {IRB.CreatePointerCast(whereToTagFrom, PtrTy),
+                      IRB.CreatePointerCast(TagVector, PtrTy),
+                      ConstantInt::get(Int64Ty, tSize), ArraySize});
+
+      Value *NewCILong = IRB.CreatePtrToInt(NewCI, IntptrTy);
+      Value *TaggedNewCI = tagPointer(IRB, NewCI->getType(), NewCILong,
+                                      ConstantInt::get(IntptrTy, RPTag));
+      NewCI->replaceUsesWithIf(TaggedNewCI, [NewCI, Offset, NewCILong](const Use &U) {
+        auto *User = U.getUser();
+        bool isCallToFSANTagMemory =
+            isa<CallInst>(User) && cast<CallInst>(User)->getCalledFunction() &&
+            cast<CallInst>(User)->getCalledFunction()->hasName() &&
+            cast<CallInst>(User)->getCalledFunction()->getName().str().find(
+                "fsan_tag_memory") != std::string::npos;
+        bool safe = !isa<LifetimeIntrinsic>(User);
+        safe &= !isa<DbgInfoIntrinsic>(User);
+        safe &= !isCallToFSANTagMemory;
+        safe &= (Offset != nullptr && User != Offset) || Offset == nullptr;
+        safe &= (User != NewCILong); 
+        return safe;
+      });
+
+      if (ClFSAN_verbose)
+        errs() << "\t\t[FSAN] new operator tag\n\t" << *TaggedNewCI
+               << "\n\ttype: " << structName << "\n\tarray size: " << *ArraySize
+               << "\n";
+      changed = true;
+    } // if allocType
+    else
+      return changed;
+
+  } // if Callee
+  else {
+    assert(false && "Expected a function call in RewriteNewCall");
+  }
+  return changed;
+} // RewriteNewCall
+
+CallBase *
+HWAddressSanitizer::RewriteCall(CallBase *CI, Value *arraySize,
+                                const std::string &formerAllocatorName,
+                                bool *needsOffsetForCookie) {
+  bool isNew = false;
+  Value *allocSize = nullptr;
+  Value *nElems = nullptr;
+  Value *origPtr = nullptr;
+  LLVMContext &Ctx = M.getContext();
+  Type *SizeTy = M.getDataLayout().getIntPtrType(Ctx); // use for size
+  Type *VoidPtrTy = CI->getType();                     // opaque
+  FunctionCallee formerFn;
+  bool isRealloc = false;
+  bool hasAlignment = false;
+  if (formerAllocatorName == "malloc") {
+    allocSize = CI->getArgOperand(0);
+  } // malloc
+  else if (formerAllocatorName == "realloc") {
+    origPtr = CI->getArgOperand(0);
+    allocSize = CI->getArgOperand(1);
+    isRealloc = true;
+  } // realloc
+  else if (formerAllocatorName == "calloc") {
+    allocSize = CI->getArgOperand(1);
+    nElems = CI->getArgOperand(0);
+  } // calloc
+  else if (formerAllocatorName == "reallocarray") {
+    origPtr = CI->getArgOperand(0);
+    nElems = CI->getArgOperand(1);
+    allocSize = CI->getArgOperand(2);
+  } // reallocarray
+  else if (formerAllocatorName.find("operator new[]") != std::string::npos) {
+    allocSize = CI->getArgOperand(0);
+    isNew = true;
+    // TODO: does it have alignment?? Only if 3 params there is alignment
+    auto callArgsNum = CI->arg_size();
+    if (callArgsNum == 3) {
+      // it has type and alignment
+      hasAlignment = true; // TODO
+    }
+  } // operator new[]
+  else if (formerAllocatorName.find("operator new") != std::string::npos) {
+    allocSize = CI->getArgOperand(0);
+    isNew = true;
+    auto callArgsNum = CI->arg_size();
+    if (callArgsNum == 3) {
+      // it has type and alignment
+      hasAlignment = true; // TODO
+    }
+  } // operator new
+  // TODO: handle memalign, aligned_alloc, posix_memalign, valloc, pvalloc
+
+  Type *sizeType = allocSize->getType();
+
+  // adjust arguments && former function
+  SmallVector<Value *, 4> arguments;
+  if (formerAllocatorName == "malloc") {
+    FunctionType *MallocType = FunctionType::get(VoidPtrTy, {sizeType}, false);
+    formerFn = M.getOrInsertFunction("malloc", MallocType);
+    assert(formerFn && "Failed to get or insert malloc function");
+    arguments.push_back(allocSize);
+  }
+
+  if (formerAllocatorName == "calloc") {
+    formerFn = M.getOrInsertFunction("calloc", VoidPtrTy, sizeType, sizeType);
+    arguments.push_back(nElems);
+    arguments.push_back(allocSize);
+  }
+
+  if (formerAllocatorName == "realloc") {
+    FunctionType *ReallocTy =
+        FunctionType::get(VoidPtrTy, {VoidPtrTy, sizeType}, false);
+
+    formerFn = M.getOrInsertFunction("realloc", ReallocTy);
+    assert(formerFn && "Failed to get or insert realloc function");
+    arguments.push_back(origPtr);
+    arguments.push_back(allocSize);
+  }
+
+  if (formerAllocatorName == "reallocarray") {
+    formerFn = M.getOrInsertFunction("reallocarray", VoidPtrTy, VoidPtrTy,
+                                     sizeType, sizeType);
+    arguments.push_back(origPtr);
+    arguments.push_back(nElems);
+    arguments.push_back(allocSize);
+  }
+  if (formerAllocatorName.find("operator new[]") != std::string::npos ||
+      formerAllocatorName.find("operator new") != std::string::npos) {
+
+    // TODO: check on std::throw arg, if still there!
+    bool cookieStrIsThere = false;
+    cookieStrIsThere = CheckOnCookie(CI->getArgOperand(CI->arg_size() - 1));
+    if (cookieStrIsThere)
+      errs() << "COOKIE ACK IN IR\n";
+    unsigned originalArgsNum =
+        cookieStrIsThere ? CI->arg_size() - 2 : CI->arg_size() - 1;
+    *needsOffsetForCookie = cookieStrIsThere;
+
+    for (unsigned i = 0; i < originalArgsNum; ++i)
+      arguments.push_back(CI->getArgOperand(i));
+  }
+
+  if (isNew) {
+    bool isInvoke = isa<InvokeInst>(CI);
+    if (isInvoke) {
+      InvokeInst *OldInv = cast<InvokeInst>(CI);
+      IRBuilder<> IRB(OldInv->getParent(), OldInv->getIterator());
+      auto *Dest = OldInv->getNormalDest();
+      auto *UnwindDest = OldInv->getUnwindDest();
+      Value *OldInvokedFunc = OldInv->getCalledOperand()->stripPointerCasts();
+      FunctionType *OldInvokedFuncTy = nullptr;
+      if (Function *OldInvokedFuncAsFn = dyn_cast<Function>(OldInvokedFunc)) {
+        OldInvokedFuncTy = OldInvokedFuncAsFn->getFunctionType();
+      }
+
+      assert(OldInvokedFuncTy &&
+             "Failed to get function type of old invoked function");
+      InvokeInst *NewInvoke =
+          InvokeInst::Create(OldInvokedFuncTy, OldInv->getCalledOperand(), Dest,
+                             UnwindDest, arguments, "invoke.rewrite");
+      // TODO: REFACTOR and fix attributes to function call to match
+      // original!
+      NewInvoke->setDebugLoc(OldInv->getDebugLoc());
+      NewInvoke->insertBefore(OldInv);
+      OldInv->replaceAllUsesWith(NewInvoke);
+
+      OldInv->eraseFromParent();
+      return NewInvoke;
+    } else {
+      // its a new call
+
+      Value *NewOperator = CI->getCalledOperand()->stripPointerCasts();
+      FunctionType *NewOperatorTy = nullptr;
+      if (Function *NewOperatorAsFn = dyn_cast<Function>(NewOperator)) {
+        NewOperatorTy = NewOperatorAsFn->getFunctionType();
+      }
+      assert(NewOperatorTy &&
+             "Failed to get function type of new operator function");
+
+      CallInst *NewCall = CallInst::Create(
+          NewOperatorTy, CI->getCalledOperand(), arguments, "call.rewrite");
+      NewCall->setTailCall(true);
+      NewCall->setDebugLoc(CI->getDebugLoc());
+
+      NewCall->insertBefore(CI);
+      CI->replaceAllUsesWith(NewCall);
+      CI->eraseFromParent();
+      return NewCall;
+    }
+
+    return nullptr;
+  } // if isNew
+
+  if (InvokeInst *Invoke = dyn_cast<InvokeInst>(CI)) {
+    // INVOKE MALLOC
+    InvokeInst *OldInv = cast<InvokeInst>(CI);
+
+    IRBuilder<> IRB(OldInv->getParent(), OldInv->getIterator());
+    auto *Dest = OldInv->getNormalDest();
+    auto *UnwindDest = OldInv->getUnwindDest();
+    Value *OldInvokedFunc; // = OldInv->getCalledOperand()->stripPointerCasts();
+    FunctionType *OldInvokedFuncTy = nullptr;
+
+    // FETCH MALLOC SIGNATURE IF IT's MALLOC
+    if (formerAllocatorName == "malloc") {
+      OldInvokedFunc = M.getFunction("malloc");
+    }
+    if (formerAllocatorName == "calloc") {
+      OldInvokedFunc = M.getFunction("calloc");
+    }
+    if (formerAllocatorName == "realloc") {
+      OldInvokedFunc = M.getFunction("realloc");
+    } else
+      assert(false &&
+             "TODO  handle other allocators for invoke, currently only malloc");
+    if (Function *OldInvokedFuncAsFn = dyn_cast<Function>(OldInvokedFunc)) {
+      OldInvokedFuncTy = OldInvokedFuncAsFn->getFunctionType();
+    }
+
+    assert(OldInvokedFuncTy &&
+           "Failed to get function type of old invoked function");
+
+    InvokeInst *NewInvoke =
+        InvokeInst::Create(OldInvokedFuncTy, OldInvokedFunc, Dest, UnwindDest,
+                           arguments, "invoke.rewrite");
+    NewInvoke->setDebugLoc(OldInv->getDebugLoc());
+    NewInvoke->insertBefore(OldInv);
+    OldInv->replaceAllUsesWith(NewInvoke);
+    OldInv->eraseFromParent();
+    return NewInvoke;
+  }
+  IRBuilder<> IRB(CI);
+  CallBase *formerCall = IRB.CreateCall(formerFn, arguments);
+  CI->replaceAllUsesWith(formerCall);
+  // TODO: debug attributes, maybe you need to set some!
+  CI->eraseFromParent();
+  return formerCall;
+} // RewriteCall
+
+Value *HWAddressSanitizer::GetArraySize(CallBase *CI, std::string demangledName,
+                                        StructType *t, IRBuilder<> &IRB) {
+  assert(!demangledName.empty() && "Demangled name cannot be empty");
+  uint64_t typeSize = M.getDataLayout().getTypeAllocSize(t);
+
+  if (typeSize == 0) {
+    errs() << "Error: Type size is zero for type " << t->getName() << "\n";
+    errs() << "isOpaque = " << t->isOpaque() << "\n";
+    errs() << "Type dump:\n";
+    errs() << *t << "\n";
+    assert(typeSize != 0 &&
+           "Type size cannot be zero for allocation size reconstruction");
+  }
+
+  auto Int64Ty = Type::getInt64Ty(M.getContext());
+  PointerType *PtrTy = PointerType::getUnqual(M.getContext());
+
+  Value *TypeSizeValue =
+      ConstantInt::get(Int64Ty, typeSize); // size of the struct type
+  if (demangledName == "malloc" || demangledName == "valloc" ||
+      demangledName == "pvalloc") {
+    Value *MallocSizeValue = IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
+    return IRB.CreateUDiv(MallocSizeValue, TypeSizeValue);
+  } else if (demangledName == "calloc") {
+    return IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
+  } else if (demangledName == "realloc") {
+    Value *ReallocSizeValue = IRB.CreateZExt(CI->getArgOperand(1), Int64Ty);
+    return IRB.CreateUDiv(ReallocSizeValue, TypeSizeValue);
+  } else if (demangledName == "reallocarray") {
+    return IRB.CreateZExt(CI->getArgOperand(1), Int64Ty);
+  } else if (demangledName.find("operator new") != std::string::npos) {
+    bool isArrayNew = (demangledName.find("new[]") != std::string::npos);
+    Value *NewSizeValue = IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
+    if (isArrayNew) {
+      return IRB.CreateUDiv(NewSizeValue, TypeSizeValue);
+    } else {
+      return ConstantInt::get(Int64Ty, 1);
+    }
+  }
+  assert(false && "Allocator not handled for size reconstruction");
+  return nullptr;
+} // GetArraySize
 
 void HWAddressSanitizerPass::printPipeline(
     raw_ostream &OS, function_ref<StringRef(StringRef)> MapClassName2PassName) {
@@ -866,24 +1433,6 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
   IRB.CreateCall(Asm, R.PtrLong); // TODO: bring back
 }
 
-bool HWAddressSanitizer::ignoreMemIntrinsic(OptimizationRemarkEmitter &ORE,
-                                            MemIntrinsic *MI) {
-  if (MemTransferInst *MTI = dyn_cast<MemTransferInst>(MI)) {
-    return (!ClInstrumentWrites || ignoreAccess(ORE, MTI, MTI->getDest())) &&
-           (!ClInstrumentReads || ignoreAccess(ORE, MTI, MTI->getSource()));
-  }
-  if (isa<MemSetInst>(MI))
-    return !ClInstrumentWrites || ignoreAccess(ORE, MI, MI->getDest());
-  return false;
-}
-
-bool memcpyIsOOB(MemTransferInst *MTI, const DataLayout &DL) {
-  // return true if statically sized memcpy calls write past the bounds of a
-  // field
-  // TODO
-  return false;
-}
-
 void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
   auto arg0 = MI->getOperand(0);
   auto arg1 = MI->getOperand(1);
@@ -1033,7 +1582,6 @@ void HWAddressSanitizer::untagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
 
 } // untagAlloca
 
-// TODO: correctly handle aggregates of vectors
 void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
                                    const DataLayout &DL) {
   if (StructType *ST = dyn_cast<StructType>(AI->getAllocatedType())) {
@@ -1059,16 +1607,6 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
     }
     auto *ST = dyn_cast<StructType>(InTY);
     assert(ST && "Innermost element type of array must be struct for RLT");
-    // auto SizeWithPadding = DL.getTypeAllocSize(AT);
-    // errs() << "[FSAN-STACK] ARR-ALLOCA\n\t" << *AI << "\n\tST " << *ST
-    //        << "\n\tSZ " << SizeWithPadding << " FUNCTION "
-    //        << demangle(AI->getFunction()->getName()) << "\n";
-
-    // if (depth > 1) {
-    //   errs() << "[FSAN] TAG STV " << depth << "-D array, INTY " << *InTY
-    //          << ", nElems " << nElems << "\n";
-    // }
-
     auto *TV = RetrieveOrCreateTagVector(ST, M, depth);
     assert(TV && "Tag vector must exist here - tagAlloca");
 
@@ -1080,7 +1618,6 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
   } // ArrayType
 
   else {
-    // SPEC2017 never hits this case
     errs() << "[FSAN] WARNING: Alloca of unsupported type for RLT: "
            << *(AI->getAllocatedType()) << "\n";
     errs() << "Is vector? " << AI->getAllocatedType()->isVectorTy() << "\n";
@@ -1089,7 +1626,6 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
     errs() << "Is pointer? " << AI->getAllocatedType()->isPointerTy() << "\n";
     errs() << AI->getAllocatedType() << "\n";
   }
-
   return;
 } // tagAlloca
 
@@ -1112,17 +1648,6 @@ unsigned HWAddressSanitizer::retagMask(unsigned AllocaNo) {
       248, 56,  24, 8,   124, 252, 60,  28,  12,  4,  126, 254,
       62,  30,  14, 6,   2,   127, 63,  31,  15,  7,  3,   1};
   return FastMasks[AllocaNo % std::size(FastMasks)];
-}
-
-Value *HWAddressSanitizer::applyTagMask(IRBuilder<> &IRB, Value *OldTag) {
-  if (TagMaskByte == 0xFF)
-    return OldTag; // No need to clear the tag byte.
-  return IRB.CreateAnd(OldTag,
-                       ConstantInt::get(OldTag->getType(), TagMaskByte));
-}
-
-Value *HWAddressSanitizer::getNextTagWithCall(IRBuilder<> &IRB) {
-  return IRB.CreateZExt(IRB.CreateCall(HwasanGenerateTagFunc), IntptrTy);
 }
 
 // Add a tag to an address.
@@ -1167,40 +1692,6 @@ inline Value *HWAddressSanitizer::untagPointerIntrinsic(IRBuilder<> &IRB,
   return MaskedPtr;
 }
 
-// 0xFFFFFFFFFFFFFFFF
-
-inline Value *
-HWAddressSanitizer::MaskFuckingPointer(IRBuilder<> &IRB, Value *Ptr,
-                                       uint64_t Mask = 0xFFFFFFFFFFFFFFFFULL) {
-
-  Type *PtrTy = Ptr->getType();
-  unsigned PtrBits = M.getDataLayout().getPointerTypeSizeInBits(PtrTy);
-  Type *MaskTy = IntegerType::get(M.getContext(), PtrBits);
-  Value *MaskVal = ConstantInt::get(MaskTy, Mask);
-  // SIGNATURE: declare ptrty llvm.ptrmask(ptrty %ptr, intty %mask) speculatable
-  // memory(none)
-  Function *PtrMask =
-      Intrinsic::getDeclaration(&M, Intrinsic::ptrmask, {PtrTy, MaskTy});
-  Value *MaskedPtr = IRB.CreateCall(PtrMask, {Ptr, MaskVal});
-  return MaskedPtr;
-}
-
-Value *HWAddressSanitizer::tagPointerIntrinsic(IRBuilder<> &IRB,
-                                               Value *UntaggedPtr,
-                                               uint8_t Tag) {
-
-  // Type *PtrTy = UntaggedPtr->getType();
-  // unsigned PtrBits = M.getDataLayout().getPointerTypeSizeInBits(PtrTy);
-  // Type *MaskTy = IntegerType::get(M.getContext(), PtrBits);
-  // Value *MaskVal = ConstantInt::get(MaskTy, (Tag << PointerTagShift)z
-  // bool cond = MaskedPtr->getType() == Ptr->getType() &&
-  //             (MaskedPtr->getType()->getPointerAddressSpace() ==
-  //              Ptr->getType()->getPointerAddressSpace());
-  // assert(cond && "PTRMASK FUCKED UP");
-  // return MaskedPtr;
-  return nullptr;
-}
-
 Value *HWAddressSanitizer::getHwasanThreadSlotPtr(IRBuilder<> &IRB) {
   // Android provides a fixed TLS slot for sanitizers. See TLS_SLOT_SANITIZER
   // in Bionic's libc/platform/bionic/tls_defines.h.
@@ -1236,7 +1727,6 @@ Value *HWAddressSanitizer::getFrameRecordInfo(IRBuilder<> &IRB) {
 
 bool HWAddressSanitizer::instrumentLandingPads(
     SmallVectorImpl<Instruction *> &LandingPadVec) {
-
   return true;
 }
 
@@ -1431,17 +1921,13 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   if (!F.hasFnAttribute(Attribute::SanitizeHWAddress)) {
     return;
   }
-  // PROTOBUF: skip functions called "SharedCtor" TODO
 
   if (F.empty())
     return;
   // bool isCppConstructor = F.getName().str().find("C2E") != std::string::npos
   // ||
   //                         F.getName().str().find("C1E") != std::string::npos;
-  // if (isCppConstructor) {
-  //   errs() << "[FSAN] Skipping C++ constructor: " << F.getName() << "\n";
-  //   return;
-  // }
+
   NumTotalFuncs++;
   OptimizationRemarkEmitter &ORE =
       FAM.getResult<OptimizationRemarkEmitterAnalysis>(F);
@@ -1450,21 +1936,17 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   SmallVector<InterestingMemoryOperand, 16> OperandsToInstrument;
   SmallVector<MemIntrinsic *, 16> IntrinToInstrument;
-  SmallVector<Instruction *, 16> BuiltinsToCheck;
   SmallVector<Instruction *, 8> LandingPadVec;
-
-  // FieldArmor
   SmallVector<GetElementPtrInst *, 40> GEPsToInstrument;
   SmallVector<CmpInst *, 40> CMPsToInstrument;
-  SmallVector<ConstantExpr *, 40> ConstGEPsToInstrument;
+  SmallVector<CallBase *, 40> CallsToTypedAllocator;
+  SmallVector<CallBase *, 40> CallsToTypedNew;
   SmallVector<StoreInst *, 40> StoresToInstrument;
   SmallVector<BinaryOperator *, 40> BOPsToInstrument;
-  // FieldArmor
 
   const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
 
   memtag::StackInfoBuilder SIB(SSI, DEBUG_TYPE);
-  // TODO: SIB might be removing UB -> check if we want to use this!
   for (auto &Inst : instructions(F)) {
 
     if (InstrumentStack) {
@@ -1474,20 +1956,11 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     if (InstrumentLandingPads && isa<LandingPadInst>(Inst))
       LandingPadVec.push_back(&Inst);
 
-    // TODO: filter out something
-    // TODO: I am ignoring ORE at the moment, I think it's fine to have the
-    // RemarkEmitter emit info in SIB, just double check that it does not
-    // break stuff.
     getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
 
-    /* NOTE: ideally, one wants to instrument memcpy/memmove/memset only when
-     * they operate on non-root pointers*/
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
-      // if (!ignoreMemIntrinsic(ORE, MI))
       IntrinToInstrument.push_back(MI);
-    if (isCallToBuiltinFunction(&Inst)) {
-      BuiltinsToCheck.push_back(&Inst);
-    }
+
     if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(&Inst)) {
       GEPsToInstrument.push_back(GEPI);
     }
@@ -1495,6 +1968,17 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     if (CmpInst *CI = dyn_cast<CmpInst>(&Inst)) {
       CMPsToInstrument.push_back(CI);
     }
+
+    // HEAP instrumentation: calls & invokes
+    if (CallBase *CB = dyn_cast<CallBase>(&Inst)) {
+      if (IsTypedAllocator(CB))
+        CallsToTypedAllocator.push_back(CB);
+      else {
+        if (IsTypedNew(CB))
+          CallsToTypedNew.push_back(CB);
+      }
+    }
+
     if (auto *BO = dyn_cast<BinaryOperator>(&Inst)) {
       if (BO->getOpcode() == Instruction::Sub) {
         // NOTE: only subs, because adding ptrs should be against the standard
@@ -1507,13 +1991,6 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
         // NOTE: ptr additions make sense only if one of the two operands is an
         // integer offset. Ow they are just undefined behavior.
         BOPsToInstrument.push_back(BO);
-      }
-    }
-
-    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(&Inst)) {
-      if (CE->getOpcode() == Instruction::GetElementPtr) {
-        // TODO: get rid of this and check at the store/load operand level.
-        ConstGEPsToInstrument.push_back(CE);
       }
     }
   }
@@ -1534,7 +2011,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   if (SInfo.AllocasToInstrument.empty() && OperandsToInstrument.empty() &&
       IntrinToInstrument.empty() && GEPsToInstrument.empty() &&
       CMPsToInstrument.empty() && BOPsToInstrument.empty() &&
-      ConstGEPsToInstrument.empty() && BuiltinsToCheck.empty())
+      CallsToTypedAllocator.empty() && CallsToTypedNew.empty())
     return;
 
   assert(!ShadowBase);
@@ -1555,7 +2032,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     const DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
     const PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
     const LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
-    instrumentStack(SInfo, DT, PDT, LI, F.getDataLayout()); // KNOB
+    instrumentStack(SInfo, DT, PDT, LI, F.getDataLayout());
   }
 
   // If we split the entry block, move any allocas that were originally in the
@@ -1571,32 +2048,33 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     }
   }
 
-  // TODO: filter out checks.
+  if (ClFSAN_heap) {
+    for (auto *CB : CallsToTypedAllocator)
+      RewriteMallocLikeCall(CB);
+    for (auto *CB : CallsToTypedNew)
+      RewriteNewCall(CB);
+  }
 
   if (ClFSAN_memIntr && !IntrinToInstrument.empty()) {
     for (auto *Inst : IntrinToInstrument)
-      instrumentMemIntrinsic(Inst); // KNOB
-  }
-  if (!BuiltinsToCheck.empty()) {
-    for (auto *Inst : BuiltinsToCheck)
-      errs() << "[FSAN-DBG] Builtin call: " << *Inst << "\n";
+      instrumentMemIntrinsic(Inst);
   }
 
   if (ClFSAN_GEP) {
     for (auto &GEPI : GEPsToInstrument) {
-      InstrumentGEP(GEPI); // KNOB
+      InstrumentGEP(GEPI);
     }
   }
 
   if (ClFSAN_BOP) {
     for (auto &BOP : BOPsToInstrument) {
-      InstrumentBOP(BOP); // KNOB
+      InstrumentBOP(BOP);
     }
   }
 
   if (ClFSAN_CMP) {
     for (auto &CMPI : CMPsToInstrument) {
-      InstrumentCMP(CMPI); // KNOB
+      InstrumentCMP(CMPI);
     }
   }
   if (ClFSAN_memAccesses) {
@@ -1607,11 +2085,33 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     const DataLayout &DL = F.getDataLayout();
     if (ClFSAN_memAccesses)
       for (auto &Operand : OperandsToInstrument)
-        instrumentMemAccess(Operand, DTU, LI, DL); // KNOB
+        instrumentMemAccess(Operand, DTU, LI, DL);
     DTU.flush(); // TODO: does this have an interplay with optimizations?
   }
 
   ShadowBase = nullptr;
+}
+
+bool HWAddressSanitizer::IsTypedAllocator(CallBase *CB) {
+  Value *V = CB->getCalledOperand()->stripPointerCasts();
+  Function *Callee = dyn_cast<Function>(V);
+  auto demangledName = Callee ? llvm::demangle(Callee->getName().str()) : "";
+  return (Callee &&
+          demangledName.find("typed_allocation") != std::string::npos);
+}
+
+bool HWAddressSanitizer::IsTypedNew(CallBase *CB) {
+  Value *V = CB->getCalledOperand()->stripPointerCasts();
+  Function *Callee = dyn_cast<Function>(V);
+  auto demangledName = Callee ? llvm::demangle(Callee->getName().str()) : "";
+  bool AlignmentAware = demangledName.find("align_val_t") != std::string::npos;
+  if (AlignmentAware) {
+    // TODO
+    errs() << "[FSAN] SKIP NEW " << *CB
+           << " because it's alignment-aware. TODO.\n";
+  }
+  return (Callee && demangledName.find("operator new") != std::string::npos &&
+          !AlignmentAware);
 }
 
 void dumpGEPDebug(GetElementPtrInst *GEPI) {
@@ -2091,7 +2591,6 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     // errs() << "\n";
     return; // TODO: handle corner cases
   }
-  // taggedPointer = MaskFuckingPointer(IRB, taggedPointer);
   assert(taggedPointer->isPointerTy() &&
          "Tagged pointer must be of pointer type");
   llvm::Type *ptrTy = taggedPointer->getType();

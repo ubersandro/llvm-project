@@ -76,7 +76,7 @@ class Module;
 class StringRef;
 class raw_ostream;
 #if defined(__x86_64__)
-#define TAG_MAX (1ULL<<3) // x86 has 6 bits for tagging
+#define TAG_MAX (1ULL << 3) // x86 has 6 bits for tagging
 #elif defined(__aarch64__)
 #define TAG_MAX (1ULL << 5)
 // NOTE: we use some of the bits for tagging, the others for levels
@@ -201,11 +201,10 @@ private:
 
   void InstrumentGEP(GetElementPtrInst *GEPI);
   void InstrumentBOP(BinaryOperator *BOP);
-  void processOperand(Instruction *BOP, Value *OP1, int idx);
+  void processOperand(Instruction *BOP, Value *OP1,
+                      int idx); // untag operands of BOPs
   StructType *getStructTypeFromDbgInfo(GlobalVariable *GV, int *numElements,
                                        bool *isUnion);
-  void InstrumentStoreOfFunctionArg(StoreInst *SI);
-  Type *figureOutInheritance(const std::set<Type *> &structTypes);
   Value *GetArraySize(CallBase *CI, StructType *t,
                       IRBuilder<> &IRB); // FieldArmor
   void handleGEP2operands(GetElementPtrInst *GEPI);
@@ -276,7 +275,17 @@ private:
   Value *MaskFuckingPointer(IRBuilder<> &IRB, Value *Ptr, uint64_t Mask);
   bool instrumentLandingPads(SmallVectorImpl<Instruction *> &RetVec);
   Value *getNextTagWithCall(IRBuilder<> &IRB); // not sure I still need this
-
+  // HEAP
+  bool IsTypedAllocator(CallBase *CB);
+  bool IsTypedNew(CallBase *CB);
+  bool RewriteMallocLikeCall(CallBase *CB);
+  bool RewriteNewCall(CallBase *I);
+  CallBase *RewriteCall(CallBase *CI, Value *arraySize,
+                        const std::string &formerAllocatorName,
+                        bool *needsOffsetForCookie = nullptr);
+  Value *GetArraySize(CallBase *CI, std::string demangledName, StructType *t,
+                      IRBuilder<> &IRB);
+  // HEAP
   Value *getHwasanThreadSlotPtr(IRBuilder<> &IRB);
   Value *applyTagMask(IRBuilder<> &IRB, Value *OldTag);
   unsigned retagMask(unsigned AllocaNo);
