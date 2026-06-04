@@ -24,13 +24,13 @@ namespace RuntimeTaggingSupport {
 #if defined(__x86_64__)
 uint64_t TBits = 3;
 uint64_t LBits = 2;
-uint64_t MAX_LEVEL = (1 << LBits);
-uint64_t MAX_T = (1 << TBits); // 0b100000
+uint64_t L_MAX = (1ULL << LBits);
+uint64_t T_MAX = (1ULL << TBits); // 0b100000
 #else
 uint64_t TBits = 5;
 uint64_t LBits = 2;
-uint64_t MAX_LEVEL = (1 << LBits);
-uint64_t MAX_T = (1 << TBits); // 0b100000
+uint64_t L_MAX = (1ULL << LBits);
+uint64_t T_MAX = (1ULL << TBits); // 0b100000
 #endif
 
 __attribute__((noinline)) void createTagVector(StructType *ST, Module &M,
@@ -147,7 +147,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
   auto FieldsOffsets = DL.getStructLayout(Ty)->getMemberOffsets();
 
   uint8_t fatherT = 0;
-  uint8_t fatherL = depth & (MAX_LEVEL - 1); // modulo MAX_LEVEL --> level-aware
+  uint8_t fatherL = depth & (L_MAX - 1); // modulo L_MAX --> level-aware
   uint32_t sonIdx = 1;
   // NOTE: 2^^16 max number of fields
   if (FieldsOffsets.size() >= (1 << 16) - 1) {
@@ -229,7 +229,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
           DL.getStructLayout(cast<StructType>(CurFieldType))
               ->getMemberOffsets();
       size_t CurContainedSubTy = 0;
-      auto NextL = (fatherL + 1) & (MAX_LEVEL - 1); // modulo MAX_LEVEL
+      auto NextL = (fatherL + 1) & (L_MAX - 1); // modulo L_MAX
 
       for (Type *SSty : llvm::reverse(CurFieldType->subtypes())) {
         CurContainedSubTy =
@@ -258,7 +258,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         CurDepth++;
       }
       auto OverallDepth =
-          (CurDepth + 1 + fatherL) & (MAX_LEVEL - 1); // modulo MAX_LEVEL
+          (CurDepth + 1 + fatherL) & (L_MAX - 1); // modulo L_MAX
       // check type
       if (ElemType->isStructTy()) {
         // retrieve or create tag vector for struct type
@@ -280,7 +280,6 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
                    "Element tag must be a constant integer in the tag vector.");
             auto ElemTagValue = ElemTag->getZExtValue();
             // ADJUST LEVEL TO NEW NESTING SITUATION
-            // ElemTagValue &= (MAX_T - 1); // modulo MAX_T
             if(ElemTagValue!=0)
               ElemTagValue |= (OverallDepth << TBits);
 
@@ -293,10 +292,14 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
       } else {
         // scalar arrays get the same tag
         // NOTE: this case catches arrays with depth > MAX_DEPTH as well
-        uint8_t Tag = (sonIdx) & (MAX_T - 1); // modulo MAX_T
-        if (Tag == 0) {
-          Tag = 1;
+        uint64_t IdxModuloT_MAX = sonIdx % T_MAX;
+        uint64_t IdxDivT_MAX = sonIdx / T_MAX;
+        auto T = (IdxModuloT_MAX + IdxDivT_MAX);
+        if (T == T_MAX) {
+          T = 1;
         }
+        uint8_t Tag = T % T_MAX;
+
         Tag |= (fatherL << TBits);
         size_t ArraySize = DL.getTypeAllocSize(CurFieldType);
 
@@ -332,12 +335,15 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         memset(&Tags[CurFieldOffset], 0x00, DL.getTypeAllocSize(CurFieldType));
       } else {
         // scalar field
-        uint8_t CurFieldT = sonIdx & (MAX_T - 1); // modulo MAX_T
-        if (CurFieldT == 0) {
-          CurFieldT = 1U; // avoid 0 tag for scalar fields, which is the
-                          // default tag for padding and unions/literal structs
+        uint64_t IdxModuloT_MAX = sonIdx % T_MAX;
+        uint64_t IdxDivT_MAX = sonIdx / T_MAX;
+        auto T = (IdxModuloT_MAX + IdxDivT_MAX);
+        if (T == T_MAX) {
+          T = 1;
         }
-        uint8_t CurFieldTag = CurFieldT | (fatherL << TBits);
+        uint8_t Tag = T % T_MAX;
+
+        uint8_t CurFieldTag = Tag | (fatherL << TBits);
         int CurFieldSize = DL.getTypeAllocSize(CurFieldType);
         memset(&Tags[CurFieldOffset], CurFieldTag, CurFieldSize);
       }

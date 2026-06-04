@@ -4677,7 +4677,7 @@ Value *ScalarExprEmitter::EmitSub(const BinOpInfo &op) {
   llvm::Value *RHS =
       Builder.CreatePtrToInt(op.RHS, CGF.PtrDiffTy, "sub.ptr.rhs.cast");
   Value *diffInChars = Builder.CreateSub(LHS, RHS, "sub.ptr.sub");
-
+  // llvm::errs() << "CGExprScalar.cpp: diffInChars: " << *diffInChars << "\n";
   // Okay, figure out the element size.
   const BinaryOperator *expr = cast<BinaryOperator>(op.E);
   QualType elementType = expr->getLHS()->getType()->getPointeeType();

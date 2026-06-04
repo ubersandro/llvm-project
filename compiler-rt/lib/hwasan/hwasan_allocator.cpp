@@ -232,7 +232,7 @@ static void* HwasanAllocate(StackTrace* stack, uptr orig_size, uptr alignment,
   if (InTaggableRegion(reinterpret_cast<uptr>(user_ptr)) &&
       atomic_load_relaxed(&hwasan_allocator_tagging_enabled) &&
       flags()->tag_in_malloc && malloc_bisect(stack, orig_size)) {
-    tag_t tag = 0x0Lu;  // t ? t->GenerateRandomTag() : kFallbackAllocTag; RPTag
+    tag_t tag = 0;  // t ? t->GenerateRandomTag() : kFallbackAllocTag; RPTag
     // NOTE: ptr tagging will happen in the instrumentation.
     uptr tag_size = orig_size ? orig_size : 1;
     uptr full_granule_size = RoundDownTo(tag_size, kShadowAlignment);

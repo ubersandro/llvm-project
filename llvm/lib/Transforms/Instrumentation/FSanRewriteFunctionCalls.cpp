@@ -27,16 +27,17 @@ using namespace llvm;
 #define DEBUG_TYPE "fsan-rewrite"
 STATISTIC(NumCallsRewritten, "Number of allocator calls rewritten");
 
-static cl::opt<bool> ClInstrumentHeap("fsan-heap",
+static cl::opt<bool> ClInstrumentHeap("fsan-heaporcodio",
                                       cl::desc("instrument heap"), cl::Hidden,
-                                      cl::init(true));
+                                      cl::init(false));
 
 bool FSanRewriteFunctionCallsPass::isTypedMallocLike(CallBase *CB) {
   Value *V = CB->getCalledOperand()->stripPointerCasts();
   Function *Callee = dyn_cast<Function>(V);
   auto demangledName = Callee ? llvm::demangle(Callee->getName().str()) : "";
-  return (Callee && demangledName.find("typed_allocation") !=
-                        std::string::npos); // label for typed fnctn
+  return (Callee &&
+          demangledName.find("typed_allocation") != std::string::npos) &&
+         ClInstrumentHeap; // label for typed fnctn
 }
 
 bool FSanRewriteFunctionCallsPass::isTypedNewOperator(CallBase *CB) {
@@ -44,7 +45,8 @@ bool FSanRewriteFunctionCallsPass::isTypedNewOperator(CallBase *CB) {
   Function *Callee = dyn_cast<Function>(V);
   auto demangledName = Callee ? llvm::demangle(Callee->getName().str()) : "";
   return (Callee && demangledName.find("operator new") != std::string::npos &&
-          demangledName.find("align_val_t") == std::string::npos);
+          demangledName.find("align_val_t") == std::string::npos) &&
+         ClInstrumentHeap;
 }
 
 bool doCheckOnCookie(Value *V) {
@@ -312,6 +314,7 @@ Value *GetArraySize(CallBase *CI, std::string demangledName, Module &M,
 // NOTE: mallocs can be performed on ptr additions
 bool FSanRewriteFunctionCallsPass::ProcessMallocLikeCall(CallBase *CI,
                                                          Module &M) {
+  assert(false && "malloc NOPE");
   auto Int64Ty = Type::getInt64Ty(M.getContext());
   PointerType *PtrTy = PointerType::getUnqual(M.getContext());
   StructType *allocType = nullptr;
@@ -422,10 +425,10 @@ bool FSanRewriteFunctionCallsPass::ProcessMallocLikeCall(CallBase *CI,
     //   // set InsertPt
 
     // } else {
-    //   Instruction *Last = cast<CallInst>(newCI); // your %.fieldarmor.rewrite
-    //   BB = Last->getParent();
-    //   InsertPt = std::next(Last->getIterator());
-    //   while (InsertPt != BB->end() && InsertPt->isDebugOrPseudoInst())
+    //   Instruction *Last = cast<CallInst>(newCI); // your
+    //   %.fieldarmor.rewrite BB = Last->getParent(); InsertPt =
+    //   std::next(Last->getIterator()); while (InsertPt != BB->end() &&
+    //   InsertPt->isDebugOrPseudoInst())
     //     ++InsertPt;
     // }
 
@@ -492,7 +495,8 @@ void dbgSrcAndUses(CallBase *I) {
         Function *Invokee = dyn_cast<Function>(V);
         if (Invokee) {
           auto demangledNameOfInvoke = demangle(Invokee->getName().str());
-          // llvm::errs() << "\tINVOKE USR: " << demangledNameOfInvoke << "\n";
+          // llvm::errs() << "\tINVOKE USR: " << demangledNameOfInvoke <<
+          // "\n";
         }
       }
     }
@@ -500,6 +504,8 @@ void dbgSrcAndUses(CallBase *I) {
 }
 
 bool FSanRewriteFunctionCallsPass::ProcessNewCall(CallBase *I, Module &M) {
+  assert(false && "new NOPE");
+
   Value *V = I->getCalledOperand()->stripPointerCasts();
   bool changed = false;
   Function *Callee = dyn_cast<Function>(V);
@@ -607,13 +613,13 @@ bool FSanRewriteFunctionCallsPass::ProcessNewCall(CallBase *I, Module &M) {
         Value *whereToTagFrom = NewCI;
         bool isNewArray = demangledName.find("new[]") != std::string::npos;
         Value *Offset = nullptr;
-       
+
         if (isNewArray && needsOffsetForCookie) {
           Offset = IRB.CreateGEP(IRB.getInt8Ty(), // element type: i8 (1
-                                                         // byte per index unit)
-                                        NewCI,           // base pointer
-                                        IRB.getInt64(8), // offset by 8 bytes
-                                        "cookie_ptr");
+                                                  // byte per index unit)
+                                 NewCI,           // base pointer
+                                 IRB.getInt64(8), // offset by 8 bytes
+                                 "cookie_ptr");
           whereToTagFrom = Offset;
         }
 
@@ -672,13 +678,53 @@ void doQuickCheck(CallBase *CI) {
   }
 }
 
+void FSanRewriteFunctionCallsPass::debugCMP(CmpInst *cmp, Module &M) {
+  // FunctionCallee printfFunc = M.getOrInsertFunction(
+  //     "printf", FunctionType::get(IntegerType::getInt32Ty(M.getContext()),
+  //                                PointerType::getUnqual(M.getContext()),
+  //                                true));
+  // auto * CmpType = cmp->getOperand(0)->getType();
+  // if(CmpType->isPointerTy()){
+  //   IRBuilder<> IRB(cmp->getNextNonDebugInstruction());
+  //   Value *OP0 = cmp->getOperand(0);
+  //   Value *OP1 = cmp->getOperand(1);
+  //   Value *typeStr = IRB.CreateGlobalStringPtr(cmp->getOpcodeName());
+  //   Value *FormatStr = IRB.CreateGlobalStringPtr("CMP-%s: %llx, %p\n");
+  //   PointerType *PtrTy = PointerType::getUnqual(M.getContext());
+  //   IRB.CreateCall(printfFunc, {FormatStr, IRB.CreatePointerCast(OP0, PtrTy),
+  //   IRB.CreatePointerCast(OP1, PtrTy)});
+  // }
+}
+void FSanRewriteFunctionCallsPass::debugBOP(BinaryOperator *binOp, Module &M) {
+  // dump the operands in hex
+  FunctionCallee printfFunc = M.getOrInsertFunction(
+      "printf",
+      FunctionType::get(IntegerType::getInt32Ty(M.getContext()),
+                        PointerType::getUnqual(M.getContext()), true));
+  auto *Op0 = binOp->getOperand(0);
+  auto *Op1 = binOp->getOperand(1);
+  auto *Result = binOp;
+  IRBuilder<> IRB(binOp->getNextNonDebugInstruction());
+  bool isSub = binOp->getOpcode() == Instruction::Sub;
+  bool isAdd = binOp->getOpcode() == Instruction::Add;
+  if (!isSub && !isAdd)
+    return;
+  Value *typeStr = IRB.CreateGlobalStringPtr(isSub ? "SUB" : "ADD");
+
+  Value *FormatStr =
+      IRB.CreateGlobalStringPtr("BOP %s: %llx, %llx, result= %llx\n");
+  PointerType *PtrTy = PointerType::getUnqual(M.getContext());
+
+  IRB.CreateCall(printfFunc, {FormatStr, typeStr, Op0, Op1, Result});
+}
+
 PreservedAnalyses
 FSanRewriteFunctionCallsPass::run(Module &M, ModuleAnalysisManager &MAM) {
   bool changed = false;
-  if (!ClInstrumentHeap)
-    return PreservedAnalyses::all();
-  errs () << "[FSAN] Running FSanRewriteFunctionCallsPass on module: " << M.getName()
-         << "\n";
+  // if (!ClInstrumentHeap)
+  //   return PreservedAnalyses::all();
+  errs() << "[FSAN] Running FSanRewriteFunctionCallsPass on module: "
+         << M.getName() << "\n";
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
@@ -698,15 +744,28 @@ FSanRewriteFunctionCallsPass::run(Module &M, ModuleAnalysisManager &MAM) {
           } // if isTypedNewOperator
 
         } // if CallBase
+        {
+          // DEBUG for other passes
+          if (CmpInst *cmp = dyn_cast<CmpInst>(&I)) {
+            if (ClInstrumentHeap)
+              debugCMP(cmp, M);
+          }
+          if (BinaryOperator *binOp = dyn_cast<BinaryOperator>(&I)) {
+            if (ClInstrumentHeap)
+              debugBOP(binOp, M);
+          }
+        }
       } // for BB
     } // for
 
     for (CallBase *CI : typedMallocLikeToRewrite) {
-      changed |= ProcessMallocLikeCall(CI, M);
+      if (ClInstrumentHeap)
+        changed |= ProcessMallocLikeCall(CI, M);
     }
 
     for (CallBase *CI : typedNewOperatorToRewrite) {
-      changed |= ProcessNewCall(CI, M);
+      if (ClInstrumentHeap)
+        changed |= ProcessNewCall(CI, M);
     }
   }
   return (changed ? PreservedAnalyses::none() : PreservedAnalyses::all());

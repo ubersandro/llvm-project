@@ -6467,7 +6467,6 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
   if (enabled && CalleeDecl && FSAN::isAllocFD(CalleeDecl)) {
     // NOTE: this is too early for figuring out the assignment as well, because
     // of how the parser works.
-    // TODO: enforce that this is set, ow we lose type info!
     std::string IRTyNameStr = "PLACEHOLDER";
 
     // get ret type (void *)
@@ -6498,20 +6497,14 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
              getContext().getIntTypeForBitwidth(64, /*isSigned=*/true));
     // extra arg $3 -> name of the replace function (e.g. malloc for malloc
     // ,realloc for realloc etc)
-    auto FnNameStr = CalleeDecl->getName().str();
+    auto FnNameStr = CalleeDecl->getName().str(); // NOTE: not fully qualified name
+    auto FullyQualifiedName = CalleeDecl->getQualifiedNameAsString();
+    llvm::errs() << "FSAN-FE: REWRITING CALL TO: " << FullyQualifiedName << "\n";
     llvm::Value *OrigFnName = Builder.CreateGlobalString(FnNameStr);
     args.add(RValue::get(OrigFnName),
              getContext().getPointerType(getContext().CharTy));
-
     const CGFunctionInfo &fnInfo =
         CGM.getTypes().arrangeBuiltinFunctionCall(resultType, args);
-    llvm::FunctionType *fnTy = CGM.getTypes().GetFunctionType(fnInfo);
-    llvm::AttrBuilder fnAttrB(getLLVMContext());
-    fnAttrB.addAttribute(llvm::Attribute::NoUnwind);
-    fnAttrB.addAttribute(llvm::Attribute::WillReturn);
-    fnAttrB.addAttribute(llvm::Attribute::NoAlias);
-    llvm::AttributeList fnAttrs = llvm::AttributeList::get(
-        getLLVMContext(), llvm::AttributeList::FunctionIndex, fnAttrB);
 
     // Try to reuse an existing declaration of typed_allocation if present,
     // otherwise insert one with the requested function type and attach the

@@ -25,6 +25,8 @@ private:
   // bool InstrumentCMP(CmpInst *CI);
   bool ProcessMallocLikeCall(CallBase *CB, Module &M);
   bool ProcessNewCall(CallBase *I, Module &M);
+  void debugCMP(CmpInst* cmp, Module &M);
+  void debugBOP(BinaryOperator* binOp, Module &M  );
 };
 
 }

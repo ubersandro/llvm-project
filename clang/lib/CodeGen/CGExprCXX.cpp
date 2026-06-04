@@ -1352,15 +1352,23 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
       Args.add(RValue::get(typeNamePtr), ctx.getPointerType(ctx.CharTy));
     } // !typeName.empty()
     else {
-      // placement new case
+      // placement new case???? NOT QUITE
+      // llvm::errs() << "[DBG-FE] WHAT IS THIS?" << "\n";
+      // llvm::errs() << "[DBG-FE] CALLEE NAME: " << calleeName << "\n";
+      // llvm::errs() << "[DBG-FE] CALLEE DECL: " << *CalleeDecl << "\n";
+      // CAUSE A FUCKING CRASH
+      // llvm::Value * ptr = nullptr;
+      // llvm::Value *crash = llvm::UndefValue::get(ptr->getType());
+
       llvm::Value *typeNamePtr =
           CGF.Builder.CreateGlobalString("PLACEMENT", "PLACEMENT_TYPE");
       Args.add(RValue::get(typeNamePtr), ctx.getPointerType(ctx.CharTy));
     }
     if (cookie) {
-      // llvm::errs() << "[DBG-FE] ADDING A COOKIE MARKER TO THE NEW CALL" << "\n";
-      llvm::Value *cookieStr =
-          CGF.Builder.CreateGlobalString("PINO_PALETTA", "PINO_PALETTA"); // TODO: move this out of here
+      // llvm::errs() << "[DBG-FE] ADDING A COOKIE MARKER TO THE NEW CALL" <<
+      // "\n";
+      llvm::Value *cookieStr = CGF.Builder.CreateGlobalString(
+          "PINO_PALETTA", "PINO_PALETTA"); // TODO: move this out of here
       Args.add(RValue::get(cookieStr), ctx.getPointerType(ctx.CharTy));
       // set name for cookieR to "pinobiscotto"
     }
@@ -1394,7 +1402,10 @@ RValue CodeGenFunction::EmitBuiltinNewDeleteCall(const FunctionProtoType *Type,
   ASTContext &Ctx = getContext();
   DeclarationName Name =
       Ctx.DeclarationNames.getCXXOperatorName(IsDelete ? OO_Delete : OO_New);
-
+  
+  // llvm::errs() << "[DBG-FE] EmitBuiltinNewDeleteCall: NAME "
+  //              << Name.getAsString()
+  //              << (IsDelete ? " operator delete " : " operator new ") << "\n ";
   for (auto *Decl : Ctx.getTranslationUnitDecl()->lookup(Name))
     if (auto *FD = dyn_cast<FunctionDecl>(Decl))
       if (Ctx.hasSameType(FD->getType(), QualType(Type, 0)))
@@ -1627,19 +1638,22 @@ static void EnterNewDeleteCleanup(CodeGenFunction &CGF, const CXXNewExpr *E,
 llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   // The element type being allocated.
   // llvm::errs() << "[FE] EmitCXXNewExpr: CALLED on SRC LOC: "
-  //              << E->getExprLoc().printToString(getContext().getSourceManager())
+  //              <<
+  //              E->getExprLoc().printToString(getContext().getSourceManager())
   //              << ", TYPE: " << E->getAllocatedType().getAsString() << "\n";
   bool guard = false;
 
   QualType allocType = getContext().getBaseElementType(E->getAllocatedType());
   // auto IRType = ConvertTypeForMem(allocType);
-  // std::string IRTypeName = IRType->isStructTy() ? IRType->getStructName().str()
+  // std::string IRTypeName = IRType->isStructTy() ?
+  // IRType->getStructName().str()
   //                                               : allocType.getAsString();
   // 1. Build a call to the allocation function.
   FunctionDecl *allocator = E->getOperatorNew();
   // llvm::errs() << "\t[DBG-FE] Allocator: "
   //              << allocator->getQualifiedNameAsString() << ", SRC LOC: "
-  //              << E->getExprLoc().printToString(getContext().getSourceManager())
+  //              <<
+  //              E->getExprLoc().printToString(getContext().getSourceManager())
   //              << "\n";
   // allocator->dump();
 
@@ -1714,7 +1728,10 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
     LValueBaseInfo BaseInfo;
     allocation = EmitPointerWithAlignment(arg, &BaseInfo);
-
+    QualType allocType = E->getAllocatedType();
+    llvm::Type *TypeForMem = ConvertTypeForMem(allocType);
+    if(TypeForMem->isStructTy())
+      // llvm::errs() << "[DBG] placement new type: " << *TypeForMem << "\n"; // DEBUG
     // The pointer expression will, in many cases, be an opaque void*.
     // In these cases, discard the computed alignment and use the
     // formal alignment of the allocated type.
@@ -1790,8 +1807,10 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
     { // DBG
       // llvm::errs() << "\t[FE] EmitCXXNewExpr: ALLOCATOR: "
-      //              << allocator->getQualifiedNameAsString() << ", ALLOC TYPE: "
-      //              << allocatorType->getReturnType().getAsString() << ", args";
+      //              << allocator->getQualifiedNameAsString() << ", ALLOC TYPE:
+      //              "
+      //              << allocatorType->getReturnType().getAsString() << ",
+      //              args";
       // for (unsigned i = 0, e = allocatorArgs.size(); i != e; ++i) {
       //   llvm::errs() << "\n  ARG " << i << ": "
       //                << allocatorArgs[i].getType().getAsString() << " = ";
@@ -1802,10 +1821,12 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     } // DBG
 
     QualType AllocatedQualType = E->getAllocatedType();
+    auto *TypeForMem = ConvertTypeForMem(AllocatedQualType);
+    // if (TypeForMem->isStructTy())
+    //   llvm::errs() << "[FSAN-FE]: new struct type: " << *TypeForMem << "\n";
+
     std::string typeName =
-        ConvertTypeForMem(AllocatedQualType)->isStructTy()
-            ? ConvertTypeForMem(AllocatedQualType)->getStructName().str()
-            : "scalar";
+        TypeForMem->isStructTy() ? TypeForMem->getStructName().str() : "scalar";
     // at this point, we have all the right arguments only, no extra args yet
     RValue RV =
         EmitNewDeleteCall(*this, allocator, allocatorType, allocatorArgs,
@@ -1910,7 +1931,6 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   EmitNewInitializer(*this, E, allocType, elementTy, result, numElements,
                      allocSizeWithoutCookie);
   // emit store of a string to this resultPtr, make it non volatile
-  // FSAN::persistWithStore(Builder, result, IRTypeName, ArraySize, *this, CGM);
   llvm::Value *resultPtr = result.emitRawPointer(*this);
 
   // Deactivate the 'operator delete' cleanup if we finished
@@ -1955,16 +1975,16 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   //                    llvm::ValueAsMetadata::get(llvm::ConstantInt::get(
   //                        llvm::Type::getInt64Ty(LLVMCtx), ArraySize)),
   //                });
-    // llvm::errs() << "\t\tMD >> FSanMD for new-expression: ";
-    // FSanMD->print(llvm::errs());
-    // llvm::errs() << ", resultPtr: ";
-    // resultPtr->print(llvm::errs());
-    // llvm::errs() << ", SRC LOC OF NEW: ";
-    // E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
-    // llvm::errs() << "\n";
-    // if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(resultPtr))
-    //   I->setMetadata("fsan.new", FSanMD); // TODO: not sure about his...
-    // FSAN
+  // llvm::errs() << "\t\tMD >> FSanMD for new-expression: ";
+  // FSanMD->print(llvm::errs());
+  // llvm::errs() << ", resultPtr: ";
+  // resultPtr->print(llvm::errs());
+  // llvm::errs() << ", SRC LOC OF NEW: ";
+  // E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
+  // llvm::errs() << "\n";
+  // if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(resultPtr))
+  //   I->setMetadata("fsan.new", FSanMD); // TODO: not sure about his...
+  // FSAN
   // }
 
   return resultPtr;

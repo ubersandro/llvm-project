@@ -76,9 +76,9 @@ class Module;
 class StringRef;
 class raw_ostream;
 #if defined(__x86_64__)
-#define TAG_MAX (1ULL << 3) // x86 has 6 bits for tagging
+#define T_MAX (1ULL << 3) // x86 has 6 bits for tagging
 #elif defined(__aarch64__)
-#define TAG_MAX (1ULL << 5)
+#define T_MAX (1ULL << 5)
 // NOTE: we use some of the bits for tagging, the others for levels
 #endif
 

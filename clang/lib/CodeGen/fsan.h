@@ -10,13 +10,14 @@ namespace FSAN {
 
 // NOTE: no new operator, that's a different story
 inline std::set<std::string> allocFunctions = {"malloc", "realloc", "calloc",
-                                               "reallocarray"};
+                                               "reallocarray", "std::malloc", "std::realloc", "std::calloc",
+                                               "std::reallocarray"};
 // TODO: handle more!
 // "memalign",
 // "aligned_alloc", "posix_memalign", "valloc", "pvalloc"};
 inline std::set<std::string> fullsetOfAllocFunctions = {
     "malloc",        "realloc",        "calloc", "reallocarray", "memalign",
-    "aligned_alloc", "posix_memalign", "valloc", "pvalloc"};
+    "aligned_alloc", "posix_memalign", "valloc", "pvalloc", "std::malloc", "std::realloc", "std::calloc", "std::reallocarray"};
 
 inline bool isAllocCall(const clang::CallExpr *Call) {
   if (!Call)
@@ -30,7 +31,9 @@ inline bool isAllocCall(const clang::CallExpr *Call) {
     const clang::IdentifierInfo *II = FD->getIdentifier();
     if (!II)
       return false;
-    return allocFunctions.count(II->getName().str()) > 0;
+    auto FullyQualifiedName = FD->getQualifiedNameAsString();
+    return /*allocFunctions.count(II->getName().str()) > 0 ||*/
+           fullsetOfAllocFunctions.count(FullyQualifiedName) > 0;
   };
 
   // Case 1: direct call
@@ -77,7 +80,9 @@ inline bool isAllocFD(const clang::FunctionDecl *FD) {
     const clang::IdentifierInfo *II = FD->getIdentifier();
     if (!II)
       return false;
-    return allocFunctions.count(II->getName().str()) > 0;
+    auto FullyQualifiedName = FD->getQualifiedNameAsString();
+    return /*allocFunctions.count(II->getName().str()) > 0 ||*/
+           allocFunctions.count(FullyQualifiedName) > 0;
   };
 
   bool ret = matchesAllocFn(FD);
@@ -208,6 +213,8 @@ TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
             llvm::StringRef IRPointeeTyName(IRTyNameStr);
             llvm::Value *NewTypeStr =
                 CGF.Builder.CreateGlobalString(IRPointeeTyName);
+            llvm::errs() << "[FSAN-FE] Replacing placeholder type string with: " << IRPointeeTyName
+                         << "\n";
             CI->setArgOperand(typeStrArgIdx, NewTypeStr);
           }
         }

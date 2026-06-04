@@ -79,6 +79,11 @@ static cl::opt<bool> ClFSAN_heap("fsan-instrument-heap",
                                  cl::desc("instrument heap"), cl::Hidden,
                                  cl::init(true));
 
+static cl::opt<bool>
+    ClFSAN_tag_heap("fsan-tag-heap",
+                    cl::desc("insert call to tagging function for heap"),
+                    cl::Hidden, cl::init(true));
+
 static cl::opt<bool> ClFSAN_memIntr("fsan-instrument-mem-intrinsics",
                                     cl::desc("instrument memory intrinsics"),
                                     cl::Hidden, cl::init(true));
@@ -92,7 +97,7 @@ static cl::opt<bool> ClInstrumentReads("hwasan-instrument-reads",
                                        cl::desc("instrument read instructions"),
                                        cl::Hidden, cl::init(true));
 static cl::opt<bool> ClSkipUnnamedStructs(
-    "hwasan-skip-unnamed-structs",
+    "fsan-skip-unnamed-structs",
     cl::desc("skip instrumentation of unnamed struct types"), cl::Hidden,
     cl::init(true));
 
@@ -230,7 +235,6 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
     HWASan.sanitizeFunction(F, FAM);
   }
 
-  // TODO: this needs changes for sure
   PreservedAnalyses PA = PreservedAnalyses::none();
   // DominatorTreeAnalysis, PostDominatorTreeAnalysis, and LoopAnalysis
   // are incrementally updated throughout this pass whenever
@@ -342,7 +346,7 @@ bool HWAddressSanitizer::RewriteMallocLikeCall(CallBase *CI) {
   NewCI->setName(oldName + ".fieldarmor.rewrite");
   bool changed = true;
 
-  if (allocType && !dontTag && !allocType->isOpaque()) {
+  if (allocType && !dontTag && !allocType->isOpaque() && ClFSAN_tag_heap) {
     auto *NextInst = NewCI->getNextNonDebugInstruction();
     Instruction *InsertPt = nullptr;
     BasicBlock *BB;
@@ -358,6 +362,10 @@ bool HWAddressSanitizer::RewriteMallocLikeCall(CallBase *CI) {
     } else
       InsertPt = NewCI->getNextNonDebugInstruction(); // insert right after
                                                       // the new call
+    while (InsertPt && isa<PHINode>(InsertPt))
+      InsertPt = InsertPt->getNextNode();
+    assert(InsertPt &&
+           "Failed to find insertion point for tagging after malloc-like call");
     IRBuilder<> IRB(InsertPt);
     Value *ArraySize = nullptr;
     int32_t extractedArraySize = 0;
@@ -373,37 +381,34 @@ bool HWAddressSanitizer::RewriteMallocLikeCall(CallBase *CI) {
            "Failed to compute array size for typed allocation");
 
     TypeSize tSize = M.getDataLayout().getTypeAllocSize(allocType);
-
-    FunctionCallee fsan_tag_memory = M.getOrInsertFunction(
-        "fsan_tag_memory", Int64Ty, PtrTy, PtrTy, Int64Ty, Int64Ty);
     auto *TagVector =
         RuntimeTaggingSupport::RetrieveOrCreateTagVector(allocType, M);
     assert(TagVector &&
            "Failed to retrieve or create tag vector for struct type");
-    auto *call = IRB.CreateCall(fsan_tag_memory,
-                                {IRB.CreatePointerCast(NewCI, PtrTy),
-                                 IRB.CreatePointerCast(TagVector, PtrTy),
-                                 ConstantInt::get(Int64Ty, tSize), ArraySize});
-    Value *NewCILong = IRB.CreatePtrToInt(NewCI, IntptrTy);
-    Value *TaggedNewCI = tagPointer(IRB, NewCI->getType(), NewCILong,
-                                    ConstantInt::get(IntptrTy, RPTag));
-    NewCI->replaceUsesWithIf(TaggedNewCI, [NewCI,
-                                           NewCILong](const Use &U) {
-      auto *User = U.getUser();
-      bool isCallToFSANTagMemory =
-          isa<CallInst>(User) && cast<CallInst>(User)->getCalledFunction() &&
-          cast<CallInst>(User)->getCalledFunction()->hasName() &&
-          cast<CallInst>(User)->getCalledFunction()->getName().str().find(
-              "fsan_tag_memory") != std::string::npos;
-      bool safe = !isa<LifetimeIntrinsic>(User);
-      safe &= !isa<DbgInfoIntrinsic>(User);
-      safe &= !isCallToFSANTagMemory;
-      safe &= (User != NewCILong);
-      return safe;
-    });
+
+    IRB.CreateCall(FSANTaggingFunc,
+                   {IRB.CreatePointerCast(NewCI, PtrTy),
+                    IRB.CreatePointerCast(TagVector, PtrTy),
+                    ConstantInt::get(Int64Ty, tSize), ArraySize});
+    // Value *NewCILong = IRB.CreatePtrToInt(NewCI, IntptrTy);
+    // Value *TaggedNewCI = tagPointer(IRB, NewCI->getType(), NewCILong,
+    //                                 ConstantInt::get(IntptrTy, RPTag));
+    // NewCI->replaceUsesWithIf(TaggedNewCI, [NewCI, NewCILong](const Use &U) {
+    //   auto *User = U.getUser();
+    //   bool isCallToFSANTagMemory =
+    //       isa<CallInst>(User) && cast<CallInst>(User)->getCalledFunction() &&
+    //       cast<CallInst>(User)->getCalledFunction()->hasName() &&
+    //       cast<CallInst>(User)->getCalledFunction()->getName().str().find(
+    //           "fsan_tag_memory") != std::string::npos;
+    //   bool safe = !isa<LifetimeIntrinsic>(User);
+    //   safe &= !isa<DbgInfoIntrinsic>(User);
+    //   safe &= !isCallToFSANTagMemory;
+    //   safe &= (User != NewCILong);
+    //   return safe;
+    // });
 
     if (ClFSAN_verbose)
-      errs() << "\t\t[FSAN] malloc-like tag\n\t" << *call
+      errs() << "\t\t[FSAN-PASS] malloc-like tag\n\t" << *NewCI
              << "\n\ttype: " << structName << "\n\tarray size: " << *ArraySize
              << "\n";
   }
@@ -445,6 +450,7 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
         if (dataArray->isString()) {
           StringRef structNameRef = dataArray->getAsString();
           structName = structNameRef.str().substr(0, structNameRef.size() - 1);
+          // errs() << "\t\t[FSAN] new name " << structName << "\n";
           allocType =
               StructType::getTypeByName(Callee->getContext(), structName);
         } else {
@@ -458,6 +464,7 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
                   StringRef structNameRef = dataArray->getAsString();
                   std::string structName =
                       structNameRef.str().substr(0, structNameRef.size() - 1);
+                  // errs() << "\t\t[FSAN] new name " << structName << "\n";
                   allocType = StructType::getTypeByName(Callee->getContext(),
                                                         structName);
                 }
@@ -482,7 +489,8 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       return true;
     }
 
-    if (allocType && allocType->isStructTy() && !allocType->isOpaque()) {
+    if (allocType && allocType->isStructTy() && !allocType->isOpaque() &&
+        ClFSAN_tag_heap) {
       Instruction *InsertPt = nullptr;
 
       if (InvokeInst *Invoke = dyn_cast<InvokeInst>(NewCI)) {
@@ -498,6 +506,10 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
                                                         // the new call
       assert(InsertPt && "Failed to find insertion point for tagging after "
                          "new operator call");
+
+      // iterate on instructions after InsertPt, reach first NON-PHI instruction
+      while (InsertPt && isa<PHINode>(InsertPt))
+        InsertPt = InsertPt->getNextNode();
       IRBuilder<> IRB(InsertPt);
 
       // TODO: check on array size post FP
@@ -505,10 +517,6 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       assert(ArraySize != nullptr &&
              "Failed to compute array size for typed allocation");
       TypeSize tSize = M.getDataLayout().getTypeAllocSize(allocType);
-      auto Int64Ty = Type::getInt64Ty(M.getContext());
-      PointerType *PtrTy = PointerType::getUnqual(M.getContext());
-      FunctionCallee fsan_tag_memory = M.getOrInsertFunction(
-          "fsan_tag_memory", Int64Ty, PtrTy, PtrTy, Int64Ty, Int64Ty);
       auto *TagVector =
           RuntimeTaggingSupport::RetrieveOrCreateTagVector(allocType, M);
       assert(TagVector &&
@@ -523,34 +531,41 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
                                NewCI,           // base pointer
                                IRB.getInt64(8), // offset by 8 bytes
                                "cookie_ptr");
+        Offset->setName(NewCI->getName() + ".cookie_offset");
         whereToTagFrom = Offset;
+        errs() << "\t\t[FSAN] new[] with cookie, tagging from offset pointer: "
+               << *Offset << "\n";
       }
 
-      IRB.CreateCall(fsan_tag_memory,
+      // NOTE: tagged pointer coming out of this could be offset by 8, cannot be
+      // replaced as a drop in replacement with the original new operator call
+      IRB.CreateCall(FSANTaggingFunc,
                      {IRB.CreatePointerCast(whereToTagFrom, PtrTy),
                       IRB.CreatePointerCast(TagVector, PtrTy),
                       ConstantInt::get(Int64Ty, tSize), ArraySize});
 
-      Value *NewCILong = IRB.CreatePtrToInt(NewCI, IntptrTy);
-      Value *TaggedNewCI = tagPointer(IRB, NewCI->getType(), NewCILong,
-                                      ConstantInt::get(IntptrTy, RPTag));
-      NewCI->replaceUsesWithIf(TaggedNewCI, [NewCI, Offset, NewCILong](const Use &U) {
-        auto *User = U.getUser();
-        bool isCallToFSANTagMemory =
-            isa<CallInst>(User) && cast<CallInst>(User)->getCalledFunction() &&
-            cast<CallInst>(User)->getCalledFunction()->hasName() &&
-            cast<CallInst>(User)->getCalledFunction()->getName().str().find(
-                "fsan_tag_memory") != std::string::npos;
-        bool safe = !isa<LifetimeIntrinsic>(User);
-        safe &= !isa<DbgInfoIntrinsic>(User);
-        safe &= !isCallToFSANTagMemory;
-        safe &= (Offset != nullptr && User != Offset) || Offset == nullptr;
-        safe &= (User != NewCILong); 
-        return safe;
-      });
+      // IRB.SetInsertPoint(cast<Instruction>(newInsertPoint->getNextNonDebugInstruction()));
+      // Value *NewCILong = IRB.CreatePtrToInt(NewCI, IntptrTy);
+      // Value *TaggedNewCI = tagPointer(IRB, NewCI->getType(), NewCILong,
+      //                                 ConstantInt::get(IntptrTy, RPTag));
+      // NewCI->replaceUsesWithIf(TaggedNewCI, [NewCI, Offset,
+      //                                        NewCILong](const Use &U) {
+      //   auto *User = U.getUser();
+      //   bool isCallToFSANTagMemory =
+      //       isa<CallInst>(User) && cast<CallInst>(User)->getCalledFunction()
+      //       && cast<CallInst>(User)->getCalledFunction()->hasName() &&
+      //       cast<CallInst>(User)->getCalledFunction()->getName().str().find(
+      //           "fsan_tag_memory") != std::string::npos;
+      //   bool safe = !isa<LifetimeIntrinsic>(User);
+      //   safe &= !isa<DbgInfoIntrinsic>(User);
+      //   safe &= !isCallToFSANTagMemory;
+      //   safe &= (Offset != nullptr && User != Offset) || Offset == nullptr;
+      //   safe &= (User != NewCILong);
+      //   return safe;
+      // });
 
       if (ClFSAN_verbose)
-        errs() << "\t\t[FSAN] new operator tag\n\t" << *TaggedNewCI
+        errs() << "\t\t[FSAN] new operator tag\n\t" << *NewCI
                << "\n\ttype: " << structName << "\n\tarray size: " << *ArraySize
                << "\n";
       changed = true;
@@ -783,28 +798,33 @@ Value *HWAddressSanitizer::GetArraySize(CallBase *CI, std::string demangledName,
 
   Value *TypeSizeValue =
       ConstantInt::get(Int64Ty, typeSize); // size of the struct type
+  Value *Ret = nullptr;
+
   if (demangledName == "malloc" || demangledName == "valloc" ||
       demangledName == "pvalloc") {
     Value *MallocSizeValue = IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
-    return IRB.CreateUDiv(MallocSizeValue, TypeSizeValue);
+    // return IRB.CreateUDiv(MallocSizeValue, TypeSizeValue);
+    Ret = IRB.CreateUDiv(MallocSizeValue, TypeSizeValue);
   } else if (demangledName == "calloc") {
-    return IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
+    Ret = IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
   } else if (demangledName == "realloc") {
     Value *ReallocSizeValue = IRB.CreateZExt(CI->getArgOperand(1), Int64Ty);
-    return IRB.CreateUDiv(ReallocSizeValue, TypeSizeValue);
+    Ret = IRB.CreateUDiv(ReallocSizeValue, TypeSizeValue);
   } else if (demangledName == "reallocarray") {
-    return IRB.CreateZExt(CI->getArgOperand(1), Int64Ty);
+    Ret = IRB.CreateZExt(CI->getArgOperand(1), Int64Ty);
   } else if (demangledName.find("operator new") != std::string::npos) {
     bool isArrayNew = (demangledName.find("new[]") != std::string::npos);
     Value *NewSizeValue = IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
     if (isArrayNew) {
-      return IRB.CreateUDiv(NewSizeValue, TypeSizeValue);
+      Ret = IRB.CreateUDiv(NewSizeValue, TypeSizeValue);
     } else {
-      return ConstantInt::get(Int64Ty, 1);
+      Ret = ConstantInt::get(Int64Ty, 1);
     }
   }
-  assert(false && "Allocator not handled for size reconstruction");
-  return nullptr;
+  assert(Ret != nullptr &&
+         "Failed to reconstruct array size for allocator: " + demangledName);
+  Ret->setName(CI->getName() + ".array_size");
+  return Ret;
 } // GetArraySize
 
 void HWAddressSanitizerPass::printPipeline(
@@ -949,6 +969,7 @@ void HWAddressSanitizer::initializeModule() {
     errs() << "[FSAN] CMP " << (ClFSAN_CMP ? " ON\n" : " OFF\n");
     errs() << "[FSAN] GEP " << (ClFSAN_GEP ? " ON\n" : " OFF\n");
     errs() << "[FSAN] GLOBAL " << (ClFSAN_globals ? " ON\n" : " OFF\n");
+    errs() << "[FSAN] HEAP " << (ClFSAN_heap ? " ON\n" : " OFF\n");
   }
 
   PointerTagShift = IsX86_64 ? 57 : 56;
@@ -2060,12 +2081,6 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       instrumentMemIntrinsic(Inst);
   }
 
-  if (ClFSAN_GEP) {
-    for (auto &GEPI : GEPsToInstrument) {
-      InstrumentGEP(GEPI);
-    }
-  }
-
   if (ClFSAN_BOP) {
     for (auto &BOP : BOPsToInstrument) {
       InstrumentBOP(BOP);
@@ -2077,6 +2092,12 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       InstrumentCMP(CMPI);
     }
   }
+  if (ClFSAN_GEP) {
+    for (auto &GEPI : GEPsToInstrument) {
+      InstrumentGEP(GEPI);
+    }
+  }
+
   if (ClFSAN_memAccesses) {
     DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
     PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
@@ -2201,63 +2222,65 @@ bool checkIfPtr(Value *V) { return getBasePtrToInt(V) != nullptr; }
 
 // detectin and handling arithmetics is still an open problem and very hard to
 // tackle at IR
+// TODO: this is overapproximated in that it does use help from FE and it does
+// not keep into consideration the case in which both ops are pointers and then
+// their result if used in the current BOP
 void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
   auto DL = M.getDataLayout();
   auto *OP0 = BOP->getOperand(0);
   auto *OP1 = BOP->getOperand(1);
-  {
-    if (BOP->getOpcode() == Instruction::Add) {
-      /**
-       * BOPsToInstrument
-       * %282 = ptrtoint ptr %281 to i64, !dbg !866067
-       * ...
-       * %291 = load ptr, ptr %__pos_.i.fsan.scalar, align 8
-       *  %292 = ptrtoint ptr %291 to i64,
-          %293 = add i64 %282, -4, !dbg !866071
-          %.neg = sub i64 0, %292, !dbg !866071
-          %294 = add i64 %293, %.neg, !dbg !866071 <-
-          %295 = lshr i64 %294, 2, !dbg !866071
-          %296 = mul nuw i64 %295, 4, !dbg !866071
-          %297 = add i64 %296, 4, !dbg !866071
-          tail call void @llvm.memset.p0.i64(ptr align 4 %291, i8 -1, i64 %297,
-       i1 false)
-       */
-      bool IsOp0Neg = OP0->hasName() &&
-                      OP0->getName().str().find(".neg") != std::string::npos;
-      bool IsOp1Neg = OP1->hasName() &&
-                      OP1->getName().str().find(".neg") != std::string::npos;
-      if (IsOp0Neg || IsOp1Neg) {
-        assert(!(IsOp0Neg && IsOp1Neg) && "Both operands cannot be negations");
-        Value *NegOp = IsOp0Neg ? OP0 : OP1;
-        Value *OtherOp = IsOp0Neg ? OP1 : OP0;
-        bool isOP0ptr = checkIfPtr(OtherOp);
-        bool isOP1ptr = checkIfPtr(OtherOp);
+  IRBuilder<> IRB(BOP);
 
-        if ((isOP0ptr || isOP1ptr)) {
-          // do something ...
-          PtrToIntInst *PTIOther = getBasePtrToInt(OtherOp);
-          PtrToIntInst *PTINeg = getBasePtrToInt(NegOp);
-          if (PTIOther && PTINeg) {
+  if (BOP->getOpcode() == Instruction::Add) {
+    /**
+     * BOPsToInstrument
+     * %282 = ptrtoint ptr %281 to i64, !dbg !866067
+     * ...
+     * %291 = load ptr, ptr %__pos_.i.fsan.scalar, align 8
+     *  %292 = ptrtoint ptr %291 to i64,
+        %293 = add i64 %282, -4, !dbg !866071
+        %.neg = sub i64 0, %292, !dbg !866071
+        %294 = add i64 %293, %.neg, !dbg !866071 <-
+        %295 = lshr i64 %294, 2, !dbg !866071
+        %296 = mul nuw i64 %295, 4, !dbg !866071
+        %297 = add i64 %296, 4, !dbg !866071
+        tail call void @llvm.memset.p0.i64(ptr align 4 %291, i8 -1, i64 %297,
+     i1 false)
+     */
+    bool IsOp0Neg = OP0->hasName() &&
+                    OP0->getName().str().find(".neg") != std::string::npos;
+    bool IsOp1Neg = OP1->hasName() &&
+                    OP1->getName().str().find(".neg") != std::string::npos;
+    if (IsOp0Neg || IsOp1Neg) {
+      assert(!(IsOp0Neg && IsOp1Neg) && "Both operands cannot be negations");
+      Value *NegOp = IsOp0Neg ? OP0 : OP1;
+      Value *OtherOp = IsOp0Neg ? OP1 : OP0;
+      bool isOtherOpPtr = checkIfPtr(OtherOp);
 
-            auto *PtrOther = PTIOther->getOperand(0);
-            auto *PtrNeg = PTINeg->getOperand(0);
+      if (isOtherOpPtr) {
+        PtrToIntInst *PTIOther = getBasePtrToInt(OtherOp);
+        PtrToIntInst *PTINeg = getBasePtrToInt(NegOp);
+        if (PTIOther && PTINeg) {
 
-            IRBuilder<> IRBOther(PTIOther);
-            auto *NewPtrOther = untagPointerIntrinsic(IRBOther, PtrOther);
-            PTIOther->setOperand(0, NewPtrOther);
+          auto *PtrOther = PTIOther->getOperand(0);
+          auto *PtrNeg = PTINeg->getOperand(0);
 
-            IRBuilder<> IRBNeg(PTINeg);
-            auto *NewPtrNeg = untagPointerIntrinsic(IRBNeg, PtrNeg);
-            PTINeg->setOperand(0, NewPtrNeg);
+          IRBuilder<> IRBOther(PTIOther);
+          auto *NewPtrOther = untagPointerIntrinsic(IRBOther, PtrOther);
+          PTIOther->setOperand(0, NewPtrOther);
 
-            errs() << "[FSAN] Instrumented BOP with negation: " << *BOP << "\n";
-          }
-        }
-      } // IsOp0Neg || IsOp1Neg
-    }
-  } // CASE ADDITION
+          IRBuilder<> IRBNeg(PTINeg);
+          auto *NewPtrNeg = untagPointerIntrinsic(IRBNeg, PtrNeg);
+          PTINeg->setOperand(0, NewPtrNeg);
+          return; // case ADD
+        } else
+          assert(false &&
+                 "Both operands should have a ptrtoint in their def-use chain");
+      }
+    } // IsOp0Neg || IsOp1Neg
+  } // if ADD
 
-  // if both operands are pointers, untag them before the subtraction
+  // case SUB
   bool BothPtr = false;
   BothPtr = dyn_cast<PtrToIntInst>(OP0) && dyn_cast<PtrToIntInst>(OP1);
 
@@ -2271,11 +2294,87 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
       if (CE1->getOpcode() == Instruction::PtrToInt)
         BothPtr = IsPtr0 && true;
   }
-  if (!BothPtr)
-    return;
 
-  processOperand(BOP, OP0, 0);
-  processOperand(BOP, OP1, 1);
+  if (!BothPtr) {
+    // look for sub.ptr in the operands name
+    if ((OP0->hasName() &&
+         OP0->getName().str().find("sub.ptr") != std::string::npos &&
+         OP0->getName().str().find(".cast") != std::string::npos) &&
+        (OP1->hasName() &&
+         OP1->getName().str().find("sub.ptr") != std::string::npos &&
+         OP1->getName().str().find(".cast") != std::string::npos)) {
+      BothPtr = true;
+    }
+  }
+
+  if (!BothPtr) {
+    FunctionCallee printf = M.getOrInsertFunction(
+        "printf",
+        FunctionType::get(IntegerType::getInt32Ty(M.getContext()),
+                          PointerType::get(Type::getInt8Ty(M.getContext()), 0),
+                          true));
+    IRBuilder<> IRB(BOP);
+
+    // errs() << "[FSAN] SKIP BOP " << *BOP << ", in function "
+    //        << BOP->getFunction()->getName() << ", in file "
+    //        << BOP->getFunction()->getParent()->getSourceFileName() << "\n";
+
+    // NOTE: InstCombine + FrontEnd are responsible for this shame
+
+    auto *PTI_LHS = getBasePtrToInt(OP0);
+    auto *PTI_RHS = getBasePtrToInt(OP1);
+    if (PTI_LHS && PTI_RHS && (BOP->getOpcode() == Instruction::Sub)) {
+      // Value *FormatStr = IRB.CreateGlobalStringPtr(
+      //     "BOP SKIP: %s, OP0: %s %p, OP1: %s %p, FUN %s\n");
+      // bool isAdd = BOP->getOpcode() == Instruction::Add;
+      // Value *FuncName = IRB.CreateGlobalStringPtr(isAdd ? "ADD" : "SUB");
+      // Value *FUNC_NAME =
+      //     IRB.CreateGlobalStringPtr(BOP->getFunction()->getName());
+      // Value *OP0NAME_global = OP0->hasName()
+      //                             ? IRB.CreateGlobalStringPtr(OP0->getName())
+      //                             : IRB.CreateGlobalStringPtr("unnamed");
+      // Value *OP1NAME_global = OP1->hasName()
+      //                             ? IRB.CreateGlobalStringPtr(OP1->getName())
+      //                             : IRB.CreateGlobalStringPtr("unnamed");
+      // IRB.CreateCall(printf, {FormatStr, FuncName, OP0NAME_global, OP0,
+      //                         OP1NAME_global, OP1, FUNC_NAME});
+      errs() << "[FSAN] BOP CORNER CASE: " << *BOP << "\n";
+      errs() << "\tOP0: " << *OP0 << "\n";
+      errs() << "\tOP1: " << *OP1 << "\n";
+      errs() << "\tPTI_LHS: " << *PTI_LHS << "\n";
+      errs() << "\tPTI_RHS: " << *PTI_RHS << "\n";
+
+      // TODO: does this introduce issues? With other related operations?
+      IRBuilder IRB(PTI_LHS);
+      auto *NewPtrLHS = untagPointerIntrinsic(IRB, PTI_LHS->getOperand(0));
+      PTI_LHS->setOperand(0, NewPtrLHS);
+
+      IRBuilder IRB2(PTI_RHS);
+      auto *NewPtrRHS = untagPointerIntrinsic(IRB2, PTI_RHS->getOperand(0));
+      PTI_RHS->setOperand(0, NewPtrRHS);
+    } else {
+      Value *FormatStr = IRB.CreateGlobalStringPtr(
+          "BOP SKIP: %s, OP0: %s %p, OP1: %s %p, FUN %s\n");
+      bool isAdd = BOP->getOpcode() == Instruction::Add;
+      Value *FuncName = IRB.CreateGlobalStringPtr(isAdd ? "ADD" : "SUB");
+      Value *FUNC_NAME =
+          IRB.CreateGlobalStringPtr(BOP->getFunction()->getName());
+      Value *OP0NAME_global = OP0->hasName()
+                                  ? IRB.CreateGlobalStringPtr(OP0->getName())
+                                  : IRB.CreateGlobalStringPtr("unnamed");
+      Value *OP1NAME_global = OP1->hasName()
+                                  ? IRB.CreateGlobalStringPtr(OP1->getName())
+                                  : IRB.CreateGlobalStringPtr("unnamed");
+      IRB.CreateCall(printf, {FormatStr, FuncName, OP0NAME_global, OP0,
+                              OP1NAME_global, OP1, FUNC_NAME});
+    }
+
+    return;
+  }
+
+  // TODO: check if this is always true
+  processOperand(BOP, OP0, 0); // OP0 is a ptrtoint
+  processOperand(BOP, OP1, 1); // OP1 is a ptrtoint
 }
 
 bool isArrayOfAggregates(llvm::Type *T) {
@@ -2345,9 +2444,6 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   auto PTR_OP_NAME = GEPI->getPointerOperand()->hasName()
                          ? GEPI->getPointerOperand()->getName().str()
                          : "gep.ptr.op." + itostr(NumInstrumentedGEPs);
-  // if (PTR_OP_NAME.find("agg.tmp") != std::string::npos && ClFSAN_verbose) {
-  //   dumpGEPDebug(GEPI);
-  // }
 
   if (GEPI->getType()->isVectorTy()) {
     // NOTE: if loops are being vectorized, this will happen. TODO.
@@ -2364,8 +2460,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   bool isScalar = false;
 
   // compute this only where needed
-  Value *FatherLevel = nullptr;
-
+  Value *FatherLevel = nullptr; // level of ptr operand
   // NOTE: aggregates here are either structs or arrays of structs.
   if (SrcType->isArrayTy()) {
     // if array of structs, L=L+1, R set, T unused
@@ -2379,8 +2474,6 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
       // R always set
       // T unused
       auto Operand = GEPI->getPointerOperand();
-      // bool SrcIsDecay =
-      //     Operand->getName().find("arraydecay") != std::string::npos;
       bool DstIsStruct = DstType->isStructTy();
       Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
       Value *Tag = nullptr;
@@ -2434,15 +2527,20 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
     if (SrcType->isStructTy()) {
       StructType *ST = dyn_cast<StructType>(SrcType);
       bool tag = true;
+      // unnamed structs are used in extractvalues and might be a sign of type
+      // coercion
 
       if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
         // IDEA: remove FPs caused by type coercion when frontend implements
         // efficient copy
+        // TODO: does this introduce FNs?
         tag = false;
         GEPI->setMetadata("fsan_skip_gep", MDNode::get(M.getContext(), {}));
         taggedPointer =
             IRB.CreatePtrToInt(untagPointerIntrinsic(IRB, GEPI), IntptrTy);
-        endResultName = GEPNAME + ".fsan.untagged";
+        endResultName =
+            GEPNAME + ".fsan.untagged"; // TODO: establish proper propagation
+                                        // rules for this
       }
 
       // if (ST && ST->hasName() && ST->getName().str().find("union.") == 0) {
@@ -2488,12 +2586,19 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
         if (ConstantInt *CI = dyn_cast<ConstantInt>(op2)) {
           idx = (uint64_t)CI->getZExtValue();
-          if (idx == (TAG_MAX - 1)) {
-            idx = 0; // ADJ tag to prevent null T
+          uint64_t IdxModuloT_MAX = (idx + 1) % T_MAX;
+          uint64_t IdxDivT_MAX = (idx + 1) / T_MAX;
+          // errs() << "[FSAN] GEP struct->scalar with constant idx: " << idx
+          //        << ", IdxModuloT_MAX: " << IdxModuloT_MAX
+          //        << ", IdxDivT_MAX: " << IdxDivT_MAX << "\n";
+          // NOTE: this could still go to 0
+          auto T = (IdxModuloT_MAX + IdxDivT_MAX);
+          if (T == T_MAX) {
+            T = 1;
           }
           sonTag = ConstantInt::get(
               IntptrTy,
-              (idx + 1) % TAG_MAX); // +1 to avoid 0, which means untagged
+              T % T_MAX); // +1 to avoid 0, which means untagged
         } else {
           assert(false &&
                  "Non-constant GEP index not supported in struct GEPs for now");
@@ -2514,7 +2619,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         //      << "GEP: ";
         // GEPI->print(errs());
         // errs() << "\n";
-        taggedPointer = untagPointerIntrinsic(IRB, GEPI), IntptrTy;
+        taggedPointer = untagPointerIntrinsic(IRB, GEPI);
         endResultName = GEPNAME + ".fsan.untagged";
       } else {
         // tag = 1
@@ -2544,7 +2649,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
           else {
             Tag =
-                AddOneModuloSomething(IRB, FatherLevel, LevelMask); // L = L + 1
+                AddOneModuloSomething(IRB, FatherLevel, LevelMask); // L = L +1
           }
 
           Tag = IRB.CreateShl(Tag, TBits);
@@ -2594,34 +2699,6 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   assert(taggedPointer->isPointerTy() &&
          "Tagged pointer must be of pointer type");
   llvm::Type *ptrTy = taggedPointer->getType();
-
-  // 2. Define the FunctionType representing the assembly block's signature.
-  // It takes the candidate pointer as an argument and returns the frozen
-  // pointer.
-  llvm::FunctionType *asmFnTy =
-      llvm::FunctionType::get(ptrTy,   // Return type
-                              {ptrTy}, // Argument types
-                              false    // Is variadic
-      );
-
-  // 3. Create the InlineAsm object
-  llvm::InlineAsm *tagBarrierAsm = llvm::InlineAsm::get(
-      asmFnTy, // The function signature we just built
-      "",      // The assembly string (empty, zero-cost at runtime)
-      "=r,r",  // Output and Input constraints
-      true     // hasSideEffects (corresponds to 'sideeffect' in IR)
-  );
-
-  // 4. Generate the call instruction using your IRBuilder
-  llvm::Value *taggedPtr =
-      IRB.CreateCall(asmFnTy,         // Explicitly provide the function type
-                     tagBarrierAsm,   // The InlineAsm value
-                     {taggedPointer}, // The input argument list
-                     "tagged_ptr" // Optional name for the resulting IR register
-      );
-
-  // 'taggedPtr' now contains the optimization-resistant pointer
-
   taggedPointer->setName(endResultName);
 
   GEPI->replaceUsesWithIf(taggedPointer, [GEPI, isScalar,
@@ -2832,11 +2909,8 @@ void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
         NameOp2.find("magicptr") != std::string::npos) {
       // simplifycfg can generate CMPs where ptrs are cast directly to int and
       // have "magicptr" in their name
-
-      // errs() << "[FSAN] CMP magicptr: " << *CI << ", ty: ";
-      // cmpType->print(errs());
-      // errs() << "\n";
-
+      errs() << "[FSAN] CMP magic " << "OP1: " << NameOp1
+             << ", OP2: " << NameOp2 << "\n";
       IRBuilder<> IRB(CI);
       auto *Mask = ConstantInt::get(cmpType, ~(TagMaskByte << PointerTagShift));
       auto untaggedPtr1 = IRB.CreateAnd(op1, Mask);
