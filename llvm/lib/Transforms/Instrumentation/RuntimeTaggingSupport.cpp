@@ -295,10 +295,11 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         uint64_t IdxModuloT_MAX = sonIdx % T_MAX;
         uint64_t IdxDivT_MAX = sonIdx / T_MAX;
         auto T = (IdxModuloT_MAX + IdxDivT_MAX);
-        if (T == T_MAX) {
+        T = T % T_MAX;
+        if (T == 0) {
           T = 1;
         }
-        uint8_t Tag = T % T_MAX;
+        uint8_t Tag = T;
 
         Tag |= (fatherL << TBits);
         size_t ArraySize = DL.getTypeAllocSize(CurFieldType);

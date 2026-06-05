@@ -2572,9 +2572,10 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           uint64_t IdxModuloT_MAX = (idx + 1) % T_MAX;
           uint64_t IdxDivT_MAX = (idx + 1) / T_MAX;
           auto T = (IdxModuloT_MAX + IdxDivT_MAX);
-          if (T == T_MAX)
+          T = T % T_MAX;
+          if (T == 0)
             T = 1;
-          sonTag = ConstantInt::get(IntptrTy, T % T_MAX);
+          sonTag = ConstantInt::get(IntptrTy, T);
         } else
           assert(false &&
                  "Non-constant GEP index?");
