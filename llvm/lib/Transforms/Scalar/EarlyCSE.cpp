@@ -1854,7 +1854,7 @@ bool EarlyCSE::run() {
 }
 
 PreservedAnalyses EarlyCSEPass::run(Function &F, FunctionAnalysisManager &AM) {
-  return PreservedAnalyses::all();
+  return PreservedAnalyses::all(); // FSAN
   auto &TLI = AM.getResult<TargetLibraryAnalysis>(F);
   auto &TTI = AM.getResult<TargetIRAnalysis>(F);
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);

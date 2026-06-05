@@ -2353,6 +2353,7 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
       auto *NewPtrRHS = untagPointerIntrinsic(IRB2, PTI_RHS->getOperand(0));
       PTI_RHS->setOperand(0, NewPtrRHS);
     } else {
+      return;
       Value *FormatStr = IRB.CreateGlobalStringPtr(
           "BOP SKIP: %s, OP0: %s %p, OP1: %s %p, FUN %s\n");
       bool isAdd = BOP->getOpcode() == Instruction::Add;
@@ -2399,10 +2400,12 @@ Value *HWAddressSanitizer::extractLevelFromPointer(IRBuilder<> &IRB,
       MaskTy, PtrMaskForLevel); // preserve L bits, not even R, still shifted
   Function *PtrMaskFcn =
       Intrinsic::getDeclaration(&M, Intrinsic::ptrmask, {PtrTy, MaskTy});
-  Value *LevelShifted = IRB.CreateCall(PtrMaskFcn, {Ptr, MaskVal});
+
+  Value *LevelShifted = IRB.CreateCall(PtrMaskFcn, {Ptr, MaskVal}); // AND
   Value *LevelShiftedInt = IRB.CreatePtrToInt(LevelShifted, IntptrTy);
-  Value *Level = IRB.CreateLShr(LevelShiftedInt, PointerTagShift + TBits);
-  Level->setName("Level");
+  Value *Level =
+      IRB.CreateLShr(LevelShiftedInt, PointerTagShift + TBits); // SHIFT
+  Level->setName("FatherL");
   return Level;
 }
 
@@ -2448,9 +2451,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   if (GEPI->getType()->isVectorTy()) {
     // NOTE: if loops are being vectorized, this will happen. TODO.
     errs() << "[FSAN] UNHANDLED GEP with vector result type: ";
-    GEPI->print(errs());
-    errs() << "\n";
-    return;
+    assert(false && "This should not happen if loop opts are disabled");
   }
 
   IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
@@ -2458,52 +2459,34 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   std::string endResultName = "";
   Value *taggedPointer = nullptr;
   bool isScalar = false;
-
-  // compute this only where needed
-  Value *FatherLevel = nullptr; // level of ptr operand
-  // NOTE: aggregates here are either structs or arrays of structs.
+  Value *FatherLevel = nullptr; // level of ptr operand, only computed if needed
   if (SrcType->isArrayTy()) {
-    // if array of structs, L=L+1, R set, T unused
+    // if N-dimensional array of structs, L=L+1, R set, T unused (WIP)
     // if array of non-structs, L=L, R=0, T=idx
     bool isAggregateOfStructs = isArrayOfAggregates(DstType);
+    bool DstIsStruct = DstType->isStructTy();
 
-    if (DstType->isStructTy() ||
-        (isAggregateOfStructs)) { /** GEP into array of aggregates -> could be
-                                     struct or array */
+    if (DstIsStruct || (isAggregateOfStructs)) {
       // L=L+1
       // R always set
       // T unused
-      auto Operand = GEPI->getPointerOperand();
-      bool DstIsStruct = DstType->isStructTy();
+      auto PtrOp = GEPI->getPointerOperand();
       Value *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
       Value *Tag = nullptr;
-      // EXAMPLE of decay add
-      // %add.ptr.i = getelementptr inbounds nuw %struct.pix_pos, ptr
-      // %arraydecay.fsan.array, i64 1, !dbg !9444 bool isDecayAdd =
-      // GEPI->getName().str().find("add.ptr") != std::string::npos;
-      // errs() << "GEP NAME: " << GEPI->getName() << "\n";
-      // errs() << *GEPI << "\n";
-      // if (SrcIsDecay) {
-      //   if (ClFSAN_verbose) {
-      //     errs() << "[FSAN] ARRAY DECAY GEP: ";
-      //     GEPI->print(errs());
-      //     errs() << "\n";
-      //   }
-      // }
 
       bool isDecayAdd =
           GEPI->getName().str().find("add.ptr") != std::string::npos;
       bool IsArrayIdx = GEPI->hasName() && GEPI->getName().str().find(
                                                "arrayidx") != std::string::npos;
-      FatherLevel = extractLevelFromPointer(IRB, GEPI->getOperand(0));
+      FatherLevel = extractLevelFromPointer(IRB, PtrOp);
       if (isDecayAdd || IsArrayIdx) {
         if (ClFSAN_verbose) {
           errs() << "ARRAY DECAY + STRUCT GEP: ";
           GEPI->print(errs());
           errs() << "\n";
         }
-
-        Tag = FatherLevel;
+        Tag = FatherLevel; // preserve L since we are indexing the array
+                           // starting from the pointer to the first element
       } else
         Tag = AddOneModuloSomething(IRB, FatherLevel, LevelMask);
 
@@ -2516,19 +2499,19 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
                      IRB.CreatePtrToInt(untaggedResult, IntptrTy), Tag);
     } // GEP array->aggregate
     else {
-      // // L = L, R = 0, T = idx
+      // array of non-structs. Preserve L, we are flattening it.
+      // L = L, R = 0, T = idx
       taggedPointer = GEPI;
       endResultName = GEPNAME + ".fsan.scalar.array";
     }
-
   } // GEP from array type
 
   else { /** father is not array */
     if (SrcType->isStructTy()) {
       StructType *ST = dyn_cast<StructType>(SrcType);
       bool tag = true;
-      // unnamed structs are used in extractvalues and might be a sign of type
-      // coercion
+      // NOTE: unnamed structs are used in extractvalues and might be a sign of
+      // type coercion
 
       if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
         // IDEA: remove FPs caused by type coercion when frontend implements
@@ -2588,25 +2571,17 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           idx = (uint64_t)CI->getZExtValue();
           uint64_t IdxModuloT_MAX = (idx + 1) % T_MAX;
           uint64_t IdxDivT_MAX = (idx + 1) / T_MAX;
-          // errs() << "[FSAN] GEP struct->scalar with constant idx: " << idx
-          //        << ", IdxModuloT_MAX: " << IdxModuloT_MAX
-          //        << ", IdxDivT_MAX: " << IdxDivT_MAX << "\n";
-          // NOTE: this could still go to 0
           auto T = (IdxModuloT_MAX + IdxDivT_MAX);
-          if (T == T_MAX) {
+          if (T == T_MAX)
             T = 1;
-          }
-          sonTag = ConstantInt::get(
-              IntptrTy,
-              T % T_MAX); // +1 to avoid 0, which means untagged
-        } else {
+          sonTag = ConstantInt::get(IntptrTy, T % T_MAX);
+        } else
           assert(false &&
-                 "Non-constant GEP index not supported in struct GEPs for now");
-        }
+                 "Non-constant GEP index?");
 
         Value *untagged = untagPointerIntrinsic(IRB, GEPI);
         Value *untaggedLong = IRB.CreatePtrToInt(untagged, IntptrTy);
-        FatherLevel = extractLevelFromPointer(IRB, GEPI->getOperand(0));
+        FatherLevel = extractLevelFromPointer(IRB, GEPI->getPointerOperand());
         FatherLevel = IRB.CreateShl(FatherLevel, TBits); // adj L bits
         sonTag = IRB.CreateOr(sonTag, FatherLevel);
         taggedPointer = tagPointer(IRB, GEPI->getType(), untaggedLong, sonTag);
@@ -2614,11 +2589,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         isScalar = true;
       } // GEP struct -> scalar
       else if (!tag) {
-        // TODO
-        // errs() << "[FSAN] UNTAGGED "
-        //      << "GEP: ";
-        // GEPI->print(errs());
-        // errs() << "\n";
+        // sometimes, we might not want to tag the GEP
         taggedPointer = untagPointerIntrinsic(IRB, GEPI);
         endResultName = GEPNAME + ".fsan.untagged";
       } else {
@@ -2660,8 +2631,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           endResultName = GEPNAME + ".fsan" +
                           (DstType->isStructTy() ? ".struct" : ".array");
         }
-      } // else - son is not scalar
-
+      } // else - son is either not scalar or arrayOfAggregates
     } // FATHER IS STRUCT
     else {
       // SRC Type is neither an array nor a struct -> what is it then?
@@ -2918,6 +2888,26 @@ void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
       auto untaggedPtr2 = IRB.CreateAnd(op2, Mask);
       CI->replaceUsesOfWith(op2, untaggedPtr2);
       NumInstrumentedCMPs++;
+    } else {
+      return;
+      IRBuilder<> IRB(CI);
+      FunctionCallee printf = M.getOrInsertFunction(
+          "printf",
+          FunctionType::get(
+              IntegerType::getInt32Ty(M.getContext()),
+              PointerType::get(Type::getInt8Ty(M.getContext()), 0), true));
+      Value *FormatStr =
+          IRB.CreateGlobalStringPtr("CMP SKIP: %s, OP0: %s %p, OP1: %s %p\n");
+      Value *FUNC_NAME =
+          IRB.CreateGlobalStringPtr(CI->getFunction()->getName());
+      Value *OP0NAME_global = op1->hasName()
+                                  ? IRB.CreateGlobalStringPtr(op1->getName())
+                                  : IRB.CreateGlobalStringPtr("unnamed");
+      Value *OP1NAME_global = op2->hasName()
+                                  ? IRB.CreateGlobalStringPtr(op2->getName())
+                                  : IRB.CreateGlobalStringPtr("unnamed");
+      IRB.CreateCall(printf, {FormatStr, FUNC_NAME, OP0NAME_global, op1,
+                              OP1NAME_global, op2});
     }
   }
 } // InstrumentCMP
