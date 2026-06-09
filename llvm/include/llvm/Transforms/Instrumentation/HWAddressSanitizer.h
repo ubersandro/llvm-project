@@ -270,6 +270,8 @@ private:
                        const DataLayout &DL);
   Value *extractLevelFromPointer(IRBuilder<> &IRB, Value *Ptr);
   Value *zeroOutLevelBits(IRBuilder<> &IRB, Value *Ptr);
+  Value *maskPointerIntrinsic(IRBuilder<> &IRB, Value *Ptr, uint64_t Mask);
+
   Value *AddOneModuloSomething(IRBuilder<> &IRB, Value *Addendum,
                                uint64_t Mask);
   Value *MaskFuckingPointer(IRBuilder<> &IRB, Value *Ptr, uint64_t Mask);
@@ -369,7 +371,10 @@ private:
 
   unsigned PointerTagShift;
   unsigned LevelShift;
-  uint64_t LevelMask;
+  uint64_t LMask;
+  uint64_t TMask;
+  uint64_t RMask;
+
   unsigned TBits;
   unsigned LBits;
 

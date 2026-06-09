@@ -1115,9 +1115,9 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     }
 
     // NOTE: adding another one of these passes, since LTO could mess up the IR
-    if (LangOpts.Sanitize.has(SanitizerKind::HWAddress)) {
-      MPM.addPass(FSanRewriteFunctionCallsPass());
-    }
+    // if (LangOpts.Sanitize.has(SanitizerKind::HWAddress)) {
+    //   MPM.addPass(FSanRewriteFunctionCallsPass());
+    // }
     
     // untag pointers in ptr subtractions
     if (LangOpts.Sanitize.has(SanitizerKind::FSanitizer)) {

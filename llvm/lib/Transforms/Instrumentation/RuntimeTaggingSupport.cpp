@@ -53,7 +53,7 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M,
   auto isAnonStructOrClass = ST->getName().str().find("struct.anon") == 0 ||
                              ST->getName().str().find("class.anon") == 0;
   bool SkipAnonStruct =
-      isAnonStructOrClass && clFSAN_SKIP_ANON_STRUCTS.getValue();
+      isAnonStructOrClass && clFSAN_SKIP_ANON_STRUCTS;
   if (SkipAnonStruct)
     errs() << "[FSAN - TAG] Skipping anonymous struct " << *ST << "\n";
   auto demangledTypeName = demangle(ST->getStructName().str());

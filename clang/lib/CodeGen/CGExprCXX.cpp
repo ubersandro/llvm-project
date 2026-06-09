@@ -1402,10 +1402,11 @@ RValue CodeGenFunction::EmitBuiltinNewDeleteCall(const FunctionProtoType *Type,
   ASTContext &Ctx = getContext();
   DeclarationName Name =
       Ctx.DeclarationNames.getCXXOperatorName(IsDelete ? OO_Delete : OO_New);
-  
+
   // llvm::errs() << "[DBG-FE] EmitBuiltinNewDeleteCall: NAME "
   //              << Name.getAsString()
-  //              << (IsDelete ? " operator delete " : " operator new ") << "\n ";
+  //              << (IsDelete ? " operator delete " : " operator new ") << "\n
+  //              ";
   for (auto *Decl : Ctx.getTranslationUnitDecl()->lookup(Name))
     if (auto *FD = dyn_cast<FunctionDecl>(Decl))
       if (Ctx.hasSameType(FD->getType(), QualType(Type, 0)))
@@ -1728,10 +1729,30 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
     LValueBaseInfo BaseInfo;
     allocation = EmitPointerWithAlignment(arg, &BaseInfo);
+    llvm::errs() << "[DBG-FE] PLACEMENT NEW: ";
+    E->dump();
+    llvm::errs() << "[DBG-FE] SRC LOC: ";
+    E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
     QualType allocType = E->getAllocatedType();
     llvm::Type *TypeForMem = ConvertTypeForMem(allocType);
-    if(TypeForMem->isStructTy())
-      // llvm::errs() << "[DBG] placement new type: " << *TypeForMem << "\n"; // DEBUG
+
+    if (TypeForMem->isStructTy()) {
+      llvm::errs() << "\n\t[DBG-FE] TYPE: " << *TypeForMem << "\n";
+      // is it an array?
+      if (TypeForMem->isArrayTy()) {
+        llvm::errs() << "\n\t[DBG-FE] ARRAY of SIZE"
+                     << TypeForMem->getArrayNumElements() << "\n";
+      }
+      // TODO: untag the shadow memory where the struct is being allocated to
+      // prevent FPs if the allocation buffer is inside a struct (nested array)
+
+      bool allocationBufferIsInsideStruct = false;
+      // arg is the allocation buffer, the first placement argument
+      llvm::errs() << "\t allocation buffer: ";
+      arg->dump();
+      llvm::errs() << "\n";
+    }
+
     // The pointer expression will, in many cases, be an opaque void*.
     // In these cases, discard the computed alignment and use the
     // formal alignment of the allocated type.
@@ -1798,27 +1819,16 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
       allocatorArgs.add(
           RValue::get(llvm::ConstantInt::get(SizeTy, allocAlign.getQuantity())),
           AlignValT);
+      llvm::errs() << "\t[DBG-FE] aligned new" << ", SRC LOC: "
+                   << E->getExprLoc().printToString(
+                          getContext().getSourceManager())
+                   << "\n";
     }
 
     // FIXME: Why do we not pass a CalleeDecl here?
     EmitCallArgs(allocatorArgs, allocatorType, E->placement_arguments(),
                  /*AC*/ AbstractCallee(), /*ParamsToSkip*/ ParamsToSkip);
     // ADD extra args for cookie
-
-    { // DBG
-      // llvm::errs() << "\t[FE] EmitCXXNewExpr: ALLOCATOR: "
-      //              << allocator->getQualifiedNameAsString() << ", ALLOC TYPE:
-      //              "
-      //              << allocatorType->getReturnType().getAsString() << ",
-      //              args";
-      // for (unsigned i = 0, e = allocatorArgs.size(); i != e; ++i) {
-      //   llvm::errs() << "\n  ARG " << i << ": "
-      //                << allocatorArgs[i].getType().getAsString() << " = ";
-      //   allocatorArgs[i].getRValue(*this).getScalarVal()->dump();
-      // }
-      // llvm::errs() << "\n";
-      // allocatorType->dump();
-    } // DBG
 
     QualType AllocatedQualType = E->getAllocatedType();
     auto *TypeForMem = ConvertTypeForMem(AllocatedQualType);
