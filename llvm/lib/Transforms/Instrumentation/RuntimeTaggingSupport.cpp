@@ -52,8 +52,7 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M,
       !isLiteral && ST->getName().str().find("union.") != std::string::npos;
   auto isAnonStructOrClass = ST->getName().str().find("struct.anon") == 0 ||
                              ST->getName().str().find("class.anon") == 0;
-  bool SkipAnonStruct =
-      isAnonStructOrClass && clFSAN_SKIP_ANON_STRUCTS;
+  bool SkipAnonStruct = isAnonStructOrClass && clFSAN_SKIP_ANON_STRUCTS;
   if (SkipAnonStruct)
     errs() << "[FSAN - TAG] Skipping anonymous struct " << *ST << "\n";
   auto demangledTypeName = demangle(ST->getStructName().str());
@@ -68,6 +67,8 @@ __attribute__((noinline)) void createTagVector(StructType *ST, Module &M,
     std::ifstream BlocklistFile(clFSAN_BLOCKLIST_TAG_FILEPATH.getValue());
     if (BlocklistFile.is_open()) {
       std::string Line;
+      // TODO: add support for selectively blocklisting specific fields using
+      // indexes, not names
       while (std::getline(BlocklistFile, Line)) {
         // NOTE: we want to match struct.sockaddr, but not struct.sockaddr_in
         bool containsAsterisk = Line.find('*') != std::string::npos;
@@ -280,7 +281,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
                    "Element tag must be a constant integer in the tag vector.");
             auto ElemTagValue = ElemTag->getZExtValue();
             // ADJUST LEVEL TO NEW NESTING SITUATION
-            if(ElemTagValue!=0)
+            if (ElemTagValue != 0)
               ElemTagValue |= (OverallDepth << TBits);
 
             assert(ElemTagValue <= 0xff &&
@@ -312,26 +313,36 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         // NOTE: this does not violate the C std!
         // ONLY ENABLE IF IT'S FULL OF THESE BUGS AND THEY ARE ANNOYING FOR
         // FUZZING
-        bool IsLastField = sonIdx == FieldsOffsets.size();
-        if (IsLastField) {
-          // || ArrayFieldElems == 1
+        bool isArray = CurFieldType->isArrayTy();
+         // NOTE: FAM can only be at the very end of the struct, but there could be an extra padding member if the size of the FAM is 1.
+        bool IsLastField = sonIdx == FieldsOffsets.size() || sonIdx == (FieldsOffsets.size() - 1); // breaks with padding bytes, they are an extra field
+        
+        if (IsLastField && isArray) {
+
           // NOTE: the field might overlap with compiler-inserted padding
           // TODO:double check that this makes sense in STD
-          if (ArrayFieldElems == 0 || !clFSAN_FAM) {
+          if (ArrayFieldElems == 0 || ArrayFieldElems == 1) {
             auto RemainderBytes = DL.getTypeAllocSize(Ty) - CurFieldOffset;
-            if (clFSAN_FAM)
+            if (clFSAN_FAM) {
+              errs() << "[FSAN - TAG] Clearing potential padding at the end of "
+                        "struct "
+                     << *Ty << " (field: " << *CurFieldType << ", idx " << sonIdx
+                     << ", remainder bytes: " << RemainderBytes
+                     << ", struct size: " << DL.getTypeAllocSize(Ty) << ")\n";
               memset(&Tags[CurFieldOffset], 0x00, RemainderBytes);
+            }
           }
           // FFMPEG fix: remove FPs untagging artifically padded structs? Can
           // be patched in SRC
         } // if LastField
+        
       }
     } // cur sub field is array
 
     else {
       // case : scalar fields, literal structs, unions == ALL SCALAR
-      if (CurFieldType->isStructTy()  &&  (CurFieldIsLiteral || CurFieldIsUnion ||
-          CurFieldIsBlockListedStruct)) {
+      if (CurFieldType->isStructTy() && (CurFieldIsLiteral || CurFieldIsUnion ||
+                                         CurFieldIsBlockListedStruct)) {
         // union, literal
         memset(&Tags[CurFieldOffset], 0x00, DL.getTypeAllocSize(CurFieldType));
       } else {
