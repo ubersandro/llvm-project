@@ -391,6 +391,7 @@ bool HWAddressSanitizer::RewriteMallocLikeCall(CallBase *CI) {
                    {IRB.CreatePointerCast(NewCI, PtrTy),
                     IRB.CreatePointerCast(TagVector, PtrTy),
                     ConstantInt::get(Int64Ty, tSize), ArraySize});
+    // TODO
     // Value *NewCILong = IRB.CreatePtrToInt(NewCI, IntptrTy);
     // Value *TaggedNewCI = tagPointer(IRB, NewCI->getType(), NewCILong,
     //                                 ConstantInt::get(IntptrTy, RPTag));

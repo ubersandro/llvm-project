@@ -1637,27 +1637,12 @@ static void EnterNewDeleteCleanup(CodeGenFunction &CGF, const CXXNewExpr *E,
 
 /** This method emits both calls and invokes. */
 llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
-  // The element type being allocated.
-  // llvm::errs() << "[FE] EmitCXXNewExpr: CALLED on SRC LOC: "
-  //              <<
-  //              E->getExprLoc().printToString(getContext().getSourceManager())
-  //              << ", TYPE: " << E->getAllocatedType().getAsString() << "\n";
   bool guard = false;
-
   QualType allocType = getContext().getBaseElementType(E->getAllocatedType());
-  // auto IRType = ConvertTypeForMem(allocType);
-  // std::string IRTypeName = IRType->isStructTy() ?
-  // IRType->getStructName().str()
-  //                                               : allocType.getAsString();
-  // 1. Build a call to the allocation function.
   FunctionDecl *allocator = E->getOperatorNew();
-  // llvm::errs() << "\t[DBG-FE] Allocator: "
-  //              << allocator->getQualifiedNameAsString() << ", SRC LOC: "
-  //              <<
-  //              E->getExprLoc().printToString(getContext().getSourceManager())
-  //              << "\n";
-  // allocator->dump();
-
+  bool isEnabled =
+      SanOpts.has(SanitizerKind::FSanitizer) &&
+      SanOpts.has(SanitizerKind::FSanitizerHeapInstrumentation);
   // If there is a brace-initializer or C++20 parenthesized initializer, cannot
   // allocate fewer elements than inits.
   unsigned minElements = 0;
@@ -1729,29 +1714,76 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
     LValueBaseInfo BaseInfo;
     allocation = EmitPointerWithAlignment(arg, &BaseInfo);
-    llvm::errs() << "[DBG-FE] PLACEMENT NEW: ";
-    E->dump();
-    llvm::errs() << "[DBG-FE] SRC LOC: ";
-    E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
     QualType allocType = E->getAllocatedType();
     llvm::Type *TypeForMem = ConvertTypeForMem(allocType);
 
-    if (TypeForMem->isStructTy()) {
+    if (TypeForMem->isStructTy() && isEnabled) {
+      llvm::errs() << "[DBG-FE] PLACEMENT NEW: ";
+      E->dump();
+      llvm::errs() << "\n\t[DBG-FE] SRC LOC: ";
+      E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
       llvm::errs() << "\n\t[DBG-FE] TYPE: " << *TypeForMem << "\n";
       // is it an array?
-      if (TypeForMem->isArrayTy()) {
-        llvm::errs() << "\n\t[DBG-FE] ARRAY of SIZE"
-                     << TypeForMem->getArrayNumElements() << "\n";
+      bool isAllocationOfArray =
+          false; // whether it's a struct or an array of structs
+
+      if (E->isArray()) {
+        llvm::errs() << "\n\t[DBG-FE] PLACEMENT NEW ARRAY\n";
+        isAllocationOfArray = true;
+        // compute array size based on arg
+        if (llvm::ConstantInt *CI = dyn_cast<llvm::ConstantInt>(numElements)) {
+          ArraySize = CI->getSExtValue();
+          llvm::errs() << "\t[DBG-FE] Array size: " << ArraySize << "\n";
+        } else
+          ArraySize = 1; // assume 1 for now
+        // else call tagging function with div ArraySize / TypeSize -> TODO
       }
-      // TODO: untag the shadow memory where the struct is being allocated to
-      // prevent FPs if the allocation buffer is inside a struct (nested array)
 
       bool allocationBufferIsInsideStruct = false;
-      // arg is the allocation buffer, the first placement argument
-      llvm::errs() << "\t allocation buffer: ";
-      arg->dump();
-      llvm::errs() << "\n";
-    }
+      // if the placement args have a MemberExpr, then we know for sure that the
+      // allocation buffer is inside a struct
+      if (auto *ME = dyn_cast<MemberExpr>(arg->IgnoreParenImpCasts())) {
+        allocationBufferIsInsideStruct = true;
+        llvm::errs() << "\t[DBG-FE] Allocation buffer is inside a struct, "
+                        "untagging shadow memory for type: "
+                     << *TypeForMem << "\n";
+      }
+      if (auto *UNOP = dyn_cast<UnaryOperator>(arg->IgnoreParenImpCasts()))
+        if (auto *ME = dyn_cast<MemberExpr>(
+                UNOP->getSubExpr()->IgnoreParenImpCasts())) {
+          allocationBufferIsInsideStruct = true;
+          llvm::errs() << "\t[DBG-FE] Allocation buffer is inside a struct, "
+                          "untagging shadow memory for type: "
+                       << *TypeForMem << "\n";
+        }
+
+      /**
+       * fsan_tag_memory RET: Int64Ty, ARGS:  PtrTy, PtrTy, Int64Ty, Int64Ty;
+       */
+      // with tag vector nullptr to untag
+
+      /**
+       * FSANTaggingFunc{allocation, nullptr, sizeofallocatedtype, sizeofarray};
+       */
+
+      // Create call -> TODO
+      auto PtrTy = llvm::PointerType::getUnqual(Int8Ty);
+      auto FSANTagMemoryFunc = CGM.getModule().getOrInsertFunction(
+          "fsan_tag_memory",
+          llvm::FunctionType::get(Int64Ty, {PtrTy, PtrTy, Int64Ty, Int64Ty},
+                                  false));
+      llvm::Value *typeSize = llvm::ConstantInt::get(Int64Ty, type);
+      llvm::Value *arraySize = llvm::ConstantInt::get(Int64Ty, ArraySize);
+      llvm::Value *nullPtr = llvm::ConstantPointerNull::get(PtrTy);
+      llvm::Value *allocationPtr = allocation.emitRawPointer(*this);
+      llvm::Value *tagMemoryCall = Builder.CreateCall(
+          FSANTagMemoryFunc, {allocationPtr, nullPtr, typeSize, arraySize});
+      llvm::errs() << "\t[DBG-FE] Emitted call to fsan_tag_memory for "
+                      "placement new, SRC LOC: "
+                   << E->getExprLoc().printToString(
+                          getContext().getSourceManager())
+                   << "\n";
+    } // if it's a struct and we're instrumenting with HWAsan
 
     // The pointer expression will, in many cases, be an opaque void*.
     // In these cases, discard the computed alignment and use the
@@ -1766,21 +1798,11 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
       allocatorArgs.add(RValue::get(allocSize), getContext().getSizeType());
       allocatorArgs.add(RValue::get(allocation, *this), arg->getType());
     }
-    // llvm::errs() << "\t[DBG-FE] Placement new case , SRC LOC:";
-    // E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
-    // llvm::errs() << "\n";
-    // E->dump();
+
   } else {
     const FunctionProtoType *allocatorType =
         allocator->getType()->castAs<FunctionProtoType>();
-    ImplicitAllocationParameters IAP =
-        E->implicitAllocationParameters(); // NOTE: this describes extra params
-    // DUMP IAP
-    // llvm::errs() << "\t[DBG-FE] IAP: PassTypeIdentity: "
-    //              << static_cast<unsigned>(IAP.PassTypeIdentity)
-    //              << ", PassAlignment: "
-    //              << static_cast<unsigned>(IAP.PassAlignment) << " IAP.Type "
-    //              << IAP.Type.getAsString() << "\n";
+    ImplicitAllocationParameters IAP = E->implicitAllocationParameters();
     unsigned ParamsToSkip = 0;
     if (isTypeAwareAllocation(IAP.PassTypeIdentity)) {
       QualType SpecializedTypeIdentity = allocatorType->getParamType(0);
@@ -1829,20 +1851,14 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     EmitCallArgs(allocatorArgs, allocatorType, E->placement_arguments(),
                  /*AC*/ AbstractCallee(), /*ParamsToSkip*/ ParamsToSkip);
     // ADD extra args for cookie
-
     QualType AllocatedQualType = E->getAllocatedType();
     auto *TypeForMem = ConvertTypeForMem(AllocatedQualType);
-    // if (TypeForMem->isStructTy())
-    //   llvm::errs() << "[FSAN-FE]: new struct type: " << *TypeForMem << "\n";
-
     std::string typeName =
         TypeForMem->isStructTy() ? TypeForMem->getStructName().str() : "scalar";
-    // at this point, we have all the right arguments only, no extra args yet
     RValue RV =
         EmitNewDeleteCall(*this, allocator, allocatorType, allocatorArgs,
                           typeName, cookie); // HOOK FOR NEW NEW
-    // llvm::errs() << "\t[FE] EmitCXXNewExpr: Allocator call emitted: ";
-    // RV.getScalarVal()->dump();
+
     guard = true;
 
     // Set !heapallocsite metadata on the call to operator new.
@@ -1967,36 +1983,6 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
     resultPtr = PHI;
   }
-  // FSAN
-
-  // if (guard) { // NOTE: only type new, not placement new
-  //   llvm::LLVMContext &LLVMCtx = getLLVMContext();
-
-  //   if (numElements) {
-  //     if (llvm::ConstantInt *ConstNum =
-  //             dyn_cast<llvm::ConstantInt>(numElements))
-  //       ArraySize = ConstNum->getZExtValue();
-  //   }
-
-  //   llvm::MDNode *FSanMD = llvm::MDNode::get(
-  //       LLVMCtx, {
-  //                    llvm::MDString::get(LLVMCtx, "fsan.new"),
-  //                    llvm::MDString::get(LLVMCtx, IRTypeName),
-  //                    llvm::ValueAsMetadata::get(llvm::ConstantInt::get(
-  //                        llvm::Type::getInt64Ty(LLVMCtx), ArraySize)),
-  //                });
-  // llvm::errs() << "\t\tMD >> FSanMD for new-expression: ";
-  // FSanMD->print(llvm::errs());
-  // llvm::errs() << ", resultPtr: ";
-  // resultPtr->print(llvm::errs());
-  // llvm::errs() << ", SRC LOC OF NEW: ";
-  // E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
-  // llvm::errs() << "\n";
-  // if (llvm::Instruction *I = dyn_cast<llvm::Instruction>(resultPtr))
-  //   I->setMetadata("fsan.new", FSanMD); // TODO: not sure about his...
-  // FSAN
-  // }
-
   return resultPtr;
 }
 
