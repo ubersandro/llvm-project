@@ -1718,22 +1718,22 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     llvm::Type *TypeForMem = ConvertTypeForMem(allocType);
 
     if (TypeForMem->isStructTy() && isEnabled) {
-      llvm::errs() << "[DBG-FE] PLACEMENT NEW: ";
-      E->dump();
-      llvm::errs() << "\n\t[DBG-FE] SRC LOC: ";
-      E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
-      llvm::errs() << "\n\t[DBG-FE] TYPE: " << *TypeForMem << "\n";
+      // llvm::errs() << "[DBG-FE] PLACEMENT NEW: ";
+      // E->dump();
+      // llvm::errs() << "\n\t[DBG-FE] SRC LOC: ";
+      // E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
+      // llvm::errs() << "\n\t[DBG-FE] TYPE: " << *TypeForMem << "\n";
       // is it an array?
       bool isAllocationOfArray =
           false; // whether it's a struct or an array of structs
 
       if (E->isArray()) {
-        llvm::errs() << "\n\t[DBG-FE] PLACEMENT NEW ARRAY\n";
+        // llvm::errs() << "\n\t[DBG-FE] PLACEMENT NEW ARRAY\n";
         isAllocationOfArray = true;
         // compute array size based on arg
         if (llvm::ConstantInt *CI = dyn_cast<llvm::ConstantInt>(numElements)) {
           ArraySize = CI->getSExtValue();
-          llvm::errs() << "\t[DBG-FE] Array size: " << ArraySize << "\n";
+          // llvm::errs() << "\t[DBG-FE] Array size: " << ArraySize << "\n";
         } else
           ArraySize = 1; // assume 1 for now
         // else call tagging function with div ArraySize / TypeSize -> TODO
@@ -1744,7 +1744,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
       // allocation buffer is inside a struct
       if (auto *ME = dyn_cast<MemberExpr>(arg->IgnoreParenImpCasts())) {
         allocationBufferIsInsideStruct = true;
-        llvm::errs() << "\t[DBG-FE] Allocation buffer is inside a struct, "
+        llvm::errs() << "\t[DBG-FE] PLC NEW Allocation buffer is inside a struct, "
                         "untagging shadow memory for type: "
                      << *TypeForMem << "\n";
       }
@@ -1752,7 +1752,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
         if (auto *ME = dyn_cast<MemberExpr>(
                 UNOP->getSubExpr()->IgnoreParenImpCasts())) {
           allocationBufferIsInsideStruct = true;
-          llvm::errs() << "\t[DBG-FE] Allocation buffer is inside a struct, "
+          llvm::errs() << "\t[DBG-FE] PLC NEW Allocation buffer is inside a struct, "
                           "untagging shadow memory for type: "
                        << *TypeForMem << "\n";
         }

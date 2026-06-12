@@ -65,7 +65,6 @@ static cl::opt<bool> ClFSAN_stack("fsan-instrument-stack",
 static cl::opt<bool> ClFSAN_globals("fsan-instrument-globals",
                                     cl::desc("Instrument globals"), cl::Hidden,
                                     cl::init(true));
-// TODO: for heap, see FSanRewrite...
 static cl::opt<bool> ClFSAN_memAccesses("fsan-instrument-mem-accesses",
                                         cl::desc("instrument memory accesses"),
                                         cl::Hidden, cl::init(true));
@@ -431,14 +430,6 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       return false;
     }
 
-    { // DEBUG
-      bool IsAlignmentAwareNew =
-          AllocatorName.find("align_val_t") != std::string::npos;
-      if (IsAlignmentAwareNew) {
-        errs() << "\t\t[FSAN-REW] Alignment-aware " << *I << "\n";
-      }
-    } // DEBUG
-
     auto size = I->arg_size();
     // NOTE: args are expected to be strictly more than one, otherwise it means
     // this call was not rewritten
@@ -520,34 +511,43 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       // iterate on instructions after InsertPt, reach first NON-PHI instruction
       // while (InsertPt && isa<PHINode>(InsertPt))
       //   InsertPt = InsertPt->getNextNode();
-      PHINode* PHI = nullptr; 
-      if(PHI = dyn_cast<PHINode> (InsertPt)) {
+      PHINode *PHI = nullptr;
+      if (PHI = dyn_cast<PHINode>(InsertPt)) {
         // the PHI node must be instrumented una tantum
-        errs() << "\t\t[FSAN] PHI node detected as insertion point: " << *PHI << "\n";
+        errs() << "\t\t[FSAN] PHI node detected as insertion point: " << *PHI
+               << "- TODO.\n";
+        return changed; // TODO: this needs proper handling
         bool AlreadyInstrumented = false;
-        for(User * U: PHI->users()) {
-          if(isa<CallInst>(U) && cast<CallInst>(U)->getCalledFunction() &&
-             cast<CallInst>(U)->getCalledFunction()->hasName() &&
-             cast<CallInst>(U)->getCalledFunction()->getName().str().find(
-                 "fsan_tag_memory") != std::string::npos) {
+        for (User *U : PHI->users()) {
+          if (isa<CallInst>(U) && cast<CallInst>(U)->getCalledFunction() &&
+              cast<CallInst>(U)->getCalledFunction()->hasName() &&
+              cast<CallInst>(U)->getCalledFunction()->getName().str().find(
+                  "fsan_tag_memory") != std::string::npos) {
             AlreadyInstrumented = true;
             break;
           }
         }
-        if(AlreadyInstrumented) {
-          errs() << "\t\t[FSAN] PHI node already instrumented, skipping tagging for new call: " << *PHI << "\n";
+        if (AlreadyInstrumented) {
+          errs() << "\t\t[FSAN] PHI node already instrumented, skipping "
+                    "tagging for new call: "
+                 << *PHI << "\n";
           return changed;
-        }
-        else{
-          while(InsertPt && isa<PHINode>(InsertPt))
+        } else {
+          while (InsertPt && isa<PHINode>(InsertPt))
             InsertPt = InsertPt->getNextNode();
         }
       }
-      errs() << "\t\t[FSAN] TAGGING "<< *NewCI << " at: " << *InsertPt << "\n";
+      errs() << "\t\t[FSAN] TAGGING " << *NewCI << " at: " << *InsertPt << "\n";
       IRBuilder<> IRB(InsertPt);
+      
 
       // TODO: check on array size post FP
-      Value *ArraySize = GetArraySize(NewCI, AllocatorName, allocType, IRB);
+      Value *ArraySize =
+          GetArraySize(NewCI, AllocatorName, allocType,
+                       IRB); // referring to CI makes use with domtree error
+      errs() << "\t\t[FSAN] CALL SIZE " << *ArraySize << "\n";
+      // Value* ArraySize = ConstantInt::get(Int64Ty,1); // default value for
+      // non-array allocations
       assert(ArraySize != nullptr &&
              "Failed to compute array size for typed allocation");
       TypeSize tSize = M.getDataLayout().getTypeAllocSize(allocType);
@@ -556,8 +556,9 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       assert(TagVector &&
              "Failed to retrieve or create tag vector for struct type");
       Value *whereToTagFrom = NewCI;
-      if(PHI!= nullptr) {
+      if (PHI != nullptr) {
         whereToTagFrom = PHI;
+        // TODO: handle this case creating PHI node
       }
       bool isNewArray = AllocatorName.find("new[]") != std::string::npos;
       Value *Offset = nullptr;
@@ -565,7 +566,7 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       if (isNewArray && needsOffsetForCookie) {
         Offset = IRB.CreateGEP(IRB.getInt8Ty(), // element type: i8 (1
                                                 // byte per index unit)
-                               NewCI,           // base pointer
+                               whereToTagFrom,  // base pointer
                                IRB.getInt64(8), // offset by 8 bytes
                                "cookie_ptr");
         Offset->setName(NewCI->getName() + ".cookie_offset");
@@ -808,14 +809,12 @@ Value *HWAddressSanitizer::GetArraySize(CallBase *CI, std::string demangledName,
     assert(typeSize != 0 &&
            "Type size cannot be zero for allocation size reconstruction");
   }
-
   auto Int64Ty = Type::getInt64Ty(M.getContext());
   PointerType *PtrTy = PointerType::getUnqual(M.getContext());
 
   Value *TypeSizeValue =
       ConstantInt::get(Int64Ty, typeSize); // size of the struct type
   Value *Ret = nullptr;
-
   if (demangledName == "malloc" || demangledName == "valloc" ||
       demangledName == "pvalloc") {
     Value *MallocSizeValue = IRB.CreateZExt(CI->getArgOperand(0), Int64Ty);
@@ -1601,7 +1600,6 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
         IRB.CreateUDiv(IRB.CreateTypeSize(IntptrTy, O.TypeStoreSize),
                        ConstantInt::get(IntptrTy, 8))};
     IRB.CreateCall(HwasanMemoryAccessCallbackSized[O.IsWrite], Args);
-    NumMemAccessesNotInlined++;
   }
 
   NumInstrumentedMemAccesses++;
@@ -2669,40 +2667,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
         // H: is pointers to a certain struct are used in extractvalue, type
         // coercion
-      }
-
-      // if (ST && ST->hasName() && ST->getName().str().find("union.") == 0) {
-      //   tag = false;
-      //   GEPI->setMetadata("fsan_skip_gep", MDNode::get(M.getContext(), {}));
-      // }
-
-      // if (ST && ST->hasName()) {
-      //   auto demangledName = demangle(ST->getName().str());
-      //   for (auto &pattern : FilterSet) {
-      //     // TODO: finish this
-      //     if (demangledName.find(pattern) != std::string::npos) {
-      //       errs() << "[FSAN] GEP BLOCK: " << pattern << ", GEP: ";
-      //       GEPI->print(errs());
-      //       errs() << "\n";
-      //       tag = false;
-      //       break;
-      //     }
-      //   }
-      // }
-
-      // GEPs on anon structs might be a symptom of type coercion, which is a
-      // common source of FPs
-      // if (ST && ST->hasName()) {
-      //   auto demangledName = demangle(ST->getName().str());
-      //   if ((demangledName.find("class.anon") != std::string::npos) ||
-      //       (demangledName.find("struct.anon") != std::string::npos)) {
-      //     errs() << "[FSAN] GEP BLOCK: anon struct, GEP: ";
-      //     GEPI->print(errs());
-      //     errs() << "\n";
-      //     tag = false;
-      //   }
-      // }
-      // TODO: introduce tunables for the above cases
+      }// unnamed struct coercion detection 
 
       sonTag = nullptr;
       auto sonIsScalar = !DstType->isStructTy() && !DstType->isVectorTy();
