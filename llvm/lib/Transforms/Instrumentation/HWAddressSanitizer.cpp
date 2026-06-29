@@ -32,12 +32,6 @@
 #define TRANS_CONSTANT 0x400000000000ULL // 1<<46, 0x400000000000
 #define OFFSET_MEM 0x1000ULL
 
-static llvm::cl::opt<std::string> FilterFilePath(
-    "hwasan-filter-file",
-    llvm::cl::desc("File containing struct names to protect/ignore"),
-    llvm::cl::Hidden, llvm::cl::init(""));
-std::set<std::string> FilterSet;
-
 using namespace llvm;
 using namespace RuntimeTaggingSupport;
 
@@ -72,11 +66,12 @@ static cl::opt<bool>
     ClFSAN_memAccessesInline("fsan-instrument-mem-accesses-inline",
                              cl::desc("instrument memory accesses"), cl::Hidden,
                              cl::init(false));
-// NO MEM ACCESSES + NO BOP -> 510 crashes for SEGV
 
-static cl::opt<bool> ClFSAN_heap("fsan-instrument-heap",
-                                 cl::desc("instrument heap"), cl::Hidden,
-                                 cl::init(true));
+static cl::opt<bool>
+    ClFSAN_heap("fsan-instrument-heap",
+                cl::desc("Rewrite the calls to allocator functions to bring "
+                         "them back to the original version"),
+                cl::Hidden, cl::init(true));
 
 static cl::opt<bool>
     ClFSAN_tag_heap("fsan-tag-heap",
@@ -86,25 +81,32 @@ static cl::opt<bool>
 static cl::opt<bool> ClFSAN_memIntr("fsan-instrument-mem-intrinsics",
                                     cl::desc("instrument memory intrinsics"),
                                     cl::Hidden, cl::init(true));
-// FSAN KNOBS
 static cl::opt<bool> ClInstrumentWithCalls(
     "hwasan-instrument-with-calls",
     cl::desc("instrument reads and writes with callbacks"), cl::Hidden,
     cl::init(true));
 
-static cl::opt<bool> ClInstrumentReads("hwasan-instrument-reads",
-                                       cl::desc("instrument read instructions"),
-                                       cl::Hidden, cl::init(true));
 static cl::opt<bool> ClSkipUnnamedStructs(
     "fsan-skip-unnamed-structs",
     cl::desc("skip instrumentation of unnamed struct types"), cl::Hidden,
     cl::init(false));
 // NOTE: Skipping unnamed structs might cause FPs.
-
+// FSAN KNOBS
+static cl::opt<bool> ClFSAN_PtrTagging("fsan-instrument-ptr-tagging",
+                                       cl::desc("instrument pointer tagging"),
+                                       cl::Hidden, cl::init(true));
 static cl::opt<bool>
-    ClInstrumentWrites("hwasan-instrument-writes",
-                       cl::desc("instrument write instructions"), cl::Hidden,
-                       cl::init(true));
+    ClFSAN_GEP("fsan-instrument-geps",
+               cl::desc("instrument getelementptr instructions"), cl::Hidden,
+               cl::init(true));
+
+static cl::opt<bool> ClFSAN_BOP("fsan-instrument-bops",
+                                cl::desc("instrument binary op instructions"),
+                                cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClFSAN_CMP("fsan-instrument-cmp",
+                                cl::desc("instrument compare instructions"),
+                                cl::Hidden, cl::init(true));
 
 static cl::opt<bool> ClInstrumentAtomics(
     "hwasan-instrument-atomics",
@@ -164,23 +166,6 @@ static cl::opt<bool> ClKasanMemIntrinCallbackPrefix(
     cl::desc("Use prefix for memory intrinsics in KASAN mode"), cl::Hidden,
     cl::init(false));
 
-// FSAN KNOBS
-static cl::opt<bool> ClFSAN_PtrTagging("fsan-instrument-ptr-tagging",
-                                       cl::desc("instrument pointer tagging"),
-                                       cl::Hidden, cl::init(true));
-static cl::opt<bool>
-    ClFSAN_GEP("fsan-instrument-geps",
-               cl::desc("instrument getelementptr instructions"), cl::Hidden,
-               cl::init(true));
-
-static cl::opt<bool> ClFSAN_BOP("fsan-instrument-bops",
-                                cl::desc("instrument binary op instructions"),
-                                cl::Hidden, cl::init(true));
-
-static cl::opt<bool> ClFSAN_CMP("fsan-instrument-cmp",
-                                cl::desc("instrument compare instructions"),
-                                cl::Hidden, cl::init(true));
-
 using namespace OffsetPorcodidio;
 static cl::opt<OffsetKind> ClMappingOffsetDynamic(
     "hwasan-mapping-offset-dynamic",
@@ -189,22 +174,32 @@ static cl::opt<OffsetKind> ClMappingOffsetDynamic(
                clEnumValN(OffsetKind::kIfunc, "ifunc", "Use ifunc global"),
                clEnumValN(OffsetKind::kTls, "tls", "Use TLS")));
 
-STATISTIC(NumTotalFuncs, "Number of total funcs");
-STATISTIC(NumInstrumentedFuncs, "Number of instrumented funcs");
-STATISTIC(NumNoProfileSummaryFuncs, "Number of funcs without PS");
-STATISTIC(LiteralStructs,
-          "Number of literal structs encountered, doubly counted though");
-STATISTIC(NumInstrumentedGEPs, "Number of instrumented GEP instructions");
-STATISTIC(NumInstrumentedGlobals, "Number of instrumented global variables");
-STATISTIC(NumDefinedTagVectors, "Number of defined tag vectors (same as the "
-                                "number of totally identified struct types.)");
-STATISTIC(NumInstrumentedCMPs, "Number of instrumented CMP instructions");
-STATISTIC(NumInstrumentedMemAccesses, "Number of instrumented memory accesses");
-STATISTIC(NumMemAccessesInlined, "Number of memory accesses inlined");
-STATISTIC(NumMemAccessesNotInlined, "Number of memory accesses not inlined");
-STATISTIC(NumInstrumentedIntrinsics, "Number of instrumented intrinsics");
-// Mode for selecting how to insert frame record info into the stack ring
-// buffer.
+STATISTIC(NumTotalFuncs, " total funcs");
+STATISTIC(NumInstrumentedFuncs, " instrumented funcs");
+
+// performance-related stats
+// for GEPs and alloca, new, global instrumented == tagged
+// for BOP and CMP, instrumented means operands were untagged
+// mem accesses/intrinsics instrumented means a callback was inserted
+
+STATISTIC(NumInstrumentedGEPs, " # instrumented GEP instructions");
+// NOTE: these are the GEPs for which we explictly remove the tag
+STATISTIC(NumUntaggedGEPs, " # untagged GEP instructions");
+STATISTIC(NumSkippedGEPs, " # skipped GEP instructions");
+STATISTIC(NumTotalGEPs, " # total GEP instructions");
+
+STATISTIC(NumInstrumentedGlobals, " # instrumented global variables");
+STATISTIC(NumInstrumentedCMPs, " # instrumented CMP instructions");
+STATISTIC(NumInstrumentedBOPs, " # instrumented binary operator instructions");
+
+STATISTIC(NumInstrumentedMemAccesses, " # instrumented memory accesses");
+STATISTIC(NumMemAccessesInlined,
+          " # memory accesses inlined"); // for later
+STATISTIC(NumInstrumentedIntrinsics, " # instrumented memory intrinsics");
+STATISTIC(NumInstrumentedAllocas, " # instrumented alloca instructions");
+STATISTIC(NumInstrumentedNewCalls, " # instrumented new calls");
+STATISTIC(NumInstrumentedMallocLikeFuncsCalls,
+          " # instrumented malloc-like function calls");
 
 PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
                                               ModuleAnalysisManager &MAM) {
@@ -215,16 +210,6 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
   // const Triple &TargetTriple = M.getTargetTriple();
   // if (shouldUseStackSafetyAnalysis(TargetTriple,
   // Options.DisableOptimization))
-  if (FilterFilePath.getNumOccurrences() > 0) {
-    std::ifstream filterFile(FilterFilePath);
-    std::string line;
-    while (std::getline(filterFile, line)) {
-      FilterSet.insert(line);
-      errs() << "FSAN: FILTER class/struct " << line << "\n";
-    }
-    errs() << "FSAN: Loaded " << FilterSet.size()
-           << " struct names into the filter set.\n";
-  }
   // TODO: this might introduce UB, potentially delete!
   SSI = &MAM.getResult<StackSafetyGlobalAnalysis>(M);
 
@@ -233,6 +218,11 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
 
   for (Function &F : M) {
     HWASan.sanitizeFunction(F, FAM);
+  }
+  // instrument globals here, after function sanitization to ease static
+  // analysis at GEP instrumentation time
+  if (ClFSAN_globals) {
+    HWASan.instrumentGlobals();
   }
 
   PreservedAnalyses PA = PreservedAnalyses::none();
@@ -383,6 +373,7 @@ bool HWAddressSanitizer::RewriteMallocLikeCall(CallBase *CI) {
     TypeSize tSize = M.getDataLayout().getTypeAllocSize(allocType);
     auto *TagVector =
         RuntimeTaggingSupport::RetrieveOrCreateTagVector(allocType, M);
+    // TODO: where is the depth???
     assert(TagVector &&
            "Failed to retrieve or create tag vector for struct type");
 
@@ -390,14 +381,19 @@ bool HWAddressSanitizer::RewriteMallocLikeCall(CallBase *CI) {
                    {IRB.CreatePointerCast(NewCI, PtrTy),
                     IRB.CreatePointerCast(TagVector, PtrTy),
                     ConstantInt::get(Int64Ty, tSize), ArraySize});
+    NumInstrumentedMallocLikeFuncsCalls++;
+    errs() << "\t\t[FSAN-REW] Tagging malloc-like call " << *NewCI
+           << " for struct type: " << structName << "\n";
     // TODO
     // Value *NewCILong = IRB.CreatePtrToInt(NewCI, IntptrTy);
     // Value *TaggedNewCI = tagPointer(IRB, NewCI->getType(), NewCILong,
     //                                 ConstantInt::get(IntptrTy, RPTag));
-    // NewCI->replaceUsesWithIf(TaggedNewCI, [NewCI, NewCILong](const Use &U) {
+    // NewCI->replaceUsesWithIf(TaggedNewCI, [NewCI, NewCILong](const Use
+    // &U) {
     //   auto *User = U.getUser();
     //   bool isCallToFSANTagMemory =
-    //       isa<CallInst>(User) && cast<CallInst>(User)->getCalledFunction() &&
+    //       isa<CallInst>(User) &&
+    //       cast<CallInst>(User)->getCalledFunction() &&
     //       cast<CallInst>(User)->getCalledFunction()->hasName() &&
     //       cast<CallInst>(User)->getCalledFunction()->getName().str().find(
     //           "fsan_tag_memory") != std::string::npos;
@@ -539,7 +535,6 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       }
       errs() << "\t\t[FSAN] TAGGING " << *NewCI << " at: " << *InsertPt << "\n";
       IRBuilder<> IRB(InsertPt);
-      
 
       // TODO: check on array size post FP
       Value *ArraySize =
@@ -551,8 +546,8 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       assert(ArraySize != nullptr &&
              "Failed to compute array size for typed allocation");
       TypeSize tSize = M.getDataLayout().getTypeAllocSize(allocType);
-      auto *TagVector =
-          RuntimeTaggingSupport::RetrieveOrCreateTagVector(allocType, M);
+      auto *TagVector = RuntimeTaggingSupport::RetrieveOrCreateTagVector(
+          allocType, M); // TODO: where is the depth???
       assert(TagVector &&
              "Failed to retrieve or create tag vector for struct type");
       Value *whereToTagFrom = NewCI;
@@ -581,7 +576,7 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
                      {IRB.CreatePointerCast(whereToTagFrom, PtrTy),
                       IRB.CreatePointerCast(TagVector, PtrTy),
                       ConstantInt::get(Int64Ty, tSize), ArraySize});
-
+      NumInstrumentedNewCalls++;
       if (ClFSAN_verbose)
         errs() << "\t\t[FSAN] new operator tag\n\t" << *NewCI
                << "\n\ttype: " << structName << "\n\tarray size: " << *ArraySize
@@ -990,6 +985,7 @@ void HWAddressSanitizer::initializeModule() {
   PointerTagShift = IsX86_64 ? 57 : 56;
   TBits = IsX86_64 ? 3 : 5;
   LBits = 2;
+  L_MAX = (1UL << LBits) - 1;
 
   LMask = ((1UL << LBits) - 1);
   TMask = ((1UL << TBits) - 1);
@@ -1006,9 +1002,9 @@ void HWAddressSanitizer::initializeModule() {
   createHwasanCtorComdat(); // creates the routine ctor with a call into the
                             // runtime function __hwasan_init
 
-  if (ClFSAN_globals) {
-    instrumentGlobals();
-  }
+  // if (ClFSAN_globals) {
+  //   instrumentGlobals();
+  // }
   instrumentPersonalityFunctions();
   if (!TargetTriple.isAndroid()) {
     ThreadPtrGlobal = M.getOrInsertGlobal("__hwasan_tls", IntptrTy, [&] {
@@ -1476,11 +1472,6 @@ void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
   auto arg0 = MI->getOperand(0);
   auto arg1 = MI->getOperand(1);
   if (!MI->getMetadata("fsan.instrument")) {
-    // errs() << "[FSAN] NO FSAN MD INTRINSIC: " << *MI << "\n";
-    // auto debugLoc = MI->getDebugLoc();
-    // if (debugLoc)
-    //   errs() << "\t[src loc] " << debugLoc->getFilename() << ":"
-    //          << debugLoc->getLine() << "\n";
     return;
   }
 
@@ -1577,6 +1568,399 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
   // might be UNSAFE?
   if (canBeSkipped(O, DL))
     return false;
+
+  // // BLOCKLISTING CORNER CASES
+  // // 1. store { i64, i64 } zeroinitializer, ptr %fToCall.fsan.struct
+  // if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+  //   if (isa<ConstantAggregateZero>(SI->getValueOperand()) &&
+  //       SI->getValueOperand()->getType()->isStructTy()) {
+  //     errs() << "[FSAN] Skipping instrumentation of store of zero initializer
+  //     "
+  //               "of struct type: "
+  //            << *SI << "\n";
+  //     return false;
+  //   }
+  // }
+  // // 2. load of a struct with type coercion
+  // /** EXAMPLE:
+  //  * call void @__hwasan_load16(i64 %18)
+  //   %19 = load { ptr, ptr }, ptr %coerce.dive.fsan.struct
+  //  */
+  // if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+  //   if (LI->getType()->isStructTy()) {
+  //     // get loaded struct type
+  //     StructType *ST = dyn_cast<StructType>(LI->getType());
+  //     bool OperandIsCoerce = LI->getPointerOperand()->getName().str().find(
+  //                                "coerce.dive") != std::string::npos;
+  //     if (ST && OperandIsCoerce) {
+  //       errs() << "[FSAN] Skipping instrumentation of load of struct type
+  //       with "
+  //                 "coerce.dive: "
+  //              << *LI << "\n";
+  //       return false;
+  //     }
+  //   }
+  // } // LoadInst
+
+  // // 3. store a vtable ptr in the vptr of the current object. I assume this
+  // is
+  // // compiler managed and it is safe.
+  // /**
+  //  * EXAMPLE:   store ptr getelementptr inbounds inrange(-16, 72) ({ [11 x
+  //  ptr]
+  //  }, ptr @vtable for xalanc_1_10::Function, i32 0, i32 0, i32 2), ptr
+  //  %this1, align 8, !dbg !343319
+
+  //  */
+  // if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+  //   auto *StoredValue = SI->getValueOperand();
+  //   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(StoredValue)) {
+  //     errs() << "[FSAN] Checking for store of vtable ptr to vptr of current "
+  //               "object: "
+  //            << *SI << "\n";
+  //     if (CE->getOpcode() == Instruction::GetElementPtr) {
+  //       bool GepOperandIsVtable =
+  //           demangle(CE->getOperand(0)->getName()).find("vtable") !=
+  //           std::string::npos;
+  //       if (GepOperandIsVtable) {
+  //         auto *PtrOpOfStore = SI->getPointerOperand();
+  //         errs() << "\t[FSAN] Pointer operand of store: " << *PtrOpOfStore
+  //                << "\n";
+  //         bool isStoreToThis = SI->getPointerOperand()->getName().str().find(
+  //                                  "this") != std::string::npos;
+  //         if (isStoreToThis) {
+  //           errs()
+  //               << "[FSAN] Skipping instrumentation of store of vtable ptr to
+  //               "
+  //                  "vptr of current object: "
+  //               << *SI << "\n";
+  //           return false;
+  //         }
+  //       }
+  //     }
+  //   }
+  // } // StoreInst
+
+  // // 4. load from vfn operand or load of vtable
+  // if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+  //   if (LI->getPointerOperand()->getName().str().find("vfn") !=
+  //       std::string::npos) {
+  //     errs() << "[FSAN] Skipping instrumentation of load from vfn operand: "
+  //            << *LI << "\n";
+  //     return false;
+  //   }
+  //   if (LI->getName().str().find("vtable") != std::string::npos) {
+  //     errs() << "[FSAN] Skipping instrumentation of load of vtable: " << *LI
+  //            << "\n";
+  //     return false;
+  //   }
+  //   // 5. load where the type is a constant anonymous struct and the pointer
+  //   // operand has an alloca as underlying object (is a inttoptr of an alloca
+  //   // TODO) % 29 = load{i64, ptr}, ptr % retval.tagged, align 8, !dbg !3275
+  //   if (StructType *ST = dyn_cast<StructType>(LI->getType())) {
+  //     if (!ST->hasName() || ST->getName().str().empty()) {
+  //       // TODO: improve heuristic
+  //       bool isFSANTagged = LI->getPointerOperand()->getName().str().find(
+  //                               ".tagged") != std::string::npos;
+  //       if (isFSANTagged) {
+  //         errs() << "[FSAN] Skipping instrumentation of load of constant "
+  //                   "anonymous struct with pointer operand that has .tagged
+  //                   in " "its name: "
+  //                << *LI << "\n";
+  //         return false;
+  //       }
+  //     }
+  //   }
+  // } // LoadInst
+
+  // // 6. loads/stores to bf (bitfields) do not GEP into the structure, but
+  // they
+  // // are still mem accesses. Detecting whether it's a bitfield in a struct or
+  // // not is challenging since LLVM IR is ptr opaque. TODO: future version
+  // will
+  // // take care of this.
+  // if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+  //   if (LI->getPointerOperand()->getName().str().find("bf.") !=
+  //       std::string::npos) {
+  //     errs() << "[FSAN] Skipping instrumentation of load from bitfield: " <<
+  //     *LI
+  //            << "\n";
+  //     return false;
+  //   }
+  //   if (LI->getName().str().find("bf.") != std::string::npos) {
+  //     errs() << "[FSAN] Skipping instrumentation of load of bitfield: " <<
+  //     *LI
+  //            << "\n";
+  //     return false;
+  //   }
+  // }
+  // if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+  //   if (SI->getPointerOperand()->getName().str().find("bf.") !=
+  //       std::string::npos) {
+  //     errs() << "[FSAN] Skipping instrumentation of store to bitfield: " <<
+  //     *SI
+  //            << "\n";
+  //     return false;
+  //   }
+  //   if (SI->getValueOperand()->getName().str().find("bf.") !=
+  //       std::string::npos) {
+  //     errs() << "[FSAN] Skipping instrumentation of store of bitfield: " <<
+  //     *SI
+  //            << "\n";
+  //     return false;
+  //   }
+  // }
+
+  // // 7. passing a struct by value should not be flagged
+  // /** EXAMPLE:
+  //  * %206 = ptrtoint ptr %left.tagged to i64
+  //     call void @__hwasan_load16(i64 %206)
+  //     call void @intra_chroma_DC_all(ptr noundef %195, i32 noundef %196, i32
+  //  noundef %197, i64 %202, i64 %205, ptr noundef byval(%struct.pix_pos) align
+  //  8
+  //       %left.tagged, i32 noundef %198, i32 noundef %add, ptr noundef %pred)
+  //  */
+  // // NOTE: tmp sol is not instrumenting using HWAsan's knob TODO
+
+  // // 8. returning a struct that can be lowered to a i64 is compiler-managed
+  // type
+  // // coercion.
+  // if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+  //   // call void @__hwasan_load8(i64 % 26),
+  //   // % 27 = load i64, ptr % retval.tagged <-- this is a load of a struct
+  //   that
+  //   // has been coerced to i64 ret i64 %27, !dbg !1764
+  //   for (User *U : LI->users()) {
+  //     if (ReturnInst *RI = dyn_cast<ReturnInst>(U)) {
+  //       auto LoadTy = LI->getType();
+  //       auto LoadPtrIsAlloca = LI->getPointerOperand()->getName().str().find(
+  //                                  ".tagged") != std::string::npos;
+  //       // TODO: compute bitness of the load and check it matches the size of
+  //       // the struct NOTE : for now, just consider this type punning if load
+  //       // type is int
+  //       if (LoadTy->isIntegerTy() && LoadPtrIsAlloca) {
+  //         errs() << "[FSAN] Skipping instrumentation of load of struct that "
+  //                   "has been coerced to int and is returned: "
+  //                << *LI << "\n";
+  //         return false;
+  //       }
+  //     }
+  //   }
+  // }
+
+  // // 9. When a struct is ret by value, it is stored by the compiler inside a
+  // var
+  // // called tmp. We do not want to instrument this store, since it is
+  // // compiler-managed.
+  // /** EXAMPLE:
+  //  *
+  //  * %call730 = call i64 @pp_set_verbatim_wrapping_(ptr noundef %1605)
+  // %1606 = ptrtoint ptr %tmp.tagged to i64
+  // call void  @__hwasan_store8(i64 %1606)
+  // store i64 %call730, ptr %tmp.tagged
+  // call void @llvm.memcpy.p0.p0.i64(ptr align 4 %old_wrapping_mode.tagged, ptr
+  // align 4 %tmp.tagged, i64 8, i1 false)
+  //  */
+  // // if storing to var named tmp result of a call, then discard
+  // instrumentation
+  // // if storing to a retval, which is where the return value of a function is
+  // // stored before being returned TODO: potentially check it is the return
+  // value
+  // // of a func
+
+  // if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+  //   if (SI->getPointerOperand()->getName().str().find("tmp") !=
+  //       std::string::npos) {
+  //     if (CallInst *CI = dyn_cast<CallInst>(SI->getValueOperand())) {
+  //       errs() << "[FSAN] Skipping instrumentation of store to tmp var that
+  //       is "
+  //                 "result of a call: "
+  //              << *SI << "\n";
+  //       return false;
+  //     }
+  //   }
+  //   if (SI->getPointerOperand()->getName().str().find("retval") !=
+  //       std::string::npos) {
+  //     if (CallInst *CI = dyn_cast<CallInst>(SI->getValueOperand())) {
+  //       errs()
+  //           << "[FSAN] Skipping instrumentation of store to retval var that
+  //           is "
+  //              "result of a call: "
+  //           << *SI << "\n";
+  //       return false;
+  //     }
+  //   }
+  // }
+  // // 10. LOAD of a struct passed to a function by value, where the function
+  // has
+  // // coerced parameters in the signature. E.g. a struct that can be coerced
+  // to
+  // // i64 is passed as an i64, and then loaded as a struct inside the
+  // function.
+  // // This is also compiler-managed type coercion.
+  // /**
+  //  * EXAMPLE:
+  //  * call to something like
+  //  * define internal i64 @add_costs(i64 %cost1.coerce, i64 %cost2.coerce)
+  //  */
+  // if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+  //   bool isLoadOfInt = LI->getType()->isIntegerTy();
+  //   for (User *U : LI->users()) {
+  //     if (CallInst *CI = dyn_cast<CallInst>(U)) {
+  //       int posCurParamInFuncCall = -1;
+  //       for (unsigned i = 0; i < CI->arg_size(); i++) {
+  //         if (CI->getArgOperand(i) == LI) {
+  //           posCurParamInFuncCall = i;
+  //           break;
+  //         }
+  //       }
+  //       // now get function signature and see it the param name ends with
+  //       // .coerce, which is a strong signal of type coercion by the compiler
+  //       if (posCurParamInFuncCall != -1) {
+  //         Function *CalledFunc = llvm::dyn_cast<llvm::Function>(
+  //             CI->getCalledOperand()->stripPointerCasts());
+  //         if (CalledFunc && CalledFunc->hasName()) {
+  //           // the function has to have enough params
+  //           auto NParams = CalledFunc->arg_size();
+  //           if (posCurParamInFuncCall < NParams) {
+  //             // NOTE: potentially skip variardic functions
+  //             auto *Param = CalledFunc->getArg(posCurParamInFuncCall);
+  //             if (Param && Param->hasName() &&
+  //                 Param->getName().str().find(".coerce") !=
+  //                 std::string::npos) {
+  //               errs() << "[FSAN] LOAD " << *LI << " CALL " << *CI << " PARAM
+  //               "
+  //                      << *Param << " is a coerced parameter of function "
+  //                      << *LI << "\n";
+  //               return false;
+  //             }
+  //             if (!Param)
+  //               errs() << "what? " << *CalledFunc << "\n";
+  //           }
+  //         }
+  //       }
+  //     }
+  //   }
+  // }
+
+  // // 11. store of an int to a struct because it has been coerced
+  // /**
+  //  * EXAMPLE:
+  //  *   %9 = ptrtoint ptr %cost1.tagged to i64
+  //       call void @__hwasan_store8(i64 %9)
+  //       store i64 %cost1.coerce, ptr %cost1.tagged, align 4
+  //       %10 = ptrtoint ptr %cost2.tagged to i64
+  //       call void @__hwasan_store8(i64 %10)
+  //       store i64 %cost2.coerce, ptr %cost2.tagged, align 4
+  //  */
+  // if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+  //   if (SI->getValueOperand()->getType()->isIntegerTy() &&
+  //       SI->getPointerOperand()->getType()->isPointerTy()) {
+  //     // pre-filter
+  //     auto *PtrOp = SI->getPointerOperand();
+  //     auto *ValOp = SI->getValueOperand();
+  //     if (ValOp->hasName() &&
+  //         ValOp->getName().str().find(".coerce") != std::string::npos) {
+  //       if (PtrOp->hasName() &&
+  //           PtrOp->getName().str().find(".tagged") != std::string::npos) {
+  //         errs() << "[FSAN] Skipping instrumentation of store of int that "
+  //                   "has been coerced to a struct: "
+  //                << *SI << "\n";
+  //         return false;
+  //       }
+  //     }
+  //   }
+  // }
+
+  // // 12. store of a coerced struct returned by value by a function to a
+  // struct
+  // /**
+  //  * EXAMPLE:
+  //  * %call = call i64 @get_computation_cost(ptr noundef %3, ptr noundef %4,
+  //  ptr
+  //   noundef %5, i8 noundef zeroext 1, ptr noundef %depends_on, ptr noundef
+  // %can_autoinc) #16, !dbg !1910035 %6 = ptrtoint ptr %cost.tagged to i64,
+  // !dbg !1910035 call void @__hwasan_store8(i64 %6), !dbg !1910035
+
+  // --> store i64 %call, ptr %cost.tagged, align 4, !dbg !1910035
+  //  */
+  // if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+  //   auto *ValOp = SI->getValueOperand();
+  //   auto *PtrOp = SI->getPointerOperand();
+
+  //   if (ValOp->getType()->isIntegerTy()) {
+  //     if (CallInst *CI = dyn_cast<CallInst>(ValOp)) {
+  //       // TODO: check the sizes match
+  //       if (PtrOp->hasName() &&
+  //           PtrOp->getName().str().find(".tagged") != std::string::npos) {
+  //         errs()
+  //             << "[FSAN] Skipping instrumentation of store of coerced struct
+  //             "
+  //                "returned by value by a function to a struct: "
+  //             << *SI << "\n";
+  //         return false;
+  //       }
+  //     }
+  //   }
+  // }
+  // // 13. C++ initialization of subobjects
+  // /** EXAMPLE:
+  //  *
+  // call void @std::__1::basic_ios<char,
+  // std::__1::char_traits<char>>::basic_ios[abi:ne210100]()(ptr noundef nonnull
+  // align 8 dereferenceable(148) %0) #17, !dbg !8577
+
+  // store ptr getelementptr
+  // inbounds inrange(-24, 16) ({ [5 x ptr], [5 x ptr] }, ptr @vtable for
+  // std::__1::basic_ofstream<char, std::__1::char_traits<char>>, i32 0, i32 0,
+  // i32 3), ptr %this1
+
+  // %add.ptr = getelementptr inbounds i8, ptr
+  // %this1, i64 176, !dbg !8576 %1 = ptrtoint ptr %add.ptr to i64, !dbg !8576
+  // call void @__hwasan_store8(i64 %1)
+
+  // store ptr getelementptr inbounds inrange(-24, 16) ({ [5 x ptr], [5 x ptr]
+  // }, ptr @vtable for  std::__1::basic_ofstream<char,
+  // std::__1::char_traits<char>>, i32 0, i32 1, i32 3), ptr %add.ptr, align 8,
+  // !dbg !8576
+  //  * */
+
+  // // storing a GEP const expr inside a vtable pointer (global) inside a
+  // pointer
+  // // -> disable checks
+  // if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+  //   auto *ValOp = SI->getValueOperand();
+  //   auto *PtrOp = SI->getPointerOperand();
+  //   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(ValOp)) {
+  //     if (CE->getOpcode() == Instruction::GetElementPtr) {
+  //       bool GepOperandIsVtable =
+  //           demangle(CE->getOperand(0)->getName()).find("vtable") !=
+  //           std::string::npos;
+  //       if (GepOperandIsVtable) {
+  //         // ptr op has to be this, a GEP i8 on this
+  //         bool PtrOpIsThis =
+  //             PtrOp->getName().str().find("this") != std::string::npos;
+  //         bool PtrOpIsGEPOnThis = false;
+  //         if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(PtrOp)) {
+  //           PtrOpIsGEPOnThis =
+  //           GEP->getPointerOperand()->getName().str().find(
+  //                                  "this") != std::string::npos;
+  //         }
+  //         if (PtrOpIsThis || PtrOpIsGEPOnThis) {
+  //           errs() << "[FSAN] Blocklist sub-object vptr init: " << *SI <<
+  //           "\n"; return false;
+  //         }
+  //       }
+  //     }
+  //   }
+  // }
+
+  // // 14. stores to this inside a constructor, loads from vtt, stores/loads on
+  // // vtable offsets, stores/loads to "add.ptr" where the add us is on this
+  // (GEP
+  // // will look like vbase.offset)
+
+  // // EOF BLOCKLISTING CORNER CASES
 
   IRBuilder<> IRB(I);
   if (!O.TypeStoreSize.isScalable() && isPowerOf2_64(O.TypeStoreSize) &&
@@ -1860,7 +2244,8 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     if (ClFSAN_verbose) {
       errs() << "[FSAN-STACK] ALLOCA #" << N << "\n\t" << *AI << "\n\tSZ "
              << Size << " B\n\tFN " << demangle(AI->getFunction()->getName())
-             << "\n";
+             << "\n\t depth " << depth << "\n\t type "
+             << *(AI->getAllocatedType()) << "\n";
       auto *Type = AI->getAllocatedType();
     }
 
@@ -1877,7 +2262,7 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
     });
 
     tagAlloca(IRB, AI, DL);
-
+    NumInstrumentedAllocas++;
     auto TagEnd = [&](Instruction *Node) {
       IRB.SetInsertPoint(Node);
       untagAlloca(IRB, AI, DL);
@@ -2050,7 +2435,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   if (ClFSAN_GEP) {
     for (auto &GEPI : GEPsToInstrument) {
-      InstrumentGEP(GEPI);
+      InstrumentGEP2(GEPI);
     }
   } // TODO: can this be moved here?
 
@@ -2184,8 +2569,7 @@ void dumpGEPDebug(GetElementPtrInst *GEPI) {
     User->print(errs());
     errs() << "\n";
   }
-  errs() << " number of operands: " << GEPI->getNumOperands() << "\n";
-
+  errs() << "  operands: " << GEPI->getNumOperands() << "\n";
   errs() << "\n _______________________________\n";
 }
 
@@ -2244,11 +2628,6 @@ PtrToIntInst *getBasePtrToInt(Value *V, int Depth = 0) {
 
 bool checkIfPtr(Value *V) { return getBasePtrToInt(V) != nullptr; }
 
-// detectin and handling arithmetics is still an open problem and very hard to
-// tackle at IR
-// TODO: this is overapproximated in that it does use help from FE and it does
-// not keep into consideration the case in which both ops are pointers and then
-// their result if used in the current BOP
 void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
   auto DL = M.getDataLayout();
   auto *OP0 = BOP->getOperand(0);
@@ -2257,7 +2636,6 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
 
   if (BOP->getOpcode() == Instruction::Add) {
     /**
-     * BOPsToInstrument
      * %282 = ptrtoint ptr %281 to i64, !dbg !866067
      * ...
      * %291 = load ptr, ptr %__pos_.i.fsan.scalar, align 8
@@ -2296,6 +2674,7 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
           IRBuilder<> IRBNeg(PTINeg);
           auto *NewPtrNeg = untagPointerIntrinsic(IRBNeg, PtrNeg);
           PTINeg->setOperand(0, NewPtrNeg);
+          NumInstrumentedBOPs++;
           return; // case ADD
         } else
           assert(false &&
@@ -2338,30 +2717,9 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
                           PointerType::get(Type::getInt8Ty(M.getContext()), 0),
                           true));
     IRBuilder<> IRB(BOP);
-
-    // errs() << "[FSAN] SKIP BOP " << *BOP << ", in function "
-    //        << BOP->getFunction()->getName() << ", in file "
-    //        << BOP->getFunction()->getParent()->getSourceFileName() << "\n";
-
-    // NOTE: InstCombine + FrontEnd are responsible for this shame
-
     auto *PTI_LHS = getBasePtrToInt(OP0);
     auto *PTI_RHS = getBasePtrToInt(OP1);
     if (PTI_LHS && PTI_RHS && (BOP->getOpcode() == Instruction::Sub)) {
-      // Value *FormatStr = IRB.CreateGlobalStringPtr(
-      //     "BOP SKIP: %s, OP0: %s %p, OP1: %s %p, FUN %s\n");
-      // bool isAdd = BOP->getOpcode() == Instruction::Add;
-      // Value *FuncName = IRB.CreateGlobalStringPtr(isAdd ? "ADD" : "SUB");
-      // Value *FUNC_NAME =
-      //     IRB.CreateGlobalStringPtr(BOP->getFunction()->getName());
-      // Value *OP0NAME_global = OP0->hasName()
-      //                             ? IRB.CreateGlobalStringPtr(OP0->getName())
-      //                             : IRB.CreateGlobalStringPtr("unnamed");
-      // Value *OP1NAME_global = OP1->hasName()
-      //                             ? IRB.CreateGlobalStringPtr(OP1->getName())
-      //                             : IRB.CreateGlobalStringPtr("unnamed");
-      // IRB.CreateCall(printf, {FormatStr, FuncName, OP0NAME_global, OP0,
-      //                         OP1NAME_global, OP1, FUNC_NAME});
       errs() << "[FSAN] BOP CORNER CASE: " << *BOP << "\n";
       errs() << "\tOP0: " << *OP0 << "\n";
       errs() << "\tOP1: " << *OP1 << "\n";
@@ -2376,61 +2734,26 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
       IRBuilder IRB2(PTI_RHS);
       auto *NewPtrRHS = untagPointerIntrinsic(IRB2, PTI_RHS->getOperand(0));
       PTI_RHS->setOperand(0, NewPtrRHS);
-    } else {
-      return;
-      Value *FormatStr = IRB.CreateGlobalStringPtr(
-          "BOP SKIP: %s, OP0: %s %p, OP1: %s %p, FUN %s\n");
-      bool isAdd = BOP->getOpcode() == Instruction::Add;
-      Value *FuncName = IRB.CreateGlobalStringPtr(isAdd ? "ADD" : "SUB");
-      Value *FUNC_NAME =
-          IRB.CreateGlobalStringPtr(BOP->getFunction()->getName());
-      Value *OP0NAME_global = OP0->hasName()
-                                  ? IRB.CreateGlobalStringPtr(OP0->getName())
-                                  : IRB.CreateGlobalStringPtr("unnamed");
-      Value *OP1NAME_global = OP1->hasName()
-                                  ? IRB.CreateGlobalStringPtr(OP1->getName())
-                                  : IRB.CreateGlobalStringPtr("unnamed");
-      IRB.CreateCall(printf, {FormatStr, FuncName, OP0NAME_global, OP0,
-                              OP1NAME_global, OP1, FUNC_NAME});
-    }
+      NumInstrumentedBOPs++;
+    } // PTI & SUB
 
     return;
   }
 
-  // TODO: check if this is always true
   processOperand(BOP, OP0, 0); // OP0 is a ptrtoint
   processOperand(BOP, OP1, 1); // OP1 is a ptrtoint
+  NumInstrumentedBOPs++;
 }
 
-bool isArrayOfAggregates(llvm::Type *T) {
+bool isArrayOfStructs(llvm::Type *T) {
   // Peel all array dimensions
+  if (!T->isArrayTy())
+    return false;
   while (T->isArrayTy())
     T = T->getArrayElementType();
 
   // Check if the base element is an aggregate
-  return T->isAggregateType();
-}
-
-// returns int value
-Value *HWAddressSanitizer::extractLevelFromPointer(IRBuilder<> &IRB,
-                                                   Value *Ptr) {
-  // Extract the tag from the pointer using llvm.ptrmask with a mask that
-  // isolates the LEVEL bits in the tag.
-  Type *PtrTy = Ptr->getType();
-  unsigned PtrBits = M.getDataLayout().getPointerTypeSizeInBits(PtrTy);
-  Type *MaskTy = IntegerType::get(M.getContext(), PtrBits);
-  uint64_t PtrMaskForLevel = LMask << (PointerTagShift + TBits);
-  Value *MaskVal = ConstantInt::get(
-      MaskTy, PtrMaskForLevel); // preserve L bits, not even R, still shifted
-  Function *PtrMaskFcn =
-      Intrinsic::getDeclaration(&M, Intrinsic::ptrmask, {PtrTy, MaskTy});
-
-  Value *LevelShifted = IRB.CreateCall(PtrMaskFcn, {Ptr, MaskVal}); // AND
-  Value *LevelShiftedInt = IRB.CreatePtrToInt(LevelShifted, IntptrTy);
-  Value *Level =
-      IRB.CreateLShr(LevelShiftedInt, PointerTagShift + TBits); // SHIFT
-  Level->setName("FatherL");
-  return Level;
+  return T->isAggregateType() && T->isStructTy();
 }
 
 Value *HWAddressSanitizer::zeroOutLevelBits(IRBuilder<> &IRB, Value *Ptr) {
@@ -2468,14 +2791,18 @@ Value *HWAddressSanitizer::AddOneModuloSomething(IRBuilder<> &IRB,
   return PlusOne;
 }
 
-// TODO: introduce two instrumentGEP, one to tag with T bits only scalar
-// pointers, the other one to tag with R, L and T bits depending on compile-time
-// settings
+int getArrayDimension(Type *AT) {
+  int Dim = 0;
+  while (AT && AT->isArrayTy()) {
+    Dim++;
+    AT = dyn_cast<ArrayType>(AT->getArrayElementType());
+  }
+  return Dim;
+}
 void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   auto nOperands = GEPI->getNumOperands();
   Value *sonTag = nullptr;
   Value *sonIdx = nullptr;
-
   bool guard = false;
   assert(nOperands <= 3);
   auto SrcType = GEPI->getSourceElementType();
@@ -2500,44 +2827,59 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
   uint64_t PTR_MASK = ((1ULL << PointerTagShift) - 1);
   uint64_t L_MASK = ((LMask << (PointerTagShift + TBits)));
   uint64_t R_MASK = (1ULL << (PointerTagShift + TBits + LBits));
-  uint64_t RGTFO =
-      L_MASK | PTR_MASK; // preserve L, remove R for safety, T is unused
+  uint64_t RGTFO = L_MASK | PTR_MASK; // preserve L, remove R, T is unused
 
   Value *FatherLevel = nullptr; // level of ptr operand, only computed if needed
   if (SrcType->isArrayTy()) {
     // if N-dimensional array of structs, L=L+1, R set, T unused (WIP)
     // if array of non-structs, L=L, R=0, T=idx
-    bool isAggregateOfStructs = isArrayOfAggregates(DstType);
+    bool DstIsArrOfStructs = isArrayOfStructs(DstType);
     bool DstIsStruct = DstType->isStructTy();
 
-    if (DstIsStruct || (isAggregateOfStructs)) {
-      // L=L+1 if struct, L if decay/add
-      // R always set
-      // T unused
-      Value *untaggedResult = zeroOutLevelBits(
-          IRB, GEPI); // R is still SET, L is zeroed out, T is unused
-      Value *Tag = nullptr;
+    if ((DstIsArrOfStructs)) {
+      // it could be
+      /**
+       * - array traversal to get to nested array
+       * - array indexing to get to a struct
+       */
 
-      bool isDecayAdd =
+      Value *Tag = nullptr;
+      // when going down one level, the DIM of the SRC is greater than the DIM
+      // of the DST
+      auto DimOfSrcArray = getArrayDimension(SrcType);
+      auto DimOfDstArray = getArrayDimension(DstType);
+      // i.e. computing a pointer to element x from x - 1 or so
+      bool indexing = DimOfSrcArray == DimOfDstArray;
+      // going down inside ARR[n][m] to get nested arrays
+      bool traversing = DimOfSrcArray > DimOfDstArray;
+
+      bool isArrayPtrArith =
           GEPI->getName().str().find("add.ptr") != std::string::npos;
+      bool isArrayDecay =
+          GEPI->getName().str().find("arraydecay") != std::string::npos;
       bool IsArrayIdx = GEPI->hasName() && GEPI->getName().str().find(
                                                "arrayidx") != std::string::npos;
-      if (isDecayAdd || IsArrayIdx) {
+      if (!traversing /*&& (isArrayPtrArith || IsArrayIdx || isArrayDecay)*/) {
         if (ClFSAN_verbose) {
-          errs() << "ARRAY DECAY + STRUCT GEP: ";
+          errs() << "\t[FSAN] ARRAY TRAVERSAL\n";
           GEPI->print(errs());
           errs() << "\n";
         }
+        // do not increment level in this case
         taggedPointer = GEPI;
         endResultName =
             GEPNAME + ".fsan" + (DstIsStruct ? ".struct" : ".array");
-      } else {
+      } // !traversing
 
+      else {
+        // traversing
         Value *RUnset = maskPointerIntrinsic(
-            IRB, untaggedResult, RGTFO); // remove R, preserve L, T is unused
+            IRB, GEPI, RGTFO); // remove R, preserve L, T is unused
         Value *RUnsetLong = IRB.CreatePtrToInt(RUnset, IntptrTy);
+        uint64_t IncConst = 1;
+
         Value *Increment =
-            ConstantInt::get(IntptrTy, (1ULL << (TBits + PointerTagShift)));
+            ConstantInt::get(IntptrTy, (IncConst << (TBits + PointerTagShift)));
         Value *PtrLongIncremented =
             IRB.CreateAdd(RUnsetLong, Increment); // L = L + 1
 
@@ -2545,10 +2887,29 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         Value *PtrLongIncWithRSet = IRB.CreateOr(
             PtrLongIncremented, ConstantInt::get(IntptrTy, R_MASK)); // set R
         taggedPointer = IRB.CreateIntToPtr(PtrLongIncWithRSet, GEPI->getType());
-      }
+        endResultName =
+            GEPNAME + ".fsan.struct.array" + (traversing ? ".down" : "");
+      } // traversing
 
-    } // GEP array->aggregate
-    else {
+    } // GEP array-> array of structs
+
+    else if (DstIsStruct) {
+      // array of structs. L=L+1, set R, T unused
+      Value *RUnset = maskPointerIntrinsic(
+          IRB, GEPI, RGTFO); // remove R, preserve L, T is unused
+      Value *RUnsetLong = IRB.CreatePtrToInt(RUnset, IntptrTy);
+      uint64_t IncConst = 1;
+      Value *Increment =
+          ConstantInt::get(IntptrTy, (IncConst << (TBits + PointerTagShift)));
+      Value *PtrLongIncremented =
+          IRB.CreateAdd(RUnsetLong, Increment); // L = L + 1
+      uint64_t R_MASK = (1ULL << (PointerTagShift + TBits + LBits));
+      Value *PtrLongIncWithRSet = IRB.CreateOr(
+          PtrLongIncremented, ConstantInt::get(IntptrTy, R_MASK)); // set R
+      taggedPointer = IRB.CreateIntToPtr(PtrLongIncWithRSet, GEPI->getType());
+      endResultName = GEPNAME + ".fsan.struct.array";
+
+    } else {
       // array of non-structs. Preserve L, we are flattening it.
       // L = L, R = 0, T = idx
       taggedPointer = GEPI;
@@ -2667,13 +3028,15 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
 
         // H: is pointers to a certain struct are used in extractvalue, type
         // coercion
-      }// unnamed struct coercion detection 
+      } // unnamed struct coercion detection
 
       sonTag = nullptr;
-      auto sonIsScalar = !DstType->isStructTy() && !DstType->isVectorTy();
-      bool sonIsArrayOfAggregates = isArrayOfAggregates(DstType);
-
-      if (sonIsScalar && !sonIsArrayOfAggregates && tag) {
+      auto sonIsScalar = !DstType->isStructTy() && !DstType->isVectorTy() &&
+                         !isArrayOfStructs(DstType);
+      bool DstIsAggregateOfStructs = isArrayOfStructs(DstType);
+      bool DstIsStruct = DstType->isStructTy();
+      // NOTE: it can be a pointer to an array, just NOT an array of structs
+      if (sonIsScalar && tag) {
         uint64_t idx = -1;
         auto op2 = GEPI->getOperand(2);
         uint64_t T = -1;
@@ -2707,55 +3070,57 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
         // sometimes, we might not want to tag the GEP
         taggedPointer = untagPointerIntrinsic(IRB, GEPI);
         endResultName = GEPNAME + ".fsan.untagged";
-      } else {
-        // tag = 1
-        // result is either aggregate or array of aggregates -> L=L+1, R set, T
-        // unused
-        if (DstType->isAggregateType()) {
-          /** GEP: struct -> aggregate */
-          // L = L + 1 if not decay, L = L if decay (since we are still indexing
-          // the first level of the struct), R = 1, T = unused set R Value
-          // *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
+      } else if (DstIsAggregateOfStructs || DstIsStruct) {
+        //   /** GEP: struct -> aggregate */
+        //   // L = L + 1 if not decay, L = L if decay (since we are still
+        //   indexing
+        //   // the first level of the struct), R = 1, T = unused set R Value
+        //   // *untaggedResult = untagPointerIntrinsic(IRB, GEPI);
 
-          bool isDecayAdd =
-              GEPI->getName().str().find("add.ptr") != std::string::npos;
-          bool IsArrayIdx =
-              GEPI->hasName() &&
-              GEPI->getName().str().find("arrayidx") != std::string::npos;
-          if (isDecayAdd || IsArrayIdx) {
-            if (ClFSAN_verbose) {
-              errs() << "ARRAY DECAY + STRUCT GEP: ";
-              GEPI->print(errs());
-              errs() << "\n";
-            }
+        //   bool isDecayAdd =
+        //       GEPI->getName().str().find("add.ptr") != std::string::npos;
+        //   bool IsArrayIdx =
+        //       GEPI->hasName() &&
+        //       GEPI->getName().str().find("arrayidx") != std::string::npos;
+        //   bool IsIncDec =
+        //       GEPI->getName().str().find("incdec") != std::string::npos;
+        //   if (isDecayAdd || IsArrayIdx || IsIncDec) {
+        //     if (ClFSAN_verbose) {
+        //       errs() << "NO LEVEL UP. Case : "
+        //              << (isDecayAdd ? "decay/add"
+        //                             : (IsArrayIdx ? "arrayidx" : "incdec"))
+        //              << "\n";
+        //       errs() << "\tGEP: ";
+        //       GEPI->print(errs());
+        //       errs() << "\n";
+        //     }
 
-            taggedPointer = GEPI;
-            endResultName = GEPNAME + ".fsan" +
-                            (DstType->isStructTy() ? ".struct" : ".array");
-          }
+        //     taggedPointer = GEPI;
+        //     endResultName = GEPNAME + ".fsan" +
+        //                     (DstType->isStructTy() ? ".struct" : ".array");
+        //   } // decay or arrayidx
+        //   else {
+        // TODO: optimize this case! Some benchmark might not compile due to
+        // excessive register pressure
+        Value *RUnset = maskPointerIntrinsic(IRB, GEPI, RGTFO);
+        // UNSET R to prevent bad math
+        Value *RUnsetLong = IRB.CreatePtrToInt(RUnset, IntptrTy);
+        Value *Increment =
+            ConstantInt::get(IntptrTy, (1ULL << (TBits + PointerTagShift)));
 
-          else {
-            // TODO: optimize this case! Some benchmark might not compile due to
-            // excessive register pressure
-            Value *RUnset = maskPointerIntrinsic(IRB, GEPI, RGTFO);
-            // UNSET R to prevent bad math
-            Value *RUnsetLong = IRB.CreatePtrToInt(RUnset, IntptrTy);
-            Value *Increment =
-                ConstantInt::get(IntptrTy, (1ULL << (TBits + PointerTagShift)));
-            Value *PtrLongIncremented = IRB.CreateAdd(RUnsetLong, Increment);
-            Value *PtrLongIncWithRSet =
-                IRB.CreateOr(PtrLongIncremented,
-                             ConstantInt::get(IntptrTy, R_MASK)); // set R
-            taggedPointer =
-                IRB.CreateIntToPtr(PtrLongIncWithRSet, GEPI->getType());
-            endResultName = GEPNAME + ".fsan" +
-                            (DstType->isStructTy() ? ".struct" : ".array");
-          }
-        }
-      } // else - son is either not scalar or arrayOfAggregates
+        Value *PtrLongIncremented = IRB.CreateAdd(RUnsetLong, Increment);
+        Value *PtrLongIncWithRSet = IRB.CreateOr(
+            PtrLongIncremented, ConstantInt::get(IntptrTy, R_MASK)); // set R
+        taggedPointer = IRB.CreateIntToPtr(PtrLongIncWithRSet, GEPI->getType());
+        endResultName =
+            GEPNAME + ".fsan" + (DstType->isStructTy() ? ".struct" : ".array");
+        // }
+      } // DstIsAggregate
     } // FATHER IS STRUCT
+
     else {
-      // SRC Type is neither an array nor a struct -> what is it then?
+      // SRC Type is neither an array nor a struct
+      // NOTE: these GEPs do not get touched for now
       if (ClFSAN_verbose) {
         errs() << "[FSAN] OTHER GEP " << "\n\tGEP: ";
         GEPI->print(errs());
@@ -2775,7 +3140,7 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
           errs() << "NAME OF IDX OPERAND: " << NameIdxOperand << "\n";
           // TODO: how do I figure out nesting level??
         }
-      }
+      } // clFSAN_verbose
 
       return;
     }
@@ -2830,6 +3195,448 @@ void HWAddressSanitizer::InstrumentGEP(GetElementPtrInst *GEPI) {
                 // EXAMPLE ->  GEP OPERAND 0:
                 // @_ZTVNSt7__cxx1115basic_stringbufIcSt11char_traitsIcESaIcEEE
                 // = external unnamed_addr constant { [16 x ptr] }, align 8
+                if (GlobalVariable *GV =
+                        dyn_cast<GlobalVariable>(CE->getOperand(0))) {
+                  if (GV->hasName() &&
+                      demangle(GV->getName().str()).find("vtable for") == 0) {
+                    safe = false;
+                  }
+                }
+              }
+            } // if GEPOperator
+          }
+        } // store in VTable
+
+        if (!safe) {
+          if (ClFSAN_verbose) {
+            errs() << "[FSAN] NOT REPLACING USE IN USER: ";
+            User->print(errs());
+            errs() << "\n";
+          }
+        }
+        return safe;
+      });
+  NumInstrumentedGEPs++;
+} // InstrumentGEP
+
+bool performChecksOnGEP(GetElementPtrInst *GEPI) {
+  // IDEA: remove FPs caused by type coercion happening
+  // 1. when passing structs by value
+  // 2. when using extractvalue on structs passed by value
+  // 3. when a function returns a struct by value and it's immediately
+  // (cfr std::make_tuple) used in a GEP
+  // TODO: what else is there?
+  // TODO: handle case by case to avoid FNs
+  bool tag = true;
+  StructType *GEPST = dyn_cast<StructType>(GEPI->getSourceElementType());
+  Value *GEPPtrOp = GEPI->getPointerOperand();
+  if (AllocaInst *AI = dyn_cast<AllocaInst>(GEPPtrOp)) {
+    Type *AIType = AI->getAllocatedType();
+    if (AIType->isStructTy()) {
+      StructType *AllocaST = dyn_cast<StructType>(AIType);
+      // compare two structs layouts
+      auto nFieldsAIST = AllocaST->getNumElements();
+      auto nFieldsGEPST = GEPST->getNumElements();
+
+      // NOTE: this fixes issues when returning/passing a struct by value
+      // (cfr 403.gcc, 462.libquantum, 525.x264_r)
+      if (nFieldsAIST != nFieldsGEPST) {
+        // H1: very coarse
+        errs() << "[FSAN] Presumably compiler-induced type punning "
+                  "detected\n\t\tAlloca struct type: "
+               << *AllocaST << "\n\t\tGEP struct type: " << *GEPST
+               << "\n\t\tGEP instruction: " << *GEPI << "\n";
+        tag = false;
+      } // H1 -> different N of fields
+
+      /**
+       * %"struct.std::__1::pair.21" = type { %struct.anon,
+       * %struct.anon }
+       * could be cast to
+       * {ptr, ptr} if struct.anon = {ptr}
+       */
+      else {
+        // NOTE: this fixes weird cases in which structs with just one
+        // field are nested into each other (cfr iterator pair in
+        // 541.leela_r)
+        bool layoutsMatch = true;
+        for (unsigned i = 0; i < nFieldsAIST; i++) {
+          Type *FieldTypeAIST = AllocaST->getElementType(i);
+          Type *FieldTypeGEPST = GEPST->getElementType(i);
+          if (FieldTypeAIST != FieldTypeGEPST) {
+            layoutsMatch = false;
+            break;
+          }
+        }
+        if (!layoutsMatch) {
+          // H2: more precise, still overapproximation but less than H1
+          errs() << "[FSAN] Presumably compiler-induced type punning "
+                    "detected based on struct layout "
+                    "mismatch\n\t\tAlloca struct type: "
+                 << *AllocaST << "\n\t\tGEP struct type: " << *GEPST
+                 << "\n\t\tGEP instruction: " << *GEPI << "\n";
+          tag = false;
+          auto DebugLoc = GEPI->getDebugLoc();
+          if (DebugLoc) {
+            errs() << "\t\t at ";
+            DebugLoc.print(errs());
+            errs() << "\n";
+          }
+        }
+        // TODO: can this open up to FNs?
+      }
+    } // AI->isStruct
+
+  } // if ALLOCA
+  else {
+
+    errs() << "[FSAN] GEP pointer operand is not an alloca: " << *GEPPtrOp
+           << "\n\tunderlying object: " << *getUnderlyingObject(GEPPtrOp)
+           << "\n\t GEP: " << *GEPI << "\n";
+
+    if (GEPPtrOp->hasName() &&
+        GEPPtrOp->getName().find("coerce.") != std::string::npos) {
+      errs() << "[FSAN] HEURISTIC - GEP with coerce in name: " << *GEPI << "\n";
+      tag = false;
+    } // HEUR 2
+    tag = false; // BE CONSERVATIVE IN CASE OF ANON STRUCT GEP
+
+    // TODO: since some ptrs might tagged already, try and "revert" the
+    // tagging logic to revel the original pointer
+    // if PTR comes from LOAD -> conservatively untag GEP
+
+    // if PTR is alloca (pot. fsan-tagged), get base alloca and do checks
+    // on type
+
+    // if it's heap-alloc, try and get the type from call to fsan
+    // tagging function?
+
+    // if it's array idx, try and get type from GEP (it's a GEP)
+  }
+
+  // H: is pointers to a certain struct are used in extractvalue, type
+  // coercion
+  return tag;
+}
+
+void HWAddressSanitizer::InstrumentGEP2(GetElementPtrInst *GEPI) {
+  auto nOperands = GEPI->getNumOperands();
+  Value *sonTag = nullptr;
+  Value *sonIdx = nullptr;
+  bool guard = false;
+  assert(nOperands <= 3);
+  // base info
+  auto SrcType = GEPI->getSourceElementType();
+  bool SrcIsStruct = SrcType->isStructTy();
+  bool SrcIsArray = SrcType->isArrayTy();
+  auto DstType = GEPI->getResultElementType();
+  bool DstIsStruct = DstType->isStructTy();
+  bool DstIsArrOfStructs = isArrayOfStructs(DstType);
+  bool IsIncDecGEP = GEPI->hasName() &&
+                     GEPI->getName().str().find("incdec") != std::string::npos;
+  bool IsAddPtrGEP = GEPI->hasName() &&
+                     GEPI->getName().str().find("add.ptr") != std::string::npos;
+  bool IsArrayIdxGEP = GEPI->hasName() && GEPI->getName().str().find(
+                                              "arrayidx") != std::string::npos;
+  bool IsArrayDecayGEP =
+      GEPI->hasName() &&
+      GEPI->getName().str().find("arraydecay") != std::string::npos;
+  auto PtrOp = GEPI->getPointerOperand();
+  auto GEPNAME = GEPI->hasName() ? GEPI->getName().str()
+                                 : "gep." + itostr(NumInstrumentedGEPs);
+  auto PTR_OP_NAME = GEPI->getPointerOperand()->hasName()
+                         ? GEPI->getPointerOperand()->getName().str()
+                         : "gep.ptr.op." + itostr(NumInstrumentedGEPs);
+
+  if (GEPI->getType()->isVectorTy()) {
+    assert(false && "This should not happen if loop opts are disabled");
+  }
+
+  IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
+  auto GEPLong = IRB.CreatePtrToInt(PtrOp, IntptrTy);
+  std::string endResultName = "";
+  Value *taggedPointer = nullptr;
+  uint64_t PTR_MASK = ((1ULL << PointerTagShift) - 1);
+
+  // SHIFTED MASKS TO PRESERVE SOME BITS IN THE PTR
+  uint64_t PRES_T_SUBMASK = (0b111ULL << (PointerTagShift));
+  uint64_t PRES_L_SUBMASK = (0b11ULL << (PointerTagShift + TBits));
+  uint64_t PRES_R_SUBMASK = (1ULL << (PointerTagShift + TBits + LBits));
+
+  uint64_t PRES_L_MASK =
+      PRES_L_SUBMASK | PTR_MASK; // remove R, preserve L, remove T
+  uint64_t PRES_R_MASK =
+      PRES_R_SUBMASK | PTR_MASK; // remove L, preserve R, remove T
+
+  uint64_t PRES_T_MASK =
+      PRES_T_SUBMASK | PTR_MASK; // remove L, preserve T, remove R
+  Value *FatherLevel = nullptr;
+
+  // CASE 1. GEP from a struct
+  if (SrcIsStruct) {
+    StructType *ST = dyn_cast<StructType>(SrcType);
+    assert(ST && "GEP source type is struct but not a StructType?");
+    bool tag = true;
+
+    if (ST && !ST->hasName() && ClSkipUnnamedStructs)
+      tag = performChecksOnGEP(GEPI);
+
+    auto sonIsScalar =
+        !DstIsStruct && !DstType->isVectorTy() && !DstIsArrOfStructs;
+
+    if (tag) {
+      if (sonIsScalar) {
+        // NOTE: both native types fields and their arrays fall under this case
+        uint64_t idx = -1;
+        auto op2 = GEPI->getOperand(2);
+        uint64_t T = -1;
+        ConstantInt *CI = dyn_cast<ConstantInt>(op2);
+        idx = (uint64_t)CI->getZExtValue();
+        uint64_t IdxModuloT_MAX = (idx + 1) % T_MAX;
+        uint64_t IdxDivT_MAX = (idx + 1) / T_MAX;
+        T = (IdxModuloT_MAX + IdxDivT_MAX);
+        T = T % T_MAX;
+        if (T == 0)
+          T = 1;
+        // SET T, preserve L, remove R
+        sonTag = ConstantInt::get(IntptrTy, T);
+        Value *untagged = maskPointerIntrinsic(IRB, GEPI, PRES_L_MASK);
+        Value *untaggedLong = IRB.CreatePtrToInt(untagged, IntptrTy);
+        Value *TBits_CONST = ConstantInt::get(IntptrTy, T << (PointerTagShift));
+        Value *untaggedLongWithT = IRB.CreateOr(untaggedLong, TBits_CONST);
+        taggedPointer = IRB.CreateIntToPtr(untaggedLongWithT, GEPI->getType());
+        endResultName = GEPNAME + ".fsan.scalar";
+      } // sonIsScalar
+      else {
+        // if DstIsStruct, set R and L = L + 1, T unused -> this is handled
+        // elsewhere
+        if (DstIsArrOfStructs) {
+          // if DstIsAggregateOfStructs, set R and L = L+1, drop T
+          Value *RUnset = maskPointerIntrinsic(IRB, GEPI, PRES_L_MASK);
+          Value *Increment =
+              ConstantInt::get(IntptrTy, (1ULL << (TBits + PointerTagShift)));
+          Value *RUnsetLong = IRB.CreatePtrToInt(RUnset, IntptrTy);
+          Value *PtrLongIncremented =
+              IRB.CreateAdd(RUnsetLong, Increment); // L = L + 1
+          uint64_t SET_R_CONSTANT = (1ULL << (PointerTagShift + TBits + LBits));
+          Value *PtrLongIncWithRSet =
+              IRB.CreateOr(PtrLongIncremented,
+                           ConstantInt::get(IntptrTy, SET_R_CONSTANT)); // set R
+          PtrLongIncWithRSet->setName(GEPNAME + ".fsan.struct.array.inc.tmp");
+          taggedPointer =
+              IRB.CreateIntToPtr(PtrLongIncWithRSet, GEPI->getType());
+          endResultName = GEPNAME + ".fsan.struct.array";
+        }
+        // NOTE : the case of struct -> struct is case 2
+      } // else scalar
+    } // if tag
+
+    else {
+      // sometimes, we might not want to tag the GEP
+      taggedPointer = untagPointerIntrinsic(IRB, GEPI);
+      endResultName = GEPNAME + ".fsan.untagged";
+    } // else tag
+  } // FATHER IS STRUCT
+
+  // CASE 2. GEP to a struct
+  if (DstIsStruct) {
+    if (IsIncDecGEP || IsAddPtrGEP) {
+      // when traversing array, no increment or tag change in general
+      return;
+    }
+
+    if (IsArrayIdxGEP) {
+      // HEUR1: if the pointer is a function argument, then it is already a
+      // pointer to a struct, DO NOT INCREMENT LEVEL
+      if (LoadInst *LI = dyn_cast<LoadInst>(PtrOp)) {
+        Value *LoadPtrOp = LI->getPointerOperand();
+        auto Loaded = getUnderlyingObject(LoadPtrOp);
+        // when passing arrays to a function, they are decayed to a pointer
+        // the struct. This guarantees they are incremented.
+        for (User *U : Loaded->users()) {
+          if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
+            Value *StoredVal = SI->getValueOperand();
+            if (Argument *Arg = dyn_cast<Argument>(StoredVal)) {
+              return;
+            }
+          }
+        }
+      }
+
+      // HEUR2: within the same function, if the pointer operand of the GEP is a
+      // decay, DO NOT INCREMENT LEVEL
+      if (LoadInst *LI = dyn_cast<LoadInst>(PtrOp)) {
+        auto *LoadPtrOp = LI->getPointerOperand();
+        for (User *U : LoadPtrOp->users()) {
+          if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
+            Value *StoredVal = SI->getValueOperand();
+            if (StoredVal->hasName() &&
+                StoredVal->getName().str().find("arraydecay") !=
+                    std::string::npos) {
+              return;
+            } else {
+              if (LoadInst *LI2 = dyn_cast<LoadInst>(StoredVal)) {
+                Value *LoadPtrOp2 = LI2->getPointerOperand();
+                auto Loaded2 = getUnderlyingObject(LoadPtrOp2);
+                // check whether Loaded2 is a function argument
+                for (User *U2 : Loaded2->users()) {
+                  if (StoreInst *SI2 = dyn_cast<StoreInst>(U2)) {
+                    Value *StoredVal2 = SI2->getValueOperand();
+                    if (Argument *Arg = dyn_cast<Argument>(StoredVal2)) {
+                      return;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // HEUR4: if ptr is loaded from a global variable, then it is already a
+      // pointer to a struct, DO NOT INCREMENT LEVEL
+      if (LoadInst *LI = dyn_cast<LoadInst>(PtrOp)) {
+        Value *LoadPtrOp = LI->getPointerOperand();
+        auto Loaded = getUnderlyingObject(LoadPtrOp);
+        if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Loaded)) {
+          errs() << "[FSAN] HEURISTIC - GEP is arrayidx, pointer operand is "
+                    "loaded from a global variable, DO NOT INCREMENT LEVEL\n";
+          errs() << "\tGEP: " << *GEPI << "\n";
+          return;
+        }
+      }
+    } // IsArrayIdxGEP
+
+    // when computing a struct pointer from a struct or an array, we need to set
+    // R and increment L
+    Value *RUnset = maskPointerIntrinsic(IRB, GEPI, PRES_L_MASK | PRES_T_MASK);
+    Value *RUnsetLong = IRB.CreatePtrToInt(RUnset, IntptrTy);
+    uint64_t IncConst = 1ULL << (PointerTagShift + TBits);
+    uint64_t IncTConst = 1ULL << (PointerTagShift);
+    Value *Increment = nullptr;
+
+    if (IsArrayDecayGEP || (SrcIsStruct && nOperands == 3)) {
+      // DecayGEPs are incremented to spill the pointer already at the right
+      // level
+      Increment = ConstantInt::get(IntptrTy, IncConst);
+      if(IsArrayDecayGEP) {
+        RUnsetLong = IRB.CreateOr(
+            RUnsetLong,
+            ConstantInt::get(IntptrTy, IncTConst)); // set 1 bit of T
+      }
+      
+      // TODO: this is ambiguous for matrices
+    } else {
+      // GEP inside a structure (src can be struct, or array)
+      Value *PresOnlyTMask =
+          ConstantInt::get(IntptrTy, PRES_T_SUBMASK); // ONLY T
+      Value *TBitsValue = IRB.CreateAnd(GEPLong, PresOnlyTMask);
+      Value *TBitsIsZero =
+          IRB.CreateICmpEQ(TBitsValue, ConstantInt::get(IntptrTy, 0));
+      Value *IncConstVal = ConstantInt::get(IntptrTy, IncConst);
+      Value *ZeroVal = ConstantInt::get(IntptrTy, 0);
+      Increment = IRB.CreateSelect(TBitsIsZero, IncConstVal, ZeroVal);
+    }
+    // TODO: make function
+    Value *PtrLongIncremented = IRB.CreateAdd(RUnsetLong, Increment);
+    uint64_t SET_R_CONSTANT = (1ULL << (PointerTagShift + TBits + LBits));
+    Value *PtrLongIncWithRSet =
+        IRB.CreateOr(PtrLongIncremented,
+                     ConstantInt::get(IntptrTy, SET_R_CONSTANT)); // set R
+    PtrLongIncWithRSet->setName(GEPNAME + ".fsan.struct.inc.tmp");
+    taggedPointer = IRB.CreateIntToPtr(PtrLongIncWithRSet, GEPI->getType());
+    endResultName = GEPNAME + ".fsan.struct";
+  } // CASE 2. GEP to a struct
+
+  // CASE 3. GEP from an array
+  if (SrcType->isArrayTy()) {
+    if ((DstIsArrOfStructs)) {
+      auto DimOfSrcArray = getArrayDimension(SrcType);
+      auto DimOfDstArray = getArrayDimension(DstType);
+
+      // traversing == going down inside ARR[n][m] to get nested arrays
+      bool traversing = DimOfSrcArray > DimOfDstArray;
+
+      if (!traversing) {
+        // preserve R, L. T is unused
+        taggedPointer = GEPI;
+        endResultName = GEPNAME + (DstIsStruct ? ".struct" : ".array");
+      } // !traversing
+
+      else {
+        // traversing
+        // TODO : do I want to preserve T?
+        Value *RUnset = maskPointerIntrinsic(
+            IRB, GEPI,
+            PRES_L_MASK | PRES_T_MASK); // remove R, preserve L, preserve T
+        Value *RUnsetLong = IRB.CreatePtrToInt(RUnset, IntptrTy);
+        uint64_t IncConst = 1ULL << (PointerTagShift + TBits);
+        Value *Increment = nullptr;
+        Value *PresOnlyTMask =
+            ConstantInt::get(IntptrTy, PRES_T_SUBMASK); // ONLY T
+        Value *TBitsValue = IRB.CreateAnd(GEPLong, PresOnlyTMask);
+
+        Value *TBitsIsZero =
+            IRB.CreateICmpEQ(TBitsValue, ConstantInt::get(IntptrTy, 0));
+        Value *IncConstVal = ConstantInt::get(IntptrTy, IncConst);
+        Value *ZeroVal = ConstantInt::get(IntptrTy, 0);
+        Increment = IRB.CreateSelect(TBitsIsZero, IncConstVal, ZeroVal);
+
+        Value *PtrLongIncremented =
+            IRB.CreateAdd(RUnsetLong, Increment); // L = L + 1
+
+        uint64_t SET_R_CONST = (1ULL << (PointerTagShift + TBits + LBits));
+        Value *PtrLongIncWithRSet =
+            IRB.CreateOr(PtrLongIncremented,
+                         ConstantInt::get(IntptrTy, SET_R_CONST)); // set R
+        taggedPointer = IRB.CreateIntToPtr(PtrLongIncWithRSet, GEPI->getType());
+        endResultName = GEPNAME + ".fsan.struct.array.down";
+      } // traversing
+    } // GEP array-> array of structs
+
+    else if (!DstIsStruct) {
+      // L = L, R = 0, T = idx
+      // NOTE : these arrays must not have R set!
+      taggedPointer = GEPI;
+      endResultName = GEPNAME + ".fsan.scalar.array";
+    }
+
+  } // GEP from array type
+
+  if (!taggedPointer) {
+    return;
+  }
+
+  assert(taggedPointer->isPointerTy() &&
+         "Tagged pointer must be of pointer type");
+  taggedPointer->setName(endResultName);
+
+  GEPI->replaceUsesWithIf(
+      taggedPointer, [GEPI, DstType, GEPLong](const Use &U) {
+        auto *User = U.getUser();
+        if (User == GEPLong) {
+          return false;
+        }
+        // do not replace in these calls, they are used to remove tag
+        if (CallBase *CB = dyn_cast<CallBase>(User)) {
+          if (CB->getCalledFunction() && CB->getCalledFunction()->hasName() &&
+              CB->getCalledFunction()->getName().find("llvm.ptrmask") !=
+                  std::string::npos)
+            return false; // no repl
+        } // call to mask ptr
+
+        if (isa<LifetimeIntrinsic>(User))
+          return false; // no repl
+
+        bool safe = true;
+
+        // NOTE: do not tag pointers used to access vtable
+        // accesses to vtables mis-use tagged pointers
+        if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
+          if (SI->getPointerOperand() == GEPI) {
+            Value *storedVal = SI->getValueOperand();
+            if (GEPOperator *CE = dyn_cast<GEPOperator>(storedVal)) {
+              if (CE->isInBounds() && CE->getNumOperands() >= 3) {
                 if (GlobalVariable *GV =
                         dyn_cast<GlobalVariable>(CE->getOperand(0))) {
                   if (GV->hasName() &&
@@ -3043,7 +3850,7 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   // if (depth > 0) {
   //   errs() << "[FSAN] TAG GV: " << GV->getName() << ", TY: " << *GVType <<
   //   "\n"; errs() << "\t * " << depth << "-D array of structs" << "\n"; errs()
-  //   << "\t * Number of elements: " << nElems << "\n";
+  //   << "\t *  elements: " << nElems << "\n";
   // }
 
   // END of type check
@@ -3122,7 +3929,21 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   }
   uint8_t Tag = 0;
   Tag = RPTag; // NOTE: both structs and arrays of structs have RP set
+  auto AdjDepth =
+      (depth /*> 0 ? depth - 1 : 0*/) &
+      (L_MAX); // depth is 0 for structs, 1 for arrays, 2 for matrices, etc
+  Tag |= (AdjDepth << TBits); // set L to struct aggregate depth IF AGGREGATE
+  Tag |= AdjDepth;
+  errs() << "[FSAN] TAG GV: " << GV->getName() << ", TY: " << *GVType
+         << ", DEPTH: " << depth << ", TAG: " << (int)Tag << "\n";
 
+  {
+    // are there ptrs to globals in the initializer of the global at hand?
+    auto Initializer = GV->getInitializer();
+    for (auto &U : Initializer->operands()) {
+      errs() << "[FSAN] Initializer operand: " << *U << "\n";
+    }
+  }
   Constant *Aliasee = ConstantExpr::getIntToPtr(
       ConstantExpr::getAdd(
           ConstantExpr::getPtrToInt(NewGV, Int64Ty),

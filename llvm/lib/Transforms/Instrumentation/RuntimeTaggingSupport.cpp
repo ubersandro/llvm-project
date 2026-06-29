@@ -29,7 +29,7 @@ uint64_t T_MAX = (1ULL << TBits); // 0b100000
 #else
 uint64_t TBits = 5;
 uint64_t LBits = 2;
-uint64_t L_MAX = (1ULL << LBits);
+int L_MAX = (1ULL << LBits);
 uint64_t T_MAX = (1ULL << TBits); // 0b100000
 #endif
 
@@ -147,8 +147,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
   std::deque<std::tuple<Type *, uint8_t, uint8_t, uint8_t, size_t>> AggQueue;
   auto FieldsOffsets = DL.getStructLayout(Ty)->getMemberOffsets();
 
-  uint8_t fatherT = 0;
-  uint8_t fatherL = depth & (L_MAX - 1); // modulo L_MAX --> level-aware
+  uint8_t fatherT = 0;                 /* unused */
+  int fatherL = (depth & (L_MAX - 1)); // modulo L_MAX --> level-aware
   uint32_t sonIdx = 1;
   // NOTE: 2^^16 max number of fields
   if (FieldsOffsets.size() >= (1 << 16) - 1) {
@@ -168,10 +168,10 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
 
     auto Tuple = AggQueue.front();
     AggQueue.pop_front();
-    sonIdx = std::get<3>(Tuple);
     Type *CurFieldType = std::get<0>(Tuple);
     fatherT = std::get<1>(Tuple);
     fatherL = std::get<2>(Tuple);
+    sonIdx = (uint32_t)std::get<3>(Tuple);
     size_t CurFieldOffset = std::get<4>(Tuple);
 
     auto *CurFieldStructType = dyn_cast<StructType>(CurFieldType);
@@ -230,6 +230,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
           DL.getStructLayout(cast<StructType>(CurFieldType))
               ->getMemberOffsets();
       size_t CurContainedSubTy = 0;
+      // for struct types, we go one level deeper
       auto NextL = (fatherL + 1) & (L_MAX - 1); // modulo L_MAX
 
       for (Type *SSty : llvm::reverse(CurFieldType->subtypes())) {
@@ -245,27 +246,29 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
     else if (CurFieldType->isArrayTy()) {
       // NOTE: depth 12 is arbitrary
       const int MaxDepth = 12;
-      int CurDepth = 1; // structs are always one level deeper wrt to the array
-                        // they belong to
-
+      // TODO: should structs live one level deeper wrt to the enclosing array?
+      int ArrayDims = 1;
       auto *CurArrayType = dyn_cast<ArrayType>(CurFieldType);
       u_int64_t Elements = CurArrayType->getNumElements();
       auto *ElemType = CurArrayType->getArrayElementType();
 
-      while (ElemType->isArrayTy() && CurDepth <= MaxDepth) {
+      while (ElemType->isArrayTy() && ArrayDims <= MaxDepth) {
         CurArrayType = dyn_cast<ArrayType>(ElemType);
         ElemType = CurArrayType->getArrayElementType();
         Elements *= CurArrayType->getNumElements();
-        CurDepth++;
+        ArrayDims++;
       }
-      auto OverallDepth =
-          (CurDepth + 1 + fatherL) & (L_MAX - 1); // modulo L_MAX
+      int OverallDepth =
+          (ArrayDims + fatherL) & (L_MAX - 1); // as a struct member, level is already +1
       // check type
       if (ElemType->isStructTy()) {
         // retrieve or create tag vector for struct type
         auto *ElemStructType = dyn_cast<StructType>(ElemType);
+        assert(ElemStructType &&
+               "Element type of array must be struct for this case.");
         size_t ElemStructSize = DL.getTypeAllocSize(ElemStructType);
-        auto *TagVector = RetrieveOrCreateTagVector(ElemStructType, M);
+        auto *TagVector =
+            RetrieveOrCreateTagVector(ElemStructType, M, OverallDepth+1);
         assert(TagVector && "Failed to retrieve or create tag vector for "
                             "struct element type.");
         GlobalVariable *TVGV = dyn_cast<GlobalVariable>(TagVector);
@@ -280,12 +283,6 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
             assert(ElemTag &&
                    "Element tag must be a constant integer in the tag vector.");
             auto ElemTagValue = ElemTag->getZExtValue();
-            // ADJUST LEVEL TO NEW NESTING SITUATION
-            if (ElemTagValue != 0)
-              ElemTagValue |= (OverallDepth << TBits);
-
-            assert(ElemTagValue <= 0xff &&
-                   "Element tag value must fit in a byte.");
             Tags[ElemOffset + H] = static_cast<uint8_t>(ElemTagValue);
           }
         }
@@ -302,7 +299,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         }
         uint8_t Tag = T;
 
-        Tag |= (fatherL << TBits);
+        Tag |= (fatherL << TBits); /* non-struct arrays elements all live at the
+                                      same level of the array itself */
         size_t ArraySize = DL.getTypeAllocSize(CurFieldType);
 
         memset(&Tags[CurFieldOffset], Tag, ArraySize);
@@ -314,9 +312,13 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         // ONLY ENABLE IF IT'S FULL OF THESE BUGS AND THEY ARE ANNOYING FOR
         // FUZZING
         bool isArray = CurFieldType->isArrayTy();
-         // NOTE: FAM can only be at the very end of the struct, but there could be an extra padding member if the size of the FAM is 1.
-        bool IsLastField = sonIdx == FieldsOffsets.size() || sonIdx == (FieldsOffsets.size() - 1); // breaks with padding bytes, they are an extra field
-        
+        // NOTE: FAM can only be at the very end of the struct, but there could
+        // be an extra padding member if the size of the FAM is 1.
+        bool IsLastField =
+            sonIdx == FieldsOffsets.size() ||
+            sonIdx == (FieldsOffsets.size() -
+                       1); // breaks with padding bytes, they are an extra field
+
         if (IsLastField && isArray) {
 
           // NOTE: the field might overlap with compiler-inserted padding
@@ -326,8 +328,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
             if (clFSAN_FAM) {
               errs() << "[FSAN - TAG] Clearing potential padding at the end of "
                         "struct "
-                     << *Ty << " (field: " << *CurFieldType << ", idx " << sonIdx
-                     << ", remainder bytes: " << RemainderBytes
+                     << *Ty << " (field: " << *CurFieldType << ", idx "
+                     << sonIdx << ", remainder bytes: " << RemainderBytes
                      << ", struct size: " << DL.getTypeAllocSize(Ty) << ")\n";
               memset(&Tags[CurFieldOffset], 0x00, RemainderBytes);
             }
@@ -335,7 +337,6 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
           // FFMPEG fix: remove FPs untagging artifically padded structs? Can
           // be patched in SRC
         } // if LastField
-        
       }
     } // cur sub field is array
 

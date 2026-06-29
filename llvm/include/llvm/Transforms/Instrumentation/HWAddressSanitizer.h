@@ -182,6 +182,7 @@ public:
   }
 
   void sanitizeFunction(Function &F, FunctionAnalysisManager &FAM);
+  void instrumentGlobals();
 
 private:
   struct ShadowTagCheckInfo {
@@ -200,6 +201,8 @@ private:
 #endif
 
   void InstrumentGEP(GetElementPtrInst *GEPI);
+  void InstrumentGEP2(GetElementPtrInst *GEPI);
+  void InstrumentGEP_NO_L(GetElementPtrInst *GEPI); /** for later */
   void InstrumentBOP(BinaryOperator *BOP);
   void processOperand(Instruction *BOP, Value *OP1,
                       int idx); // untag operands of BOPs
@@ -293,7 +296,7 @@ private:
   unsigned retagMask(unsigned AllocaNo);
   void instrumentGlobal(GlobalVariable *GV);
 
-  void instrumentGlobals();
+  
 
   Value *getCachedFP(IRBuilder<> &IRB);
   Value *getFrameRecordInfo(IRBuilder<> &IRB);
@@ -377,6 +380,7 @@ private:
 
   unsigned TBits;
   unsigned LBits;
+  unsigned L_MAX;
 
   uint64_t TagMaskByte;
 
