@@ -2513,9 +2513,9 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
       if (CI->getMetadata("heapallocsite") && isa<ExplicitCastExpr>(CE) &&
           !isa<CastExpr>(E)) {
         // the "heapallocsite" is a NON std annotation -> TODO: can I use this?
-        llvm::errs() << "HEAPALLOC: ";
-        CE->dump();
-        llvm::errs() << "\n";
+        // llvm::errs() << "HEAPALLOC: ";
+        // CE->dump();
+        // llvm::errs() << "\n";
         QualType PointeeType = DestTy->getPointeeType();
         if (!PointeeType.isNull())
           CGF.getDebugInfo()->addHeapAllocSiteMetadata(CI, PointeeType,
@@ -5134,19 +5134,27 @@ Value *ScalarExprEmitter::VisitBinAssign(const BinaryOperator *E) {
       if (FSAN::isAllocCall(Call)) {
         auto type = E->getLHS()->getType();
         if (!CGF.PendingTypeIsValid) {
-          // llvm::errs() << "[DBG] VisitBinAssign: Setting pending alloc type: "
-          //              << type.getAsString() << "\n";
-          CGF.FSanPendingAllocType = type;
-          CGF.PendingTypeIsValid = true;
+          llvm::errs() << "[DBG] VisitBinAssign: Setting pending alloc type: "
+                       << type.getAsString() << "\n";
+          if (type->isPointerType()) {
+            type = type->getPointeeType();
+          }
+
+          if (type->isStructureOrClassType()) {
+            CGF.FSanPendingAllocType = type;
+            CGF.PendingTypeIsValid = true;
+          }
         }
       }
     }
-    // // TODO: this does not capture the complexity of sub expr, recursive visit
+    // // TODO: this does not capture the complexity of sub expr, recursive
+    // visit
     // // is needed TOOD: resolve declref and other macros
 
     // if (const auto *Cast = dyn_cast<CastExpr>(RHS)) {
     //   if (const auto *Call =
-    //           dyn_cast<CallExpr>(Cast->getSubExpr()->IgnoreParenImpCasts())) {
+    //           dyn_cast<CallExpr>(Cast->getSubExpr()->IgnoreParenImpCasts()))
+    //           {
     //     if (FSAN::isAllocCall(Call)) {
     //       auto type = E->getLHS()->getType();
     //       if (!CGF.PendingTypeIsValid) {
@@ -5158,13 +5166,15 @@ Value *ScalarExprEmitter::VisitBinAssign(const BinaryOperator *E) {
     //     }
     //   }
     // }
-    // // TODO: debug 
-    // std::function<void(const Expr *)> recursiveVisit = [&](const Expr *expr) {
+    // // TODO: debug
+    // std::function<void(const Expr *)> recursiveVisit = [&](const Expr *expr)
+    // {
     //   if (const auto *Call = dyn_cast<CallExpr>(expr)) {
     //     if (FSAN::isAllocCall(Call)) {
     //       auto type = E->getLHS()->getType();
     //       if (!CGF.PendingTypeIsValid) {
-    //         llvm::errs() << "[DBG] VisitBinAssign: RECURSIVE VISIT ALLOC CASE: "
+    //         llvm::errs() << "[DBG] VisitBinAssign: RECURSIVE VISIT ALLOC
+    //         CASE: "
     //                      << type.getAsString() << "\n";
     //         CGF.FSanPendingAllocType = type;
     //         CGF.PendingTypeIsValid = true;

@@ -20,6 +20,10 @@ static cl::opt<bool> clFSAN_SKIP_ANON_STRUCTS(
              "name starts with struct.anon or class.anon)"),
     cl::Hidden, cl::init(false));
 
+static cl::opt<bool> clFSAN_DEPTH_AWARE_TAGGING(
+    "fsan-depth-aware-tagging",
+    cl::desc("Enable depth-aware tagging for nested structures"),
+    cl::Hidden, cl::init(false));
 namespace RuntimeTaggingSupport {
 #if defined(__x86_64__)
 uint64_t TBits = 3;
@@ -149,7 +153,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
 
   uint8_t fatherT = 0;                 /* unused */
   int fatherL = (depth & (L_MAX - 1)); // modulo L_MAX --> level-aware
-  uint32_t sonIdx = 1;
+  uint64_t sonIdx = 1;
   // NOTE: 2^^16 max number of fields
   if (FieldsOffsets.size() >= (1 << 16) - 1) {
     /** Too many fields :( */
@@ -171,7 +175,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
     Type *CurFieldType = std::get<0>(Tuple);
     fatherT = std::get<1>(Tuple);
     fatherL = std::get<2>(Tuple);
-    sonIdx = (uint32_t)std::get<3>(Tuple);
+    sonIdx = std::get<3>(Tuple);
     size_t CurFieldOffset = std::get<4>(Tuple);
 
     auto *CurFieldStructType = dyn_cast<StructType>(CurFieldType);
@@ -292,7 +296,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         // NOTE: this case catches arrays with depth > MAX_DEPTH as well
         uint64_t IdxModuloT_MAX = sonIdx % T_MAX;
         uint64_t IdxDivT_MAX = sonIdx / T_MAX;
-        auto T = (IdxModuloT_MAX + IdxDivT_MAX);
+        uint64_t T = (IdxModuloT_MAX + IdxDivT_MAX);
         T = T % T_MAX;
         if (T == 0) {
           T = 1;
@@ -351,10 +355,11 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         uint64_t IdxModuloT_MAX = sonIdx % T_MAX;
         uint64_t IdxDivT_MAX = sonIdx / T_MAX;
         auto T = (IdxModuloT_MAX + IdxDivT_MAX);
-        if (T == T_MAX) {
+        T = T % T_MAX;
+        if (T == 0) {
           T = 1;
         }
-        uint8_t Tag = T % T_MAX;
+        uint8_t Tag = T;
 
         uint8_t CurFieldTag = Tag | (fatherL << TBits);
         int CurFieldSize = DL.getTypeAllocSize(CurFieldType);

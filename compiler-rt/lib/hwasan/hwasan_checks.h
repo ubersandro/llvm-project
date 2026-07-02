@@ -167,8 +167,8 @@ PossiblyShortTagMatches(tag_t mem_tag, uptr ptr, uptr sz) {
 #define getR(tag) ((tag & R_MASK) >> (T_BITS + L_BITS))
 
 // This mask preserves the bits on which we do checks
-#define CHECK_TAG_MASK ((1ULL << (T_BITS + L_BITS)) - 1)
-// #define CHECK_TAG_MASK ((1ULL << (T_BITS)) - 1)
+// #define CHECK_TAG_MASK ((1ULL << (T_BITS + L_BITS)) - 1)
+#define CHECK_TAG_MASK ((1ULL << (T_BITS)) - 1)
 
 // TODO: double check on overflows on tagging bytes -> shadow byte == 0xff means
 // padding
@@ -198,8 +198,9 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   }  // ptr tag is 0
 
   uptr baseShadow = MemToShadow((uptr)untagged_ptr);
-  uint8_t mem_tag = *(uint8_t*)baseShadow;
-  bool memIsNull = mem_tag == 0UL;
+  uint8_t mem_tag = *((uint8_t*)baseShadow);
+  // bool memIsNull = (mem_tag & CHECK_TAG_MASK) == 0;
+  bool memIsNull = (mem_tag) == 0; // TODO: change back
   // NOTE: do check on first byte, catch the smallest read possible
 
   if (UNLIKELY(memIsNull)) {
@@ -304,7 +305,9 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   uint8_t tag = GetTagFromPointer(p);
   uptr untagged_ptr = UntagAddr(p);
   uptr shadow_addr = MemToShadow(untagged_ptr);
-  uint8_t ShadowTag = (*(uint8_t*)shadow_addr);  // TODO: analyze FN cases
+  // uint8_t ShadowTag = (*(uint8_t*)shadow_addr) & CHECK_TAG_MASK;  // TODO: analyze FN cases
+  uint8_t ShadowTag =
+      (*(uint8_t*)shadow_addr);  // TODO: change backk
 
   // DEBUG
   if (UNLIKELY(ShadowTag == 0)) {
@@ -327,15 +330,15 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
     return;
   }
 
-  bool isRP = getR(tag);
-  if (isRP) {
+  // bool isRP = getR(tag);
+  // if (isRP) {
     // TODO: use this to debug loops at O2
     // TODO: do we want to keep this kind of check? Or do we delegate this check
     // to type sanitizers? It's FP-prone on C++
-    VPrintf(2, "[CheckAddress] R PTR %p, SZ %d\n", (void*)p, 1 << LogSize);
-    return;
-  }
-  VPrintf(2, "[CheckAddress] NON-RP PTR %p, SZ %d\n", (void*)p, 1 << LogSize);
+    // VPrintf(2, "[CheckAddress] R PTR %p, SZ %d\n", (void*)p, 1 << LogSize);
+  //   return;
+  // }
+  // VPrintf(2, "[CheckAddress] NON-RP PTR %p, SZ %d\n", (void*)p, 1 << LogSize);
 
   auto ptr_L = getL(tag);
   auto mem_L = getL(ShadowTag);
@@ -360,7 +363,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
     case 0: /*byte*/
       ShadowTagByte = *(uint8_t*)shadow_addr & MaskTagByte;
       TagByte = TagByte & MaskTagByte;
-      if (UNLIKELY(TagByte && ShadowTagByte && TagByte != ShadowTagByte ||
+      if (UNLIKELY(/*TagByte && ShadowTagByte && */ TagByte != ShadowTagByte ||
                    (/*TagByte && ShadowTagByte &&*/
                     (*(uint8_t*)shadow_addr == PADDING_BYTE)))) {
         VPrintf(
@@ -377,7 +380,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
       TagShort = TagShort & MaskTagShort;
       ShadowTagShort = *(uint16_t*)shadow_addr;
       ShadowTagShort = ShadowTagShort & MaskTagShort;
-      if (UNLIKELY(TagShort && ShadowTagShort && (TagShort != ShadowTagShort) ||
+      if (UNLIKELY(/*TagShort && ShadowTagShort && */(TagShort != ShadowTagShort) ||
                    (/*TagShort && ShadowTagShort &&*/
                     (((*(uint16_t*)shadow_addr >> 8)) == PADDING_BYTE)))) {
         VPrintf(0,
@@ -394,7 +397,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
       TagInt = TagInt & MaskTagInt;
       ShadowTagInt = *(uint32_t*)shadow_addr;
       ShadowTagInt = ShadowTagInt & MaskTagInt;
-      if (UNLIKELY(TagInt && ShadowTagInt && (TagInt != ShadowTagInt) ||
+      if (UNLIKELY(/*TagInt && ShadowTagInt && */(TagInt != ShadowTagInt) ||
                    (/*TagInt && ShadowTagInt &&*/
                     (((*(uint32_t*)shadow_addr >> 24)) == PADDING_BYTE)))) {
         VPrintf(0,
@@ -415,7 +418,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
       TagLong = TagLong & MaskTagLong;
       ShadowTagLong = *(uint64_t*)shadow_addr;
       ShadowTagLong = ShadowTagLong & MaskTagLong;
-      if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong) ||
+      if (UNLIKELY(/*TagLong && ShadowTagLong && */(TagLong != ShadowTagLong) ||
                    (/*TagLong && ShadowTagLong &&*/
                     (((*(uint64_t*)shadow_addr >> 56)) == PADDING_BYTE)))) {
         VPrintf(0,
@@ -435,7 +438,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
       ShadowTagLong = *(uint64_t*)shadow_addr;
       TagLong = TagLong & MaskTagLong;
       ShadowTagLong = ShadowTagLong & MaskTagLong;
-      if (UNLIKELY(TagLong && ShadowTagLong && (TagLong != ShadowTagLong) ||
+      if (UNLIKELY(/*TagLong && ShadowTagLong && */(TagLong != ShadowTagLong) ||
                    (/*TagLong && ShadowTagLong &&*/
                     (((*(uint64_t*)shadow_addr >> 56)) == PADDING_BYTE)))) {
         VPrintf(0,
@@ -451,7 +454,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
         ShadowTagLong = *(uint64_t*)(shadow_addr + 8);
         ShadowTagLong = ShadowTagLong & MaskTagLong;
         if (UNLIKELY(
-                TagLong && ShadowTagLong && (TagLong != ShadowTagLong) ||
+                /*TagLong && ShadowTagLong &&*/ (TagLong != ShadowTagLong) ||
                 (/*TagLong && ShadowTagLong &&*/
                  (((*(uint64_t*)(shadow_addr + 8) >> 56)) == PADDING_BYTE)))) {
           VPrintf(0,

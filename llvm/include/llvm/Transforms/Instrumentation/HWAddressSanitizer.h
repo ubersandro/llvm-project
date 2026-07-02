@@ -76,10 +76,9 @@ class Module;
 class StringRef;
 class raw_ostream;
 #if defined(__x86_64__)
-#define T_MAX (1ULL << 3) // x86 has 6 bits for tagging
+#define T_MAX_CONST (1ULL << 3);
 #elif defined(__aarch64__)
-#define T_MAX (1ULL << 5)
-// NOTE: we use some of the bits for tagging, the others for levels
+#define T_MAX_CONST (1ULL << 5);
 #endif
 
 struct HWAddressSanitizerOptions {
@@ -200,9 +199,9 @@ private:
   u_int64_t RPTag = 0x1UL << 5;
 #endif
 
-  void InstrumentGEP(GetElementPtrInst *GEPI);
-  void InstrumentGEP2(GetElementPtrInst *GEPI);
-  void InstrumentGEP_NO_L(GetElementPtrInst *GEPI); /** for later */
+  void InstrumentGEP_L(GetElementPtrInst *GEPI);
+  void InstrumentGEP_NoL(GetElementPtrInst *GEPI); /** for later */
+  bool performChecksOnGEP(GetElementPtrInst *GEPI);
   void InstrumentBOP(BinaryOperator *BOP);
   void processOperand(Instruction *BOP, Value *OP1,
                       int idx); // untag operands of BOPs
@@ -295,8 +294,6 @@ private:
   Value *applyTagMask(IRBuilder<> &IRB, Value *OldTag);
   unsigned retagMask(unsigned AllocaNo);
   void instrumentGlobal(GlobalVariable *GV);
-
-  
 
   Value *getCachedFP(IRBuilder<> &IRB);
   Value *getFrameRecordInfo(IRBuilder<> &IRB);

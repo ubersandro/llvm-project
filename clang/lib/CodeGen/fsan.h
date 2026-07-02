@@ -3,21 +3,22 @@
 #define FSAN_H
 #include "clang/AST/ParentMapContext.h"
 #include "clang/Basic/SourceManager.h"
-#include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/InstrTypes.h"
 
 namespace FSAN {
 
 // NOTE: no new operator, that's a different story
-inline std::set<std::string> allocFunctions = {"malloc", "realloc", "calloc",
-                                               "reallocarray", "std::malloc", "std::realloc", "std::calloc",
-                                               "std::reallocarray"};
+inline std::set<std::string> allocFunctions = {
+    "malloc",      "realloc",      "calloc",      "reallocarray",
+    "std::malloc", "std::realloc", "std::calloc", "std::reallocarray"};
 // TODO: handle more!
-// "memalign",
-// "aligned_alloc", "posix_memalign", "valloc", "pvalloc"};
+// "memalign","aligned_alloc", "posix_memalign", "valloc", "pvalloc"};
 inline std::set<std::string> fullsetOfAllocFunctions = {
-    "malloc",        "realloc",        "calloc", "reallocarray", "memalign",
-    "aligned_alloc", "posix_memalign", "valloc", "pvalloc", "std::malloc", "std::realloc", "std::calloc", "std::reallocarray"};
+    "malloc",           "realloc",       "calloc",         "reallocarray",
+    "memalign",         "aligned_alloc", "posix_memalign", "valloc",
+    "pvalloc",          "std::malloc",   "std::realloc",   "std::calloc",
+    "std::reallocarray"};
 
 inline bool isAllocCall(const clang::CallExpr *Call) {
   if (!Call)
@@ -33,7 +34,7 @@ inline bool isAllocCall(const clang::CallExpr *Call) {
       return false;
     auto FullyQualifiedName = FD->getQualifiedNameAsString();
     return /*allocFunctions.count(II->getName().str()) > 0 ||*/
-           fullsetOfAllocFunctions.count(FullyQualifiedName) > 0;
+        fullsetOfAllocFunctions.count(FullyQualifiedName) > 0;
   };
 
   // Case 1: direct call
@@ -81,8 +82,13 @@ inline bool isAllocFD(const clang::FunctionDecl *FD) {
     if (!II)
       return false;
     auto FullyQualifiedName = FD->getQualifiedNameAsString();
+    if (allocFunctions.count(FullyQualifiedName) == 0 &&
+        fullsetOfAllocFunctions.count(FullyQualifiedName) > 0) {
+      llvm::errs() << "[FSAN-FE] DBG: UNHANDLED alloc function call: "
+                   << FullyQualifiedName << "\n";
+    }
     return /*allocFunctions.count(II->getName().str()) > 0 ||*/
-           allocFunctions.count(FullyQualifiedName) > 0;
+        allocFunctions.count(FullyQualifiedName) > 0; // TODO: limited
   };
 
   bool ret = matchesAllocFn(FD);
@@ -115,7 +121,8 @@ GetArraySizeFromAlloc(const clang::Expr *E,
   auto *CallExpr = llvm::dyn_cast<clang::CallExpr>(E);
   const auto *const FunctionDecl = CallExpr->getDirectCallee();
   auto AllocFnName = FunctionDecl->getIdentifier()->getName().str();
-  llvm::Value *RET = llvm::ConstantInt::get(llvm::Type::getInt64Ty(CGF.getLLVMContext()), -1);
+  llvm::Value *RET =
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(CGF.getLLVMContext()), -1);
 
   if (AllocFnName == "malloc" || AllocFnName == "valloc" ||
       AllocFnName == "pvalloc") {
@@ -131,13 +138,14 @@ GetArraySizeFromAlloc(const clang::Expr *E,
       //   llvm::errs() << "\tSRC: " << SM.getFilename(Loc) << ":"
       //                << SM.getSpellingLineNumber(Loc) << "\n";
       // }
-      clang::Expr* SizeofExpr;
+      clang::Expr *SizeofExpr;
       auto OpCode = BinOp->getOpcode();
       switch (OpCode) {
       case clang::BO_Add:
         // llvm::errs() << "[FSAN-FE] DBG ADD OP:\n";
         // BinOp->dump();
-        RET = llvm::ConstantInt::get(llvm::Type::getInt64Ty(CGF.getLLVMContext()), 1);
+        RET = llvm::ConstantInt::get(
+            llvm::Type::getInt64Ty(CGF.getLLVMContext()), 1);
         break;
 
       case clang::BO_Mul:
@@ -159,21 +167,21 @@ GetArraySizeFromAlloc(const clang::Expr *E,
           }
         }
 
-        
         break;
 
       default:
         llvm::errs() << "[FSAN-FE] UNHANDLE OP " << OpCode << "\n";
         BinOp->dump();
-        // NOTE: you can have divisions that cause this assert to fail because software is written col culo
-        // assert(false && "Unhandled binary operator in malloc size expression");
+        // NOTE: you can have divisions that cause this assert to fail because
+        // software is written col culo assert(false && "Unhandled binary
+        // operator in malloc size expression");
       }
     }
   } // malloc, valloc, pvalloc
   // TODO: calloc
   // TODO: realloc, reallocarray?
 
-  return RET; 
+  return RET;
 }
 
 inline __attribute__((weak)) void
@@ -213,8 +221,8 @@ TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
             llvm::StringRef IRPointeeTyName(IRTyNameStr);
             llvm::Value *NewTypeStr =
                 CGF.Builder.CreateGlobalString(IRPointeeTyName);
-            llvm::errs() << "[FSAN-FE] Replacing placeholder type string with: " << IRPointeeTyName
-                         << "\n";
+            llvm::errs() << "[FSAN-FE] Replacing placeholder type string with: "
+                         << IRPointeeTyName << "\n";
             CI->setArgOperand(typeStrArgIdx, NewTypeStr);
           }
         }

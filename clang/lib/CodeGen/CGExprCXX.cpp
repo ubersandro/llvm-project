@@ -219,7 +219,7 @@ RValue CodeGenFunction::EmitCXXMemberCallExpr(const CXXMemberCallExpr *CE,
                                                HasQualifier, Qualifier, IsArrow,
                                                Base, CallOrInvoke);
 }
-
+// TODO
 RValue CodeGenFunction::EmitCXXMemberOrOperatorMemberCallExpr(
     const CallExpr *CE, const CXXMethodDecl *MD, ReturnValueSlot ReturnValue,
     bool HasQualifier, NestedNameSpecifier *Qualifier, bool IsArrow,
@@ -1338,8 +1338,6 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
   llvm::CallBase *CallOrInvoke;
   llvm::Constant *CalleePtr = CGF.CGM.GetAddrOfFunction(CalleeDecl);
   CGCallee Callee = CGCallee::forDirect(CalleePtr, GlobalDecl(CalleeDecl));
-  // NOTE: a call is emitted also for placement new!
-  // FSAN
   auto calleeName = CalleeDecl->getQualifiedNameAsString();
   bool isEnabled =
       CGF.SanOpts.has(SanitizerKind::FSanitizer) &&
@@ -1352,25 +1350,14 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
       Args.add(RValue::get(typeNamePtr), ctx.getPointerType(ctx.CharTy));
     } // !typeName.empty()
     else {
-      // placement new case???? NOT QUITE
-      // llvm::errs() << "[DBG-FE] WHAT IS THIS?" << "\n";
-      // llvm::errs() << "[DBG-FE] CALLEE NAME: " << calleeName << "\n";
-      // llvm::errs() << "[DBG-FE] CALLEE DECL: " << *CalleeDecl << "\n";
-      // CAUSE A FUCKING CRASH
-      // llvm::Value * ptr = nullptr;
-      // llvm::Value *crash = llvm::UndefValue::get(ptr->getType());
-
       llvm::Value *typeNamePtr =
           CGF.Builder.CreateGlobalString("PLACEMENT", "PLACEMENT_TYPE");
       Args.add(RValue::get(typeNamePtr), ctx.getPointerType(ctx.CharTy));
     }
     if (cookie) {
-      // llvm::errs() << "[DBG-FE] ADDING A COOKIE MARKER TO THE NEW CALL" <<
-      // "\n";
       llvm::Value *cookieStr = CGF.Builder.CreateGlobalString(
           "PINO_PALETTA", "PINO_PALETTA"); // TODO: move this out of here
       Args.add(RValue::get(cookieStr), ctx.getPointerType(ctx.CharTy));
-      // set name for cookieR to "pinobiscotto"
     }
   } // if callee is new
   // FSAN
@@ -1403,10 +1390,6 @@ RValue CodeGenFunction::EmitBuiltinNewDeleteCall(const FunctionProtoType *Type,
   DeclarationName Name =
       Ctx.DeclarationNames.getCXXOperatorName(IsDelete ? OO_Delete : OO_New);
 
-  // llvm::errs() << "[DBG-FE] EmitBuiltinNewDeleteCall: NAME "
-  //              << Name.getAsString()
-  //              << (IsDelete ? " operator delete " : " operator new ") << "\n
-  //              ";
   for (auto *Decl : Ctx.getTranslationUnitDecl()->lookup(Name))
     if (auto *FD = dyn_cast<FunctionDecl>(Decl))
       if (Ctx.hasSameType(FD->getType(), QualType(Type, 0)))
