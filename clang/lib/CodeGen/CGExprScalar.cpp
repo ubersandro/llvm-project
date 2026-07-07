@@ -2415,6 +2415,7 @@ static Value *EmitHLSLElementwiseCast(CodeGenFunction &CGF, Address RHSVal,
 // have to handle a more broad range of conversions than explicit casts, as they
 // handle things like function to ptr-to-function decay etc.
 Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
+  bool CompilingWithHWAsan = CGF.getLangOpts().Sanitize.has(SanitizerKind::HWAddress);
   Expr *E = CE->getSubExpr();
   QualType DestTy = CE->getType();
   CastKind Kind = CE->getCastKind();
@@ -2457,8 +2458,8 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
     Value *Src = Visit(E);
     llvm::Type *SrcTy = Src->getType();
     llvm::Type *DstTy = ConvertType(DestTy);
-    FSAN::TagFromBitcast(Src, DestTy,
-                         CGF); // SECOND STEP-> this is often parsed after call
+    if(CompilingWithHWAsan)
+      FSAN::TagFromBitcast(Src, DestTy, CGF);
     // FIXME: this is a gross but seemingly necessary workaround for an issue
     // manifesting when a target uses a non-default AS for indirect sret args,
     // but the source HLL is generic, wherein a valid C-cast or reinterpret_cast
@@ -5127,11 +5128,9 @@ llvm::Value *CodeGenFunction::EmitWithOriginalRHSBitfieldAssignment(
 Value *ScalarExprEmitter::VisitBinAssign(const BinaryOperator *E) {
   if (E->getOpcode() == BO_Assign) {
     const Expr *RHS = E->getRHS()->IgnoreParenImpCasts();
-    // llvm::errs() << "[DBG] VisitBinAssign: Visiting assignment, RHS:\n";
-    // RHS->dump();
-
     if (const auto *Call = dyn_cast<CallExpr>(RHS)) {
-      if (FSAN::isAllocCall(Call)) {
+      bool CompilingWithHWAsan = CGF.getLangOpts().Sanitize.has(SanitizerKind::HWAddress);
+      if (FSAN::isAllocCall(Call) && CompilingWithHWAsan) {
         auto type = E->getLHS()->getType();
         if (!CGF.PendingTypeIsValid) {
           llvm::errs() << "[DBG] VisitBinAssign: Setting pending alloc type: "

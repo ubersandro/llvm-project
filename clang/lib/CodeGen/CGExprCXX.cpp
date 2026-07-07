@@ -1705,7 +1705,8 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     QualType allocType = E->getAllocatedType();
     llvm::Type *TypeForMem = ConvertTypeForMem(allocType);
     // llvm::errs() << "\n\t[DBG-FE] TYPE: " << *TypeForMem << "\n";
-    if (TypeForMem->isStructTy() && isEnabled) {
+    if( isEnabled){
+      if (TypeForMem->isStructTy()) {
       // llvm::errs() << "[DBG-FE] PLACEMENT NEW: ";
       // E->dump();
       // llvm::errs() << "\n\t[DBG-FE] SRC LOC: ";
@@ -1774,6 +1775,9 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     //              << E->getExprLoc().printToString(
     //                     getContext().getSourceManager())
     //              << "\n";
+    }
+    
+    
 
     // The pointer expression will, in many cases, be an opaque void*.
     // In these cases, discard the computed alignment and use the

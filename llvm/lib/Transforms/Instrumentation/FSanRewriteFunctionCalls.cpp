@@ -720,6 +720,7 @@ void FSanRewriteFunctionCallsPass::debugBOP(BinaryOperator *binOp, Module &M) {
 
 PreservedAnalyses
 FSanRewriteFunctionCallsPass::run(Module &M, ModuleAnalysisManager &MAM) {
+  return PreservedAnalyses::all(); // BASTA PORCODIO
   bool changed = false;
   // if (!ClInstrumentHeap)
   //   return PreservedAnalyses::all();
