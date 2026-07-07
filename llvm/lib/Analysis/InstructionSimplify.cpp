@@ -4414,8 +4414,10 @@ static Value *simplifyWithOpsReplaced(Value *V,
     if (isa<GetElementPtrInst>(I)) {
       // getelementptr x, 0 -> x.
       // This never returns poison, even if inbounds is set.
-      // if (NewOps.size() == 2 && match(NewOps[1], m_Zero()))
-      //   return NewOps[0];
+      if (I->getFunction() && I->getFunction()->hasFnAttribute(Attribute::SanitizeHWAddress))
+        return nullptr;
+      if (NewOps.size() == 2 && match(NewOps[1], m_Zero()))
+        return NewOps[0];
     }
   } else {
     // The simplification queries below may return the original value. Consider:
@@ -7190,8 +7192,11 @@ static Value *simplifyInstructionWithOperands(Instruction *I,
   case Instruction::Select:
     return simplifySelectInst(NewOps[0], NewOps[1], NewOps[2], Q, MaxRecurse);
   case Instruction::GetElementPtr: {
-    return nullptr;
+
     auto *GEPI = cast<GetElementPtrInst>(I);
+    if (GEPI->getFunction() &&
+        GEPI->getFunction()->hasFnAttribute(Attribute::SanitizeHWAddress))
+      return nullptr;
     return simplifyGEPInst(GEPI->getSourceElementType(), NewOps[0],
                            ArrayRef(NewOps).slice(1), GEPI->getNoWrapFlags(), Q,
                            MaxRecurse);

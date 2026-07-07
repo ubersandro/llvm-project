@@ -1361,6 +1361,10 @@ PreservedAnalyses AggressiveInstCombinePass::run(Function &F,
   auto &TTI = AM.getResult<TargetIRAnalysis>(F);
   auto &AA = AM.getResult<AAManager>(F);
   bool MadeCFGChange = false;
+  bool BuildingWithFSAN = F.hasFnAttribute(Attribute::SanitizeHWAddress);
+  if(BuildingWithFSAN) {
+    return PreservedAnalyses::all();
+  }
   if (!runImpl(F, AC, TTI, TLI, DT, AA, MadeCFGChange)) {
     // No changes, all analyses are preserved.
     return PreservedAnalyses::all();

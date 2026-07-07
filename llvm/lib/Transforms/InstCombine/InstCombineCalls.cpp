@@ -114,7 +114,13 @@ static bool hasUndefSource(AnyMemTransferInst *MI) {
 }
 
 Instruction *InstCombinerImpl::SimplifyAnyMemTransfer(AnyMemTransferInst *MI) {
-  return nullptr;
+  /** 
+   * Keep the mem* since the FSAN pass detects compiler-inserted ones and ignores them. 
+   * Potentially, lower AFTER the FSAN pass. TODO.
+   */
+  auto *F = MI->getFunction();
+  if(F && F->hasFnAttribute(Attribute::SanitizeHWAddress))
+    return nullptr; // FSAN
   Align DstAlign = getKnownAlignment(MI->getRawDest(), DL, MI, &AC, &DT);
   MaybeAlign CopyDstAlign = MI->getDestAlign();
   if (!CopyDstAlign || *CopyDstAlign < DstAlign) {

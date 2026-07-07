@@ -145,6 +145,10 @@ static cl::opt<unsigned>
 MaxArraySize("instcombine-maxarray-size", cl::init(1024),
              cl::desc("Maximum array size considered when doing a combine"));
 
+static cl::opt<bool> clFSAN_EnableInstructionCombining(
+    "instcombine-fsan", cl::init(false),
+    cl::desc("Enable IC with FSAN"));
+
 // FIXME: Remove this flag when it is no longer necessary to convert
 // llvm.dbg.declare to avoid inaccurate debug info. Setting this to false
 // increases variable availability at the cost of accuracy. Variables that
@@ -3078,7 +3082,9 @@ static Instruction *foldGEPOfPhi(GetElementPtrInst &GEP, PHINode *PN,
 }
 
 Instruction *InstCombinerImpl::visitGetElementPtrInst(GetElementPtrInst &GEP) {
-  return nullptr;
+  auto Function = GEP.getFunction();
+  if (Function && Function->hasFnAttribute(Attribute::SanitizeHWAddress))
+    return nullptr; // FSAN
   Value *PtrOp = GEP.getOperand(0);
   SmallVector<Value *, 8> Indices(GEP.indices());
   Type *GEPType = GEP.getType();
@@ -5940,8 +5946,10 @@ char InstCombinePass::ID = 0;
 
 PreservedAnalyses InstCombinePass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
-  if (F.hasFnAttribute(Attribute::SanitizeHWAddress))
-    return PreservedAnalyses::all();
+  if (F.hasFnAttribute(Attribute::SanitizeHWAddress) && ! clFSAN_EnableInstructionCombining){
+    return PreservedAnalyses::all(); // FSAN
+  }
+    
   auto &LRT = AM.getResult<LastRunTrackingAnalysis>(F);
   // No changes since last InstCombine pass, exit early.
   if (LRT.shouldSkip(&ID))

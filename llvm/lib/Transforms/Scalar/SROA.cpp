@@ -121,6 +121,8 @@ STATISTIC(NumVectorized, "Number of vectorized aggregates");
 /// Disable running mem2reg during SROA in order to test or debug SROA.
 static cl::opt<bool> SROASkipMem2Reg("sroa-skip-mem2reg", cl::init(false),
                                      cl::Hidden);
+static cl::opt<bool> clFSAN_SROA("enable-sroa", cl::init(true),
+                                     cl::Hidden);
 namespace {
 
 class AllocaSliceRewriter;
@@ -1166,7 +1168,7 @@ private:
                         << "       use: " << SI << "\n");
       return markAsDead(SI);
     }
-
+    // IOO?
     assert((!SI.isSimple() || ValOp->getType()->isSingleValueType()) &&
            "All simple FCA stores should have been pre-split");
     handleLoadOrStore(ValOp->getType(), SI, Offset, Size, SI.isVolatile());
@@ -5813,7 +5815,6 @@ bool SROA::promoteAllocas() {
 
 std::pair<bool /*Changed*/, bool /*CFGChanged*/> SROA::runSROA(Function &F) {
   LLVM_DEBUG(dbgs() << "SROA function: " << F.getName() << "\n");
-
   const DataLayout &DL = F.getDataLayout();
   BasicBlock &EntryBB = F.getEntryBlock();
   for (BasicBlock::iterator I = EntryBB.begin(), E = std::prev(EntryBB.end());
@@ -5872,8 +5873,8 @@ std::pair<bool /*Changed*/, bool /*CFGChanged*/> SROA::runSROA(Function &F) {
 }
 
 PreservedAnalyses SROAPass::run(Function &F, FunctionAnalysisManager &AM) {
-  if(F.hasFnAttribute(Attribute::SanitizeHWAddress))
-    return PreservedAnalyses::all(); // Dont run for now.
+  if(F.hasFnAttribute(Attribute::SanitizeHWAddress) && !clFSAN_SROA)
+    return PreservedAnalyses::all(); // FSAN
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
   AssumptionCache &AC = AM.getResult<AssumptionAnalysis>(F);
   DomTreeUpdater DTU(DT, DomTreeUpdater::UpdateStrategy::Lazy);

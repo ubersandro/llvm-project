@@ -60,6 +60,14 @@ bool SCCPSolver::tryToReplaceWithConstant(Value *V) {
   Constant *Const = getConstantOrNull(V);
   if (!Const)
     return false;
+  if(GEPOperator *GEP = dyn_cast<GEPOperator>(V)) {
+    Function * F = nullptr;
+    if (auto *I = dyn_cast<Instruction>(V)) {
+      F = I->getFunction();
+    }
+    if (F && F->hasFnAttribute(Attribute::SanitizeHWAddress))
+      return false;
+  }
   // Replacing `musttail` instructions with constant breaks `musttail` invariant
   // unless the call itself can be removed.
   // Calls with "clang.arc.attachedcall" implicitly use the return value and

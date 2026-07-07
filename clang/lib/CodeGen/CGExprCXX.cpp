@@ -1343,6 +1343,7 @@ static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
       CGF.SanOpts.has(SanitizerKind::FSanitizer) &&
       CGF.SanOpts.has(SanitizerKind::FSanitizerHeapInstrumentation);
   if (isEnabled && calleeName.find("operator new") != std::string::npos) {
+    // llvm::errs() << "FSAN-FE: operator new call : " << calleeName << "\n";
     auto &ctx = CGF.getContext();
     if (!typeName.empty()) {
       llvm::Value *typeNamePtr =
@@ -1694,12 +1695,16 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     // NOTE: we want to skip placement new, it's CMA and fuck them
     assert(E->getNumPlacementArgs() == 1);
     const Expr *arg = *E->placement_arguments().begin();
-
+    // llvm::errs() << "[DBG-FE] PLACEMENT NEW \n";
+    // E->dump();
+    // dump SRC loc
+    // E->getExprLoc().print(llvm::errs(), getContext().getSourceManager());
+    
     LValueBaseInfo BaseInfo;
     allocation = EmitPointerWithAlignment(arg, &BaseInfo);
     QualType allocType = E->getAllocatedType();
     llvm::Type *TypeForMem = ConvertTypeForMem(allocType);
-
+    // llvm::errs() << "\n\t[DBG-FE] TYPE: " << *TypeForMem << "\n";
     if (TypeForMem->isStructTy() && isEnabled) {
       // llvm::errs() << "[DBG-FE] PLACEMENT NEW: ";
       // E->dump();
@@ -1750,23 +1755,25 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
        */
 
       // Create call -> TODO
-      auto PtrTy = llvm::PointerType::getUnqual(Int8Ty);
-      auto FSANTagMemoryFunc = CGM.getModule().getOrInsertFunction(
-          "fsan_tag_memory",
-          llvm::FunctionType::get(Int64Ty, {PtrTy, PtrTy, Int64Ty, Int64Ty},
-                                  false));
-      llvm::Value *typeSize = llvm::ConstantInt::get(Int64Ty, type);
-      llvm::Value *arraySize = llvm::ConstantInt::get(Int64Ty, ArraySize);
-      llvm::Value *nullPtr = llvm::ConstantPointerNull::get(PtrTy);
-      llvm::Value *allocationPtr = allocation.emitRawPointer(*this);
-      llvm::Value *tagMemoryCall = Builder.CreateCall(
-          FSANTagMemoryFunc, {allocationPtr, nullPtr, typeSize, arraySize});
-      llvm::errs() << "\t[DBG-FE] Emitted call to fsan_tag_memory for "
-                      "placement new, SRC LOC: "
-                   << E->getExprLoc().printToString(
-                          getContext().getSourceManager())
-                   << "\n";
+      // TODO: allocation cookie might MAYBE be there? IDK
+      
     } // if it's a struct and we're instrumenting with HWAsan
+    auto PtrTy = llvm::PointerType::getUnqual(Int8Ty);
+    auto FSANTagMemoryFunc = CGM.getModule().getOrInsertFunction(
+        "fsan_tag_memory",
+        llvm::FunctionType::get(Int64Ty, {PtrTy, PtrTy, Int64Ty, Int64Ty},
+                                false));
+    llvm::Value *typeSize = llvm::ConstantInt::get(Int64Ty, type);
+    llvm::Value *arraySize = llvm::ConstantInt::get(Int64Ty, ArraySize);
+    llvm::Value *nullPtr = llvm::ConstantPointerNull::get(PtrTy);
+    llvm::Value *allocationPtr = allocation.emitRawPointer(*this);
+    llvm::Value *tagMemoryCall = Builder.CreateCall(
+        FSANTagMemoryFunc, {allocationPtr, nullPtr, typeSize, arraySize});
+    // llvm::errs() << "\t[DBG-FE] Emitted call to fsan_tag_memory for "
+    //                 "placement new, SRC LOC: "
+    //              << E->getExprLoc().printToString(
+    //                     getContext().getSourceManager())
+    //              << "\n";
 
     // The pointer expression will, in many cases, be an opaque void*.
     // In these cases, discard the computed alignment and use the

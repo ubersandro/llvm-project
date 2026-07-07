@@ -1135,6 +1135,15 @@ ConstantFoldConstantImpl(const Constant *C, const DataLayout &DL,
 Constant *llvm::ConstantFoldInstruction(const Instruction *I,
                                         const DataLayout &DL,
                                         const TargetLibraryInfo *TLI) {
+  auto * F = I->getFunction();
+  if (F && F->hasFnAttribute(Attribute::SanitizeHWAddress)){
+    if(const GEPOperator* GOP = dyn_cast<GEPOperator>(I)){
+      if(GOP->getSourceElementType()->isAggregateType()){
+        return nullptr;
+      }
+    }
+  }
+
   // Handle PHI nodes quickly here...
   if (auto *PN = dyn_cast<PHINode>(I)) {
     Constant *CommonValue = nullptr;

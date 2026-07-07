@@ -1059,6 +1059,10 @@ Value *InstCombinerImpl::simplifyNonNullOperand(Value *V,
 }
 
 Instruction *InstCombinerImpl::visitLoadInst(LoadInst &LI) {
+  auto *Function = LI.getFunction();
+  bool instrumentingWithFSAN = Function && Function->hasFnAttribute(Attribute::SanitizeHWAddress); 
+  if(instrumentingWithFSAN)
+    return nullptr;
   Value *Op = LI.getOperand(0);
   if (Value *Res = simplifyLoadInst(&LI, Op, SQ.getWithInstruction(&LI)))
     return replaceInstUsesWith(LI, Res);
@@ -1390,6 +1394,10 @@ static bool equivalentAddressValues(Value *A, Value *B) {
 }
 
 Instruction *InstCombinerImpl::visitStoreInst(StoreInst &SI) {
+  auto *Function = SI.getFunction();
+  bool instrumentingWithFSAN = Function && Function->hasFnAttribute(Attribute::SanitizeHWAddress); 
+  if(instrumentingWithFSAN)
+    return nullptr;
   Value *Val = SI.getOperand(0);
   Value *Ptr = SI.getOperand(1);
 

@@ -253,7 +253,8 @@ bool CheckOnCookie(Value *V) {
                "PINO_PALETTA"; // Q: will this work with null term?
       }
     }
-  }
+  } else
+    assert(false && "Expected a constant value for cookie check");
 
   return false;
 }
@@ -385,8 +386,8 @@ bool HWAddressSanitizer::RewriteMallocLikeCall(CallBase *CI) {
                     IRB.CreatePointerCast(TagVector, PtrTy),
                     ConstantInt::get(Int64Ty, tSize), ArraySize});
     NumInstrumentedMallocLikeFuncsCalls++;
-    if(ClFSAN_levels){
-      // TODO: for later 
+    if (ClFSAN_levels) {
+      // TODO: for later
     }
 
     if (ClFSAN_verbose)
@@ -420,24 +421,48 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       errs() << "\t\t[FSAN] TOO FEW ARGS. CALL REWRITTEN? " << *I << ", TODO\n";
       return false;
     }
+    // errs() << "\t\t[FSAN] NEW CALL " << *I << ", TODO\n";
 
+    bool LastArgIsAString = false;
+    auto LastArg = I->getArgOperand(size - 1);
+    if (Constant *name = dyn_cast<Constant>(LastArg)) {
+      if (ConstantInt *CI = dyn_cast<ConstantInt>(name)) {
+        LastArgIsAString = false;
+      } else if (ConstantDataArray *dataArray =
+                     dyn_cast<ConstantDataArray>(name->getOperand(0))) {
+        if (dataArray->isString()) {
+          LastArgIsAString = true;
+        }
+      }
+    }
+
+    if (!LastArgIsAString) {
+      // errs() << "\t\t[FSAN] LAST ARG IS NOT A STRING. CALL REWRITTEN? " << *I
+      // << ", TODO\n";
+      return false;
+    }
+
+    auto Callee =
+        dyn_cast<Function>(I->getCalledOperand()->stripPointerCasts());
+    auto DemangledCalleeName = demangle(Callee->getName().str());
     bool cookieIsThere = CheckOnCookie(I->getArgOperand(size - 1));
     auto lastArg =
         cookieIsThere
             ? I->getArgOperand(I->arg_size() - 2)
             : I->getArgOperand(I->arg_size() - 1); // typeName or COOKIE!!!
 
-    std::string structName = "";
+    std::string typeName = "";
     StructType *allocType = nullptr; // this will be null for unhandled cases
 
     if (Constant *name = dyn_cast<Constant>(lastArg)) {
       if (ConstantDataArray *dataArray =
               dyn_cast<ConstantDataArray>(name->getOperand(0))) {
         if (dataArray->isString()) {
-          StringRef structNameRef = dataArray->getAsString();
-          structName = structNameRef.str().substr(0, structNameRef.size() - 1);
-          allocType =
-              StructType::getTypeByName(Callee->getContext(), structName);
+          StringRef typeNameRef = dataArray->getAsString();
+          typeName = typeNameRef.str().substr(
+              0, typeNameRef.size() -
+                     1); // not nec a struct, I just expect a string
+          allocType = StructType::getTypeByName(Callee->getContext(), typeName);
         } else {
           if (PHINode *phi = dyn_cast<PHINode>(lastArg)) {
             auto *name = phi->getIncomingValue(0);
@@ -445,11 +470,11 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
               if (ConstantDataArray *dataArray =
                       dyn_cast<ConstantDataArray>(nameConst->getOperand(0))) {
                 if (dataArray->isString()) {
-                  StringRef structNameRef = dataArray->getAsString();
-                  std::string structName =
-                      structNameRef.str().substr(0, structNameRef.size() - 1);
-                  allocType = StructType::getTypeByName(Callee->getContext(),
-                                                        structName);
+                  StringRef typeNameRef = dataArray->getAsString();
+                  std::string typeName =
+                      typeNameRef.str().substr(0, typeNameRef.size() - 1);
+                  allocType =
+                      StructType::getTypeByName(Callee->getContext(), typeName);
                 }
               }
             }
@@ -459,17 +484,22 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
         }
       }
     } // if constant last arg
-
+    if (typeName.empty() && allocType == nullptr) {
+      // errs() << "\t\t[FSAN] UNHANDLED NEW CALL " << *I << ", TODO\n";
+      return false;
+    }
     bool needsOffsetForCookie = cookieIsThere;
     CallBase *NewCI =
         RewriteCall(I, nullptr, AllocatorName, &needsOffsetForCookie);
     bool isUnion =
-        (!structName.empty() && structName.find("union") != std::string::npos);
+        (!typeName.empty() && typeName.find("union") != std::string::npos);
 
     if (isUnion) {
       errs() << "\t\t[FSAN-REW] NOT TAGGING UNION " << *I << "\n";
       return true;
     }
+
+    // TODO: if not allocType, dump src location to make sure
 
     if (allocType && allocType->isStructTy() && !allocType->isOpaque() &&
         ClFSAN_tag_heap) {
@@ -493,31 +523,53 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       // while (InsertPt && isa<PHINode>(InsertPt))
       //   InsertPt = InsertPt->getNextNode();
       PHINode *PHI = nullptr;
-      if (PHI = dyn_cast<PHINode>(InsertPt)) {
-        // the PHI node must be instrumented una tantum
-        errs() << "\t\t[FSAN] PHI node detected as insertion point: " << *PHI
-               << "- TODO.\n";
-        return changed; // TODO: this needs proper handling
-        bool AlreadyInstrumented = false;
-        for (User *U : PHI->users()) {
-          if (isa<CallInst>(U) && cast<CallInst>(U)->getCalledFunction() &&
-              cast<CallInst>(U)->getCalledFunction()->hasName() &&
-              cast<CallInst>(U)->getCalledFunction()->getName().str().find(
-                  "fsan_tag_memory") != std::string::npos) {
-            AlreadyInstrumented = true;
-            break;
+      bool isInvoke = false;
+      isInvoke = dyn_cast<InvokeInst>(NewCI) != nullptr;
+      if (isInvoke)
+        if (PHI = dyn_cast<PHINode>(InsertPt)) {
+          auto *InvokeCI = dyn_cast<InvokeInst>(NewCI);
+          /**
+           * PHI corner case: there is an invoke new and then result flows into
+           * a PHI. IDEA: add a basic block after the invoke and then set the
+           * PHI as next block to the newly added one. The new block will be hit
+           * only if no exception is thrown by the invoke.
+           */
+
+          auto *BB_invokeLanding = InvokeCI->getNormalDest();
+          assert(BB_invokeLanding &&
+                 "Expected a single predecessor for the landing block");
+
+          // 1. Create the new block
+          BasicBlock *BB_afterInvoke =
+              BasicBlock::Create(M.getContext(), "after_invoke.fsan",
+                                 InvokeCI->getFunction(), BB_invokeLanding);
+
+          // 2. Add a terminator. A BasicBlock MUST end with a terminator (like
+          // a Branch). This also ensures the block is no longer empty, fixing
+          // your .front() crash.
+          BranchInst *Br = BranchInst::Create(BB_invokeLanding, BB_afterInvoke);
+
+          // 3. Redirect the invoke to the new intermediate block
+          InvokeCI->setNormalDest(BB_afterInvoke);
+
+          // 4. CRITICAL: Update the PHI node(s) in the landing block!
+          // The PHI node is expecting an incoming value from the Invoke's
+          // original parent block. We must tell it that the edge now comes from
+          // `BB_afterInvoke`.
+          BasicBlock *InvokeParentBB = InvokeCI->getParent();
+          // Note: If there are multiple PHIs, you should iterate over them.
+          // replaceIncomingBlockWith safely updates the specific incoming edge.
+          for (PHINode &PHI : BB_invokeLanding->phis()) {
+            int block_idx = PHI.getBasicBlockIndex(InvokeParentBB);
+            PHI.setIncomingBlock(block_idx, BB_afterInvoke);
           }
+
+          // 5. Set your InsertPt to the Branch instruction.
+          // If you are using an IRBuilder, setting the point to `Br` ensures
+          // your new instrumentation is inserted *before* the branch jumps to
+          // the PHI.
+          InsertPt = Br;
         }
-        if (AlreadyInstrumented) {
-          errs() << "\t\t[FSAN] PHI node already instrumented, skipping "
-                    "tagging for new call: "
-                 << *PHI << "\n";
-          return changed;
-        } else {
-          while (InsertPt && isa<PHINode>(InsertPt))
-            InsertPt = InsertPt->getNextNode();
-        }
-      }
       IRBuilder<> IRB(InsertPt);
 
       // TODO: check on array size post FP
@@ -532,10 +584,10 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       assert(TagVector &&
              "Failed to retrieve or create tag vector for struct type");
       Value *whereToTagFrom = NewCI;
-      if (PHI != nullptr) {
-        whereToTagFrom = PHI;
-        // TODO: handle this case creating PHI node
-      }
+      // if (PHI != nullptr) {
+      //   whereToTagFrom = PHI;
+      //   // TODO: handle this case creating PHI node
+      // }
       bool isNewArray = AllocatorName.find("new[]") != std::string::npos;
       Value *Offset = nullptr;
 
@@ -560,7 +612,7 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
       NumInstrumentedNewCalls++;
       if (ClFSAN_verbose)
         errs() << "\t\t[FSAN] new operator tag\n\t" << *NewCI
-               << "\n\ttype: " << structName << "\n\tarray size: " << *ArraySize
+               << "\n\ttype: " << typeName << "\n\tarray size: " << *ArraySize
                << "\n";
       changed = true;
     } // if allocType
@@ -2177,24 +2229,24 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
         // multi-dim array of structs -> check if struct is safe
         StructType *ST = dyn_cast<StructType>(TY);
         if (ST->isLiteral()) {
-          if(ClFSAN_verbose)
+          if (ClFSAN_verbose)
             errs() << "[FSAN] LITERAL ARRAY ALLOCA SKIP " << *AI << "\n";
           continue;
         }
         if (ST->getName().str().find("union.") == 0) {
-          if(ClFSAN_verbose)
+          if (ClFSAN_verbose)
             errs() << "[FSAN] UNION ARRAY ALLOCA SKIP " << *AI << "\n";
           continue;
         }
       } else if (allocatedType->isStructTy()) {
         StructType *ST = dyn_cast<StructType>(allocatedType);
         if (ST->isLiteral()) {
-          if(ClFSAN_verbose)
+          if (ClFSAN_verbose)
             errs() << "[FSAN] LITERAL ALLOCA SKIP " << *AI << "\n";
           continue;
         }
         if (ST->getName().str().find("union.") == 0) {
-          if(ClFSAN_verbose)
+          if (ClFSAN_verbose)
             errs() << "[FSAN] UNION ALLOCA SKIP " << *AI << "\n";
           continue;
         }
@@ -2231,8 +2283,11 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
       AI->replaceUsesWithIf(TaggedAlloca, [AICast, AILong](const Use &U) {
         auto *User = U.getUser();
         return User != AILong && User != AICast &&
-               !isa<LifetimeIntrinsic>(User);
+               !isa<LifetimeIntrinsic>(User); // TODO: fix this when tagging
       });
+      AllocaInst *NewAI = dyn_cast<AllocaInst>(TaggedAlloca);
+      assert(NewAI && "Tagged alloca must be an AllocaInst");
+      AI = NewAI;
     }
 
     tagAlloca(IRB, AI, DL);
@@ -2455,17 +2510,15 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     }
   }
 
-  if (ClFSAN_memAccesses) {
-    DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
-    PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
-    LoopInfo *LI = FAM.getCachedResult<LoopAnalysis>(F);
-    DomTreeUpdater DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy);
-    const DataLayout &DL = F.getDataLayout();
-    if (ClFSAN_memAccesses)
-      for (auto &Operand : OperandsToInstrument)
-        instrumentMemAccess(Operand, DTU, LI, DL);
-    DTU.flush(); // TODO: does this have an interplay with optimizations?
-  }
+  DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
+  PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
+  LoopInfo *LI = FAM.getCachedResult<LoopAnalysis>(F);
+  DomTreeUpdater DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy);
+  const DataLayout &DL = F.getDataLayout();
+  if (ClFSAN_memAccesses)
+    for (auto &Operand : OperandsToInstrument)
+      instrumentMemAccess(Operand, DTU, LI, DL);
+  DTU.flush(); // TODO: does this have an interplay with optimizations?
 
   ShadowBase = nullptr;
 }
@@ -2482,6 +2535,8 @@ bool HWAddressSanitizer::IsTypedNew(CallBase *CB) {
   Value *V = CB->getCalledOperand()->stripPointerCasts();
   Function *Callee = dyn_cast<Function>(V);
   auto demangledName = Callee ? llvm::demangle(Callee->getName().str()) : "";
+  // bool isOperatorNew = demangledName.find("operator new") == 0;
+  // NOTE: the above does not work properly on C++
   bool isOperatorNew = demangledName.find("operator new") != std::string::npos;
   bool AlignmentAware =
       demangledName.find("align_val_t") != std::string::npos && isOperatorNew;
@@ -2509,11 +2564,12 @@ bool HWAddressSanitizer::IsTypedNew(CallBase *CB) {
       return false;
     }
   }
-
-  // return (Callee && demangledName.find("operator new") != std::string::npos
-  // &&
-  //         !AlignmentAware);
-  return (Callee && demangledName.find("operator new") != std::string::npos);
+  bool ret = (Callee && isOperatorNew);
+  // if(ret){
+  //   // 723.llvm_r has weird operator new
+  //   errs() << "\t[FSAN-IR] IsTypedNew: " << demangledName << "\n";
+  // }
+  return ret;
 }
 
 void dumpGEPDebug(GetElementPtrInst *GEPI) {
@@ -2692,12 +2748,6 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
     auto *PTI_LHS = getBasePtrToInt(OP0);
     auto *PTI_RHS = getBasePtrToInt(OP1);
     if (PTI_LHS && PTI_RHS && (BOP->getOpcode() == Instruction::Sub)) {
-      errs() << "[FSAN] BOP CORNER CASE: " << *BOP << "\n";
-      errs() << "\tOP0: " << *OP0 << "\n";
-      errs() << "\tOP1: " << *OP1 << "\n";
-      errs() << "\tPTI_LHS: " << *PTI_LHS << "\n";
-      errs() << "\tPTI_RHS: " << *PTI_RHS << "\n";
-
       // TODO: does this introduce issues? With other related operations?
       IRBuilder IRB(PTI_LHS);
       auto *NewPtrLHS = untagPointerIntrinsic(IRB, PTI_LHS->getOperand(0));
@@ -2783,7 +2833,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
   auto DstType = GEPI->getResultElementType();
   bool DstIsStruct = DstType->isStructTy();
   bool DstIsArrOfStructs = isArrayOfStructs(DstType);
-  
+
   auto PtrOp = GEPI->getPointerOperand();
   auto GEPNAME = GEPI->hasName() ? GEPI->getName().str()
                                  : "gep." + itostr(NumInstrumentedGEPs);
@@ -2801,7 +2851,21 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
   Value *taggedPointer = nullptr;
   uint64_t PTR_MASK = ((1ULL << PointerTagShift) - 1);
 
-  if (SrcIsStruct) {
+  /**
+   * SROA GEPs -> %harqUlInfo.sroa.25.32.m_receptionStatus.i867.sroa_idx =
+   * getelementptr inbounds nuw i8, ptr %m_receptionStatus.i867.fsan.scalar, i64
+   * 4
+   */
+  bool SROA = false;
+  if (GEPNAME.find(".sroa.") != std::string::npos &&
+      GEPNAME.find(".sroa_idx") != std::string::npos) {
+    // errs() << "[FSAN] SROA GEP: " << *GEPI << "\n";
+    taggedPointer = untagPointerIntrinsic(IRB, GEPI);
+    endResultName = GEPNAME + ".fsan.untagged.sroa";
+    SROA = true;
+  }
+
+  if (SrcIsStruct && !SROA) {
     StructType *ST = dyn_cast<StructType>(SrcType);
     assert(ST && "GEP source type is struct but not a StructType?");
     bool tag = true;
@@ -2826,7 +2890,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         T = T % T_MAX_CONST;
         if (T == 0ULL)
           T = 1;
-        
+
         Value *untagged = maskPointerIntrinsic(IRB, GEPI, PTR_MASK);
         Value *untaggedLong = IRB.CreatePtrToInt(untagged, IntptrTy);
         Value *TBits_CONST = ConstantInt::get(IntptrTy, T << (PointerTagShift));
@@ -2857,7 +2921,8 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         if (User == GEPLong) {
           return false;
         }
-        // do not replace in these calls, they are used to remove tag and they might be the call to untag current ptr
+        // do not replace in these calls, they are used to remove tag and they
+        // might be the call to untag current ptr
         if (CallBase *CB = dyn_cast<CallBase>(User)) {
           if (CB->getCalledFunction() && CB->getCalledFunction()->hasName() &&
               CB->getCalledFunction()->getName().find("llvm.ptrmask") !=
@@ -2912,6 +2977,12 @@ bool HWAddressSanitizer::performChecksOnGEP(GetElementPtrInst *GEPI) {
   bool tag = true;
   StructType *GEPST = dyn_cast<StructType>(GEPI->getSourceElementType());
   Value *GEPPtrOp = GEPI->getPointerOperand();
+  auto GEPNAME = GEPI->hasName() ? GEPI->getName().str()
+                                 : "gep." + itostr(NumInstrumentedGEPs);
+  if (GEPNAME.find(".sroa.") != std::string::npos) {
+    // errs() << "[FSAN] SROA GEP: " << *GEPI << "\n";
+    tag = false;
+  }
   if (AllocaInst *AI = dyn_cast<AllocaInst>(GEPPtrOp)) {
     Type *AIType = AI->getAllocatedType();
     if (AIType->isStructTy()) {
@@ -2924,10 +2995,10 @@ bool HWAddressSanitizer::performChecksOnGEP(GetElementPtrInst *GEPI) {
       // (cfr 403.gcc, 462.libquantum, 525.x264_r)
       if (nFieldsAIST != nFieldsGEPST) {
         // H1: very coarse
-        errs() << "[FSAN] Presumably compiler-induced type punning "
-                  "detected\n\t\tAlloca struct type: "
-               << *AllocaST << "\n\t\tGEP struct type: " << *GEPST
-               << "\n\t\tGEP instruction: " << *GEPI << "\n";
+        // errs() << "[FSAN] Presumably compiler-induced type punning "
+        //           "detected\n\t\tAlloca struct type: "
+        //        << *AllocaST << "\n\t\tGEP struct type: " << *GEPST
+        //        << "\n\t\tGEP instruction: " << *GEPI << "\n";
         tag = false;
       } // H1 -> different N of fields
 
@@ -2952,11 +3023,11 @@ bool HWAddressSanitizer::performChecksOnGEP(GetElementPtrInst *GEPI) {
         }
         if (!layoutsMatch) {
           // H2: more precise, still overapproximation but less than H1
-          errs() << "[FSAN] Presumably compiler-induced type punning "
-                    "detected based on struct layout "
-                    "mismatch\n\t\tAlloca struct type: "
-                 << *AllocaST << "\n\t\tGEP struct type: " << *GEPST
-                 << "\n\t\tGEP instruction: " << *GEPI << "\n";
+          // errs() << "[FSAN] Presumably compiler-induced type punning "
+          //           "detected based on struct layout "
+          //           "mismatch\n\t\tAlloca struct type: "
+          //        << *AllocaST << "\n\t\tGEP struct type: " << *GEPST
+          //        << "\n\t\tGEP instruction: " << *GEPI << "\n";
           tag = false;
           auto DebugLoc = GEPI->getDebugLoc();
           if (DebugLoc) {
@@ -2973,7 +3044,8 @@ bool HWAddressSanitizer::performChecksOnGEP(GetElementPtrInst *GEPI) {
   else {
     if (GEPPtrOp->hasName() &&
         GEPPtrOp->getName().find("coerce.") != std::string::npos) {
-      errs() << "[FSAN] HEURISTIC - GEP with coerce in name: " << *GEPI << "\n";
+      // errs() << "[FSAN] HEURISTIC - GEP with coerce in name: " << *GEPI <<
+      // "\n";
       tag = false;
     } // HEUR 2
     tag = false; // BE CONSERVATIVE IN CASE OF ANON STRUCT GEP
@@ -3056,8 +3128,21 @@ void HWAddressSanitizer::InstrumentGEP_L(GetElementPtrInst *GEPI) {
       PRES_T_SUBMASK | PTR_MASK; // remove L, preserve T, remove R
   Value *FatherLevel = nullptr;
 
+  /**
+   * SROA GEPs -> %harqUlInfo.sroa.25.32.m_receptionStatus.i867.sroa_idx =
+   * getelementptr inbounds nuw i8, ptr %m_receptionStatus.i867.fsan.scalar, i64
+   * 4
+   */
+  bool SROA = false;
+  if (GEPI->getSourceElementType()->isIntegerTy(8) &&
+      GEPI->getNumOperands() == 3) {
+    // errs() << "[FSAN] SROA GEP: " << *GEPI << "\n";
+    taggedPointer = untagPointerIntrinsic(IRB, GEPI);
+    endResultName = GEPNAME + ".fsan.untagged.sroa";
+    SROA = true;
+  }
   // CASE 1. GEP from a struct
-  if (SrcIsStruct) {
+  if (SrcIsStruct && !SROA) {
     StructType *ST = dyn_cast<StructType>(SrcType);
     assert(ST && "GEP source type is struct but not a StructType?");
     bool tag = true;
@@ -3123,7 +3208,7 @@ void HWAddressSanitizer::InstrumentGEP_L(GetElementPtrInst *GEPI) {
   } // FATHER IS STRUCT
 
   // CASE 2. GEP to a struct
-  if (DstIsStruct) {
+  if (DstIsStruct && !SROA) {
     if (IsIncDecGEP || IsAddPtrGEP) {
       // when traversing array, no increment or tag change in general
       return;
@@ -3233,7 +3318,7 @@ void HWAddressSanitizer::InstrumentGEP_L(GetElementPtrInst *GEPI) {
   } // CASE 2. GEP to a struct
 
   // CASE 3. GEP from an array
-  if (SrcType->isArrayTy()) {
+  if (SrcType->isArrayTy() && !SROA) {
     if ((DstIsArrOfStructs)) {
       auto DimOfSrcArray = getArrayDimension(SrcType);
       auto DimOfDstArray = getArrayDimension(DstType);
@@ -3489,6 +3574,11 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
 
 /** Only expect structs, arrays of structs, matrices of structs */
 void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
+  auto NAME = GV->hasName() ? GV->getName().str() : "unnamed";
+  if (NAME.find("_kwtuple") != std::string::npos) {
+    errs() << "FUCK PYTHON " << NAME << "\n";
+    return;
+  }
   Constant *Initializer = GV->getInitializer();
   Type *GVType = GV->getValueType();
 
@@ -3679,9 +3769,8 @@ void HWAddressSanitizer::instrumentGlobals() {
       auto ST = dyn_cast<StructType>(GV.getValueType());
       if (ST->hasName() &&
           ST->getStructName().str().find("union.") != std::string::npos) {
-        if(ClFSAN_verbose) {
-          errs() << "[FSAN] SKIP UNION GV: " << GV.getName()
-                 << "\n";
+        if (ClFSAN_verbose) {
+          errs() << "[FSAN] SKIP UNION GV: " << GV.getName() << "\n";
         }
         continue;
       }

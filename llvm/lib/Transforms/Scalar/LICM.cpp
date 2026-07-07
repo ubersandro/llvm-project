@@ -2919,18 +2919,22 @@ static bool hoistArithmetics(Instruction &I, Loop &L,
   }
 
   // Try to hoist GEPs by reassociation.
-  if (hoistGEP(I, L, SafetyInfo, MSSAU, AC, DT)) {
-    ++NumHoisted;
-    ++NumGEPsHoisted;
-    return true;
+  auto *F = I.getFunction();
+  if (!F->hasFnAttribute(Attribute::SanitizeHWAddress)) {
+    if (hoistGEP(I, L, SafetyInfo, MSSAU, AC, DT)) {
+      ++NumHoisted;
+      ++NumGEPsHoisted;
+      return true;
+    }
   }
 
   // Try to hoist add/sub's by reassociation.
-  if (hoistAddSub(I, L, SafetyInfo, MSSAU, AC, DT)) {
-    ++NumHoisted;
-    ++NumAddSubHoisted;
-    return true;
-  }
+  if (!F->hasFnAttribute(Attribute::SanitizeHWAddress))
+    if (hoistAddSub(I, L, SafetyInfo, MSSAU, AC, DT)) {
+      ++NumHoisted;
+      ++NumAddSubHoisted;
+      return true;
+    }
 
   bool IsInt = I.getType()->isIntOrIntVectorTy();
   if (hoistMulAddAssociation(I, L, SafetyInfo, MSSAU, AC, DT)) {

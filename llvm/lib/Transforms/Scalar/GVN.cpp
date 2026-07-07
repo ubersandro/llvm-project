@@ -883,7 +883,8 @@ PreservedAnalyses GVNPass::run(Function &F, FunctionAnalysisManager &AM) {
   // significant! Re-ordering these variables will cause GVN when run alone to
   // be less effective! We should fix memdep and basic-aa to not exhibit this
   // behavior, but until then don't change the order here.
-  return PreservedAnalyses::all(); // FSAN
+  if (F.hasFnAttribute(Attribute::SanitizeHWAddress))
+    return PreservedAnalyses::all(); // FSAN
   auto &AC = AM.getResult<AssumptionAnalysis>(F);
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
   auto &TLI = AM.getResult<TargetLibraryAnalysis>(F);

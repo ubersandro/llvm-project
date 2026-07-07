@@ -192,8 +192,8 @@ static bool isShortenableAtTheEnd(Instruction *I) {
       case Intrinsic::memset_element_unordered_atomic:
         // Do shorten memory intrinsics.
         // FIXME: Add memmove if it's also safe to transform.
-        return true;
-    }
+        return true && !II->getMetadata("fsan.instrument");
+      }
   }
 
   // Don't shorten libcalls calls for now.
@@ -206,7 +206,7 @@ static bool isShortenableAtTheEnd(Instruction *I) {
 static bool isShortenableAtTheBeginning(Instruction *I) {
   // FIXME: Handle only memset for now. Supporting memcpy/memmove should be
   // easily done by offsetting the source address.
-  return isa<AnyMemSetInst>(I);
+  return isa<AnyMemSetInst>(I) && !I->getMetadata("fsan.instrument");
 }
 
 static std::optional<TypeSize> getPointerSize(const Value *V,
@@ -1973,6 +1973,9 @@ struct DSEState {
           continue;
 
         Instruction *DefI = Def->getMemoryInst();
+        if(DefI->getMetadata("fsan.instrument")){
+          continue;
+        }
         auto DefLoc = getLocForWrite(DefI);
         if (!DefLoc || !isRemovable(DefI)) {
           LLVM_DEBUG(dbgs() << "  ... could not get location for write or "
@@ -2243,6 +2246,9 @@ struct DSEState {
     bool Changed = false;
     for (auto OI : IOL) {
       Instruction *DeadI = OI.first;
+      if (DeadI->getMetadata("fsan.instrument")) {
+        continue;
+      }
       MemoryLocation Loc = *getLocForWrite(DeadI);
       assert(isRemovable(DeadI) && "Expect only removable instruction");
 
@@ -2274,6 +2280,9 @@ struct DSEState {
         continue;
 
       Instruction *DefInst = Def->getMemoryInst();
+      if (DefInst->getMetadata("fsan.instrument")) {
+        continue;
+      }
       auto MaybeDefLoc = getLocForWrite(DefInst);
       if (!MaybeDefLoc || !isRemovable(DefInst))
         continue;

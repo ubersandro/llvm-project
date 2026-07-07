@@ -148,7 +148,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
   // NOTE: initialize to padding tag so that padding is already tagged
   memset(Tags, PaddingTag, DL.getTypeAllocSize(Ty));
 
-  std::deque<std::tuple<Type *, uint8_t, uint8_t, uint8_t, size_t>> AggQueue;
+  std::deque<std::tuple<Type *, uint8_t, int, uint64_t, uint64_t>> AggQueue;
   auto FieldsOffsets = DL.getStructLayout(Ty)->getMemberOffsets();
 
   uint8_t fatherT = 0;                 /* unused */
@@ -176,7 +176,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
     fatherT = std::get<1>(Tuple);
     fatherL = std::get<2>(Tuple);
     sonIdx = std::get<3>(Tuple);
-    size_t CurFieldOffset = std::get<4>(Tuple);
+    uint64_t CurFieldOffset = std::get<4>(Tuple);
 
     auto *CurFieldStructType = dyn_cast<StructType>(CurFieldType);
     auto CurFieldIsLiteral =
@@ -227,12 +227,13 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
     }
     if (CurFieldStructType != nullptr && !CurFieldIsLiteral &&
         !CurFieldIsUnion && !CurFieldIsBlockListedStruct) {
-      uint8_t Count = 0;
-      auto ContainedSubTypes = CurFieldType->getNumContainedTypes();
+      
+      int Count = 0;
+      // auto ContainedSubTypes = CurFieldType->getNumContainedTypes();
 
       auto ContainedSubTyOffsets =
-          DL.getStructLayout(cast<StructType>(CurFieldType))
-              ->getMemberOffsets();
+          DL.getStructLayout(CurFieldStructType)->getMemberOffsets();
+        auto ContainedSubTypes = CurFieldStructType->getNumElements();
       size_t CurContainedSubTy = 0;
       // for struct types, we go one level deeper
       auto NextL = (fatherL + 1) & (L_MAX - 1); // modulo L_MAX
@@ -248,8 +249,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
     } // if son struct
 
     else if (CurFieldType->isArrayTy()) {
-      // NOTE: depth 12 is arbitrary
-      const int MaxDepth = 12;
+      const int MaxDepth = 20;
       // TODO: should structs live one level deeper wrt to the enclosing array?
       int ArrayDims = 1;
       auto *CurArrayType = dyn_cast<ArrayType>(CurFieldType);
