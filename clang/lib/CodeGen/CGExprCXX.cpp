@@ -1705,7 +1705,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     QualType allocType = E->getAllocatedType();
     llvm::Type *TypeForMem = ConvertTypeForMem(allocType);
     // llvm::errs() << "\n\t[DBG-FE] TYPE: " << *TypeForMem << "\n";
-    if( isEnabled){
+    if( SanOpts.has(SanitizerKind::FSanitizer)){
       if (TypeForMem->isStructTy()) {
       // llvm::errs() << "[DBG-FE] PLACEMENT NEW: ";
       // E->dump();
@@ -1757,9 +1757,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
 
       // Create call -> TODO
       // TODO: allocation cookie might MAYBE be there? IDK
-      
-    } // if it's a struct and we're instrumenting with HWAsan
-    auto PtrTy = llvm::PointerType::getUnqual(Int8Ty);
+          auto PtrTy = llvm::PointerType::getUnqual(Int8Ty);
     auto FSANTagMemoryFunc = CGM.getModule().getOrInsertFunction(
         "fsan_tag_memory",
         llvm::FunctionType::get(Int64Ty, {PtrTy, PtrTy, Int64Ty, Int64Ty},
@@ -1770,11 +1768,13 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     llvm::Value *allocationPtr = allocation.emitRawPointer(*this);
     llvm::Value *tagMemoryCall = Builder.CreateCall(
         FSANTagMemoryFunc, {allocationPtr, nullPtr, typeSize, arraySize});
-    // llvm::errs() << "\t[DBG-FE] Emitted call to fsan_tag_memory for "
-    //                 "placement new, SRC LOC: "
-    //              << E->getExprLoc().printToString(
-    //                     getContext().getSourceManager())
-    //              << "\n";
+    llvm::errs() << "\t[DBG-FE] Emitted call to fsan_tag_memory for "
+                    "placement new, SRC LOC: "
+                 << E->getExprLoc().printToString(
+                        getContext().getSourceManager())
+                 << "\n";
+    } // if it's a struct and we're instrumenting with HWAsan
+
     }
     
     

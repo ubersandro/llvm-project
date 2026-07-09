@@ -2350,8 +2350,18 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   if (F.hasFnAttribute(Attribute::Naked))
     return;
 
+  bool skipMemAccessInst = false;
   if (!F.hasFnAttribute(Attribute::SanitizeHWAddress)) {
-    return;
+    return; 
+    // TODO: questo puzza di merda
+    // auto FNNAME = F.getName().str();
+    // if(FNNAME.find("llvm.") != std::string::npos || FNNAME.find("__hwasan") != std::string::npos)
+    //   return; 
+    // // else 
+    // skipMemAccessInst = true;
+    // errs() << "[FSAN] Function " << F.getName()
+    //        << " does not have the attribute 'sanitize_hwaddress', skipping "
+    //           "instrumentation of memory accesses.\n";
   }
 
   if (F.empty())
@@ -2517,7 +2527,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   const DataLayout &DL = F.getDataLayout();
   if (ClFSAN_memAccesses)
     for (auto &Operand : OperandsToInstrument)
-      instrumentMemAccess(Operand, DTU, LI, DL);
+      if(!skipMemAccessInst)
+        instrumentMemAccess(Operand, DTU, LI, DL);
   DTU.flush(); // TODO: does this have an interplay with optimizations?
 
   ShadowBase = nullptr;
