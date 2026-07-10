@@ -69,6 +69,11 @@ static cl::opt<bool>
                              cl::init(false));
 
 static cl::opt<bool>
+    ClFSAN_AggressiveTrimmer("fsan-instrument-mem-access-aggressive-trimming",
+                             cl::desc("trim memory accesses aggressively"), cl::Hidden,
+                             cl::init(false));
+
+static cl::opt<bool>
     ClFSAN_heap("fsan-instrument-heap",
                 cl::desc("Rewrite the calls to allocator functions to bring "
                          "them back to the original version"),
@@ -186,6 +191,8 @@ STATISTIC(NumInstrumentedFuncs, " instrumented funcs");
 // for GEPs and alloca, new, global instrumented == tagged
 // for BOP and CMP, instrumented means operands were untagged
 // mem accesses/intrinsics instrumented means a callback was inserted
+STATISTIC(SkippedMemAccesses, " # skipped memory accesses");
+STATISTIC(SkippedMemAccessesAggressive, " # skipped memory accesses with heuristics");
 
 STATISTIC(NumInstrumentedGEPs, " # instrumented GEP instructions");
 // NOTE: these are the GEPs for which we explictly remove the tag
@@ -1213,8 +1220,9 @@ void HWAddressSanitizer::getInterestingMemoryOperands(
     SmallVectorImpl<InterestingMemoryOperand> &Interesting) {
   // Skip memory accesses inserted by another instrumentation.
   // TODO : try and retrofit this
-  if (I->hasMetadata(LLVMContext::MD_nosanitize))
-    return;
+  if (I->hasMetadata(LLVMContext::MD_nosanitize)) // TODO: use this fucking hell
+    return; 
+  auto DL = M.getDataLayout();
 
   // Do not instrument the load fetching the dynamic shadow address.
   if (ShadowBase == I)
@@ -1225,26 +1233,39 @@ void HWAddressSanitizer::getInterestingMemoryOperands(
     // CFR: bug in 526.blender_r.
     // if (!ClInstrumentReads || ignoreAccess(ORE, I, LI->getPointerOperand()))
     //   return;
-    Interesting.emplace_back(I, LI->getPointerOperandIndex(), false,
-                             LI->getType(), LI->getAlign());
+    InterestingMemoryOperand OP = InterestingMemoryOperand(I, LI->getPointerOperandIndex(), false,
+                                  LI->getType(), LI->getAlign());
+    if(canBeSkipped(OP, DL))
+      return;
+    Interesting.emplace_back(OP);
   } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
     // if (!ClInstrumentWrites || ignoreAccess(ORE, I, SI->getPointerOperand()))
     //   return;
-    Interesting.emplace_back(I, SI->getPointerOperandIndex(), true,
-                             SI->getValueOperand()->getType(), SI->getAlign());
+    InterestingMemoryOperand OP = InterestingMemoryOperand(I, SI->getPointerOperandIndex(), true,
+                                  SI->getValueOperand()->getType(),
+                                  SI->getAlign());
+    if(canBeSkipped(OP, DL))
+      return;
+    Interesting.emplace_back(OP);
   } else if (AtomicRMWInst *RMW = dyn_cast<AtomicRMWInst>(I)) {
     // if (!ClInstrumentAtomics || ignoreAccess(ORE, I,
     // RMW->getPointerOperand()))
     //   return;
-    Interesting.emplace_back(I, RMW->getPointerOperandIndex(), true,
+    InterestingMemoryOperand OP = InterestingMemoryOperand(I, RMW->getPointerOperandIndex(), true,
                              RMW->getValOperand()->getType(), std::nullopt);
+    if(canBeSkipped(OP, DL))
+      return;
+    Interesting.emplace_back(OP);
   } else if (AtomicCmpXchgInst *XCHG = dyn_cast<AtomicCmpXchgInst>(I)) {
     // if (!ClInstrumentAtomics || ignoreAccess(ORE, I,
     // XCHG->getPointerOperand()))
     //   return;
-    Interesting.emplace_back(I, XCHG->getPointerOperandIndex(), true,
+    InterestingMemoryOperand OP = InterestingMemoryOperand(I, XCHG->getPointerOperandIndex(), true,
                              XCHG->getCompareOperand()->getType(),
                              std::nullopt);
+    if(canBeSkipped(OP, DL))
+      return;
+    Interesting.emplace_back(OP);
   } else if (auto *CI = dyn_cast<CallInst>(I)) {
     for (unsigned ArgNo = 0; ArgNo < CI->arg_size(); ArgNo++) {
       if (!ClInstrumentByval || !CI->isByValArgument(ArgNo))
@@ -1535,40 +1556,127 @@ void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
   NumInstrumentedIntrinsics++;
 } // instrumentMemIntrinsic
 
-bool canBeSkipped(InterestingMemoryOperand &O, const DataLayout &DL) {
+int computeMemoryAccessSize(Instruction *I, const DataLayout &DL) {
+  if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+    return DL.getTypeSizeInBits(LI->getType());
+  } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+    return DL.getTypeSizeInBits(SI->getValueOperand()->getType());
+  } else if (AtomicRMWInst *RMW = dyn_cast<AtomicRMWInst>(I)) {
+    return DL.getTypeSizeInBits(RMW->getValOperand()->getType());
+  } else if (AtomicCmpXchgInst *XCHG = dyn_cast<AtomicCmpXchgInst>(I)) {
+    return DL.getTypeSizeInBits(XCHG->getCompareOperand()->getType());
+  }
+  report_fatal_error("Unexpected instruction");
+  return -1;
+}
+
+bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O, const DataLayout &DL) {
   // TODO: debug, might be removing too many checks
   if (AllocaInst *AI = dyn_cast<AllocaInst>(O.getPtr())) {
     if (AI->getAllocatedType()->isPointerTy() ||
         AI->getAllocatedType()->isIntegerTy() ||
-        AI->getAllocatedType()->isFloatingPointTy()) {
+        AI->getAllocatedType()->isFloatingPointTy() ||
+        (AI->getAllocatedType()->isArrayTy() && !isArrayOfStructs(AI->getAllocatedType())))
+      {
+        SkippedMemAccesses++;
       return true;
     }
   } // it's alloca
   // skip on globals with no "instrument" metadata
   if (GlobalVariable *GV = dyn_cast<GlobalVariable>(O.getPtr())) {
     if (!GV->getMetadata("fsan.instrument")) {
+      SkippedMemAccesses++;
       return true;
     }
   }
+  if(!ClFSAN_AggressiveTrimmer) 
+    return false;
+  if(GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(O.getPtr())) {
+    /** H1: FILTER OUT WHATEVER IS NOT STRUCT FOR SURE */
 
-  // if (GetElementPtrInst *I = dyn_cast<GetElementPtrInst>(O.getPtr())) {
-  //   auto *MD_node = I->getMetadata("fsan.instrument");
-  //   if (!MD_node) {
-  //     // errs() << "[FSAN] Skipping instrumentation of GEP with no "
-  //     //           "'instrument' metadata: "
-  //     //        << *I << "\n";
-  //     return true;
-  //   }
-  //   // else
-  //   //   errs() << "[FSAN] Instrumenting ADDR with 'fsan.instrument'
-  //   metadata: "
-  //   //          << *I << "\n";
-  // }
-  // it could be a function argument, example: pTHX_ AV **const avp
-  // we are not interested in accesses to ptr vars that are not in structs but
-  // there is no way of telling them apart.per il
+    // H1.a = ALLOCAs
+    if(AllocaInst* AI = dyn_cast<AllocaInst>(GEP->getPointerOperand())) {
+      Type *AllocatedType = AI->getAllocatedType();
+      if(!AllocatedType->isStructTy() || (AllocatedType->isArrayTy() && !isArrayOfStructs(AllocatedType))) {
+        // RULE1: skip GEPs into ALLOCAs of non-struct types
+        errs() << "[FSAN] SKIP " << *O.getInsn() << ", NON-STRUCT GEP: " << *AllocatedType << "\n";
+        SkippedMemAccessesAggressive++;
+        return true; 
+      }// if is struct
+    } // if AllocaInst
+    
+    // H1.b = GLOBALS
+    if(GlobalVariable* GV = dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {
+      Type *AllocatedType = GV->getValueType();
+      if(!AllocatedType->isStructTy() || (AllocatedType->isArrayTy() && !isArrayOfStructs(AllocatedType))) {
+        // RULE1: skip GEPs into GLOBALs of non-struct types
+        errs() << "[FSAN] GV SKIP " << *O.getInsn() << ", NON-STRUCT GEP: " << *AllocatedType << "\n";
+        SkippedMemAccessesAggressive++;
+        return true; 
+      }// if is struct
+    } // if GlobalVariable
 
-  // NOTE: DONT SKIP PTR LOADS!
+    // H2: some GEPs are just in bound based on the type of the underlying memory (Globals, Allocas only). Instrumenting a memory access when the check will succeed 100% is redundant.
+    // H2.a = ALLOCAs
+    if(AllocaInst* AI = dyn_cast<AllocaInst>(GEP->getPointerOperand())) {
+      auto UnderlyingMemTy = dyn_cast<StructType>(AI->getAllocatedType()); // discard arrays for now
+      if(!UnderlyingMemTy)
+        return false;
+
+      auto nOperandsGEP = GEP->getNumOperands();
+      if(nOperandsGEP != 3)
+        return false;
+      if(ConstantInt* IDX = dyn_cast<ConstantInt>(GEP->getOperand(2))) {
+        auto idxVal = IDX->getZExtValue();
+        if(idxVal >= UnderlyingMemTy->getNumElements())
+          return false; // out of bounds?
+        auto TypeOfFieldAtIdx = UnderlyingMemTy->getElementType(idxVal);
+        if(TypeOfFieldAtIdx->isAggregateType())
+          return false; // TODO: this is a case for later
+        
+        auto SizeOfTypeOfFieldAtIdx = DL.getTypeSizeInBits(TypeOfFieldAtIdx); // in BYTES
+        // errs() << "[FSAN-DBG] ACCESS: " << *O.getInsn() << "\n\tGEP into ALLOCA: " << *UnderlyingMemTy << ", field idx: " << idxVal << ", field type: " << *TypeOfFieldAtIdx << ", field size " << SizeOfTypeOfFieldAtIdx << "\n";
+        auto SizeOfTheMemOp = computeMemoryAccessSize(O.getInsn(), DL);
+        // NOTE: LT because we account for unions.
+        if(SizeOfTypeOfFieldAtIdx >= SizeOfTheMemOp) {
+          errs() << "[FSAN] SKIP " << *O.getInsn() << ", trivial check on GEP into ALLOCA: " << *UnderlyingMemTy << ", field idx: " << idxVal << ", field type: " << *TypeOfFieldAtIdx << ", field size: " << SizeOfTypeOfFieldAtIdx << ", access size: " << SizeOfTheMemOp << "\n";
+          SkippedMemAccessesAggressive++;
+          return true;
+        }
+      }
+    } // if AllocaInst
+
+     // CASE H2.b = GLOBALs
+    if(GlobalVariable* GV = dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {
+      auto UnderlyingMemTy = dyn_cast<StructType>(GV->getValueType()); // discard arrays for now
+      if(!UnderlyingMemTy)
+        return false;
+
+      auto nOperandsGEP = GEP->getNumOperands();
+      if(nOperandsGEP != 3)
+        return false;
+      if(ConstantInt* IDX = dyn_cast<ConstantInt>(GEP->getOperand(2))) {
+        auto idxVal = IDX->getZExtValue();
+        if(idxVal >= UnderlyingMemTy->getNumElements())
+          return false; // out of bounds?
+        auto TypeOfFieldAtIdx = UnderlyingMemTy->getElementType(idxVal);
+        if(TypeOfFieldAtIdx->isAggregateType())
+          return false; // TODO: this is a case for later
+        
+        auto SizeOfTypeOfFieldAtIdx = DL.getTypeSizeInBits(TypeOfFieldAtIdx); // in BYTES
+        auto SizeOfTheMemOp = computeMemoryAccessSize(O.getInsn(), DL);
+        // NOTE: LT because we account for unions.
+        if(SizeOfTypeOfFieldAtIdx >= SizeOfTheMemOp) {
+          errs() << "[FSAN] SKIP " << *O.getInsn() << ", trivial check on GEP into GV: " << *UnderlyingMemTy << ", field idx: " << idxVal << ", field type: " << *TypeOfFieldAtIdx << ", field size: " << SizeOfTypeOfFieldAtIdx << ", access size: " << SizeOfTheMemOp << "\n";
+          SkippedMemAccessesAggressive++;
+          return true;
+        }
+      }
+    } // if GV
+
+  }// if GEP
+  /** H2: if all accesses to a certain alloca are in-bounds, skip instrumenting the alloca marking it with some metadataum */
+
   return false;
 }
 
@@ -1597,10 +1705,7 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
     return false; // FIXME
 
   Instruction *I = O.getInsn();
-
-  // might be UNSAFE?
-  if (canBeSkipped(O, DL))
-    return false;
+    
 
   // // BLOCKLISTING CORNER CASES
   // // 1. store { i64, i64 } zeroinitializer, ptr %fToCall.fsan.struct
@@ -2373,7 +2478,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   NumInstrumentedFuncs++;
 
-  SmallVector<InterestingMemoryOperand, 16> OperandsToInstrument;
+  SmallVector<InterestingMemoryOperand, 50> OperandsToInstrument;
   SmallVector<MemIntrinsic *, 16> IntrinToInstrument;
   SmallVector<Instruction *, 8> LandingPadVec;
   SmallVector<GetElementPtrInst *, 40> GEPsToInstrument;
@@ -2382,7 +2487,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   SmallVector<CallBase *, 40> CallsToTypedNew;
   SmallVector<StoreInst *, 40> StoresToInstrument;
   SmallVector<BinaryOperator *, 40> BOPsToInstrument;
-
+  const DataLayout &DL = F.getDataLayout();
   const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
 
   memtag::StackInfoBuilder SIB(SSI, DEBUG_TYPE);
@@ -2396,6 +2501,13 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       LandingPadVec.push_back(&Inst);
 
     getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
+    // mem ops must be trimmed BEFORE applying FSAN instrumentation otherwise situation gets complicated fast
+    // for(auto &MO : OperandsToInstrument) {
+    //   if (canBeSkipped(MO, DL)) {
+    //     std::remove(OperandsToInstrument.begin(), OperandsToInstrument.end(), MO);
+    //   }
+    // }
+    
 
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
       IntrinToInstrument.push_back(MI);
@@ -2524,7 +2636,6 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
   LoopInfo *LI = FAM.getCachedResult<LoopAnalysis>(F);
   DomTreeUpdater DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy);
-  const DataLayout &DL = F.getDataLayout();
   if (ClFSAN_memAccesses)
     for (auto &Operand : OperandsToInstrument)
       if(!skipMemAccessInst)
@@ -2778,7 +2889,7 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
   NumInstrumentedBOPs++;
 }
 
-bool isArrayOfStructs(llvm::Type *T) {
+bool HWAddressSanitizer::isArrayOfStructs(llvm::Type *T) {
   // Peel all array dimensions
   if (!T->isArrayTy())
     return false;

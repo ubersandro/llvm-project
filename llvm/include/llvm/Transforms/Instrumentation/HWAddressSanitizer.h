@@ -201,6 +201,8 @@ private:
 
   void InstrumentGEP_L(GetElementPtrInst *GEPI);
   void InstrumentGEP_NoL(GetElementPtrInst *GEPI); /** for later */
+  bool canBeSkipped(InterestingMemoryOperand &O, const DataLayout &DL);
+  bool isArrayOfStructs(llvm::Type *T);
   bool performChecksOnGEP(GetElementPtrInst *GEPI);
   void InstrumentBOP(BinaryOperator *BOP);
   void processOperand(Instruction *BOP, Value *OP1,
