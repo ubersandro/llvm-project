@@ -1120,9 +1120,9 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     // }
     
     // untag pointers in ptr subtractions
-    if (LangOpts.Sanitize.has(SanitizerKind::FSanitizer)) {
+    // if (LangOpts.Sanitize.has(SanitizerKind::FSanitizer)) {
       MPM.addPass(RewritePtrSubtractionsPass());
-    }
+    // }
 
     if (CodeGenOpts.FatLTO) {
       MPM.addPass(PB.buildFatLTODefaultPipeline(

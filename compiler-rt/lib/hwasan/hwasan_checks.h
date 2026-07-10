@@ -212,6 +212,19 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
                        memory_order_relaxed);
     }
 #endif
+// check that ALL the bytes in the access are zero. If not, raise error.
+    for (unsigned int i = 0; i < sz; i++) {
+      uint8_t ShadowTagByte = *(uint8_t*)(baseShadow + i);
+      if(UNLIKELY(ShadowTagByte != 0)) {
+        VPrintf(
+            0,
+            "[check-null] Tag mismatch detected at address %p: ptr "
+            "tag=%02x mem tag=%02x \n\t PL=%02x ML=%02x \n\t PT=%02x MT=%02x\n",
+            (void*)p, ptr_tag, ShadowTagByte, getL(ptr_tag), getL(ShadowTagByte),
+            getT(ptr_tag), getT(ShadowTagByte));
+        SigTrap<EA, AT>(p, sz);
+      }
+    }
     return;
   }  // memtag is 0
 
@@ -310,16 +323,6 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
       (*(uint8_t*)shadow_addr);  // TODO: change backk
 
   // DEBUG
-  if (UNLIKELY(ShadowTag == 0)) {
-    // atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
-
-    // if (atomic_load(&checks_on_uninited_shadow, memory_order_relaxed) == 0) {
-    //   // overflow detected
-    //   atomic_fetch_add(&overflows_on_uninited_shadow_checks, 1ULL,
-    //                    memory_order_relaxed);
-    // }
-    return;
-  }
   if (UNLIKELY(GetTagFromPointer(p) == 0)) {
     // atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
     // if (atomic_load(&checks_on_untagged_ptr, memory_order_relaxed) == 0) {
@@ -329,6 +332,31 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
     // }
     return;
   }
+  
+  if (UNLIKELY(ShadowTag == 0)) {
+    // atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
+
+    // if (atomic_load(&checks_on_uninited_shadow, memory_order_relaxed) == 0) {
+    //   // overflow detected
+    //   atomic_fetch_add(&overflows_on_uninited_shadow_checks, 1ULL,
+    //                    memory_order_relaxed);
+    // }
+    // check that ALL the bytes in the access are zero. If not, raise error.
+    for (unsigned int i = 0; i < (1 << LogSize); i++) {
+      uint8_t ShadowTagByte = *(uint8_t*)(shadow_addr + i);
+      if(UNLIKELY(ShadowTagByte != 0)) {
+        VPrintf(
+            0,
+            "[check-null] Tag mismatch detected at address %p: ptr "
+            "tag=%02x mem tag=%02x \n\t PL=%02x ML=%02x \n\t PT=%02x MT=%02x\n",
+            (void*)p, tag, ShadowTagByte, getL(tag), getL(ShadowTagByte),
+            getT(tag), getT(ShadowTagByte));
+        SigTrap<EA, AT, LogSize>(p);
+      }
+    }
+    return;
+  }
+  
 
   // bool isRP = getR(tag);
   // if (isRP) {
