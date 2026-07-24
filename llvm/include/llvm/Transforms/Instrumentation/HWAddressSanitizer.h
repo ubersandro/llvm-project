@@ -77,8 +77,15 @@ class StringRef;
 class raw_ostream;
 #if defined(__x86_64__)
 #define T_MAX_CONST (1ULL << 3);
+#define T_BITS 3ULL
+#define L_BITS 2ULL // use ALL bits
+#define TAG_BITS 5ULL
+
 #elif defined(__aarch64__)
 #define T_MAX_CONST (1ULL << 5);
+#define T_BITS 5ULL
+#define T_BITS 2ULL
+
 #endif
 
 struct HWAddressSanitizerOptions {

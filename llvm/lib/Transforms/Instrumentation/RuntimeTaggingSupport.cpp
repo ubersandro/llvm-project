@@ -27,7 +27,7 @@ static cl::opt<bool> clFSAN_DEPTH_AWARE_TAGGING(
 namespace RuntimeTaggingSupport {
 #if defined(__x86_64__)
 uint64_t TBits = 3;
-uint64_t LBits = 2;
+uint64_t LBits = 3;
 uint64_t L_MAX = (1ULL << LBits);
 uint64_t T_MAX = (1ULL << TBits); // 0b100000
 #else
@@ -139,6 +139,7 @@ RetrieveOrCreateTagVector(StructType *ST, Module &M, int depth) {
 
 __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
                                                 int depth) {
+  depth = 0; // NO L
   // TODO: remove the 0 tag from everywhere else
   DataLayout DL = M.getDataLayout();
   u_int8_t *Tags = new u_int8_t[DL.getTypeAllocSize(Ty)];
@@ -152,7 +153,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
   auto FieldsOffsets = DL.getStructLayout(Ty)->getMemberOffsets();
 
   uint8_t fatherT = 0;                 /* unused */
-  int fatherL = (depth & (L_MAX - 1)); // modulo L_MAX --> level-aware
+  // int fatherL = (depth & (L_MAX - 1)); // modulo L_MAX --> level-aware
+  int fatherL = 0; // NO L
   uint64_t sonIdx = 1;
   // NOTE: 2^^16 max number of fields
   if (FieldsOffsets.size() >= (1 << 16) - 1) {
@@ -174,7 +176,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
     AggQueue.pop_front();
     Type *CurFieldType = std::get<0>(Tuple);
     fatherT = std::get<1>(Tuple);
-    fatherL = std::get<2>(Tuple);
+    // fatherL = std::get<2>(Tuple);
+    fatherL = 0; // NO L
     sonIdx = std::get<3>(Tuple);
     uint64_t CurFieldOffset = std::get<4>(Tuple);
 
@@ -236,7 +239,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         auto ContainedSubTypes = CurFieldStructType->getNumElements();
       size_t CurContainedSubTy = 0;
       // for struct types, we go one level deeper
-      auto NextL = (fatherL + 1) & (L_MAX - 1); // modulo L_MAX
+      // auto NextL = (fatherL + 1) & (L_MAX - 1); // modulo L_MAX
+      auto NextL = 0; // NO L
 
       for (Type *SSty : llvm::reverse(CurFieldType->subtypes())) {
         CurContainedSubTy =
@@ -250,9 +254,10 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
 
     else if (CurFieldType->isArrayTy()) {
       const int MaxDepth = 20;
-      // TODO: should structs live one level deeper wrt to the enclosing array?
-      int ArrayDims = 1;
+      int ArrayDims = 1; // at least 1 dim
       auto *CurArrayType = dyn_cast<ArrayType>(CurFieldType);
+      auto *OuterArrayType = CurArrayType; // for later
+
       u_int64_t Elements = CurArrayType->getNumElements();
       auto *ElemType = CurArrayType->getArrayElementType();
 
@@ -271,6 +276,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         assert(ElemStructType &&
                "Element type of array must be struct for this case.");
         size_t ElemStructSize = DL.getTypeAllocSize(ElemStructType);
+        OverallDepth = 0; // NO L
         auto *TagVector =
             RetrieveOrCreateTagVector(ElemStructType, M, OverallDepth+1);
         assert(TagVector && "Failed to retrieve or create tag vector for "
@@ -292,23 +298,60 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         }
 
       } else {
-        // scalar arrays get the same tag
-        // NOTE: this case catches arrays with depth > MAX_DEPTH as well
         uint64_t IdxModuloT_MAX = sonIdx % T_MAX;
         uint64_t IdxDivT_MAX = sonIdx / T_MAX;
         uint64_t T = (IdxModuloT_MAX + IdxDivT_MAX);
         T = T % T_MAX;
+        uint64_t TAG_BITS = 5ULL; // TODO put elsewhere
         if (T == 0) {
           T = 1;
         }
         uint8_t Tag = T;
+        // if it's monodimensional, we tag it with T
+        if (ArrayDims == 1) {
+          for (uint64_t idx = 0; idx < OuterArrayType->getNumElements(); idx++) {
+            auto el = OuterArrayType->getElementType();
+            auto Offset = CurFieldOffset + idx * DL.getTypeAllocSize(el);
+            memset(&Tags[Offset], Tag, DL.getTypeAllocSize(el));
+          }
+        }// if ArrayDims == 1
 
-        Tag |= (fatherL << TBits); /* non-struct arrays elements all live at the
-                                      same level of the array itself */
-        size_t ArraySize = DL.getTypeAllocSize(CurFieldType);
+        else{
+          std::deque<std::tuple<Type * /*EL*/, uint64_t /*L_TMP*/, uint64_t /*offset inside tag vector*/, uint64_t /*cur dim */, uint64_t /*cur arr idx */>> Stack;
+          for(uint64_t idx=0; idx<OuterArrayType->getNumElements(); idx++){
+            auto el = OuterArrayType->getElementType();
+            auto Offset = CurFieldOffset + idx * DL.getTypeAllocSize(el);
+            uint64_t T_TMP = -1;
+            uint64_t bit = idx % 2;
+            // T_TMP = 1ULL<<5 | (bit << (ArrayDims - 1));
+            T_TMP = 1ULL<<5;
 
-        memset(&Tags[CurFieldOffset], Tag, ArraySize);
+            Stack.push_back(std::make_tuple(el, T_TMP, Offset, ArrayDims-1, idx));
+          }
 
+        
+
+        while(!Stack.empty()){
+          auto [EL, T_TMP, Offset, Depth, IDX] = Stack.back();
+          Stack.pop_back();
+
+          if(EL->isArrayTy()){
+            auto *ArrTy = dyn_cast<ArrayType>(EL);
+            auto *ElemTy = ArrTy->getArrayElementType();
+            uint64_t NumElems = ArrTy->getNumElements();
+
+            for(uint64_t idx=0; idx<NumElems; idx++){
+                uint64_t T_TMP_NEW = T_TMP | ((IDX % 2) << (Depth - 1));
+                Stack.push_back(std::make_tuple(ElemTy, T_TMP_NEW, Offset + idx * DL.getTypeAllocSize(ElemTy), Depth-1, idx));
+            }// for 
+          } // if element is array 
+          else {
+            // arrays of depth 1 have same tag for all elems
+            Tag = T_TMP;
+            memset(&Tags[Offset], Tag, DL.getTypeAllocSize(EL));
+          }// else
+        }// while
+      }// array dims > 1
         auto *arrTy = dyn_cast<ArrayType>(CurFieldType);
         auto ArrayFieldElems = arrTy->getNumElements();
 

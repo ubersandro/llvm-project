@@ -168,7 +168,7 @@ PossiblyShortTagMatches(tag_t mem_tag, uptr ptr, uptr sz) {
 
 // This mask preserves the bits on which we do checks
 // #define CHECK_TAG_MASK ((1ULL << (T_BITS + L_BITS)) - 1)
-#define CHECK_TAG_MASK ((1ULL << (T_BITS)) - 1)
+#define CHECK_TAG_MASK ((1ULL << (T_BITS + L_BITS)) - 1)
 
 // TODO: double check on overflows on tagging bytes -> shadow byte == 0xff means
 // padding
@@ -185,6 +185,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   // when ptr tag is 0, we skip checks
 
   if (UNLIKELY(ptr_tag == 0)) {
+    VPrintf(2, "[CheckAddressSized] ptr tag is 0, ptr=%p sz=%lu\n", (void*)p, sz);
 #ifdef PERFORMANCE_DEBUGGING
     atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
     if (atomic_load(&checks_on_untagged_ptr, memory_order_relaxed) == 0) {
@@ -204,6 +205,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   // NOTE: do check on first byte, catch the smallest read possible
 
   if (UNLIKELY(memIsNull)) {
+    VPrintf(2, "[CheckAddressSized] memtag is 0, ptr=%p sz=%lu\n", (void*)p, sz);
 #ifdef PERFORMANCE_DEBUGGING
     atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
     if (atomic_load(&checks_on_uninited_shadow, memory_order_relaxed) == 0) {
@@ -324,6 +326,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
 
   // DEBUG
   if (UNLIKELY(GetTagFromPointer(p) == 0)) {
+    VPrintf(2, "[CheckAddress] untagged ptr detected at address %p\n", (void*)p);
     // atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
     // if (atomic_load(&checks_on_untagged_ptr, memory_order_relaxed) == 0) {
     //   // overflow detected
@@ -334,6 +337,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   }
   
   if (UNLIKELY(ShadowTag == 0)) {
+    VPrintf(2, "[CheckAddress] uninited shadow detected at address %p\n", (void*)p);
     // atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
 
     // if (atomic_load(&checks_on_uninited_shadow, memory_order_relaxed) == 0) {
@@ -356,7 +360,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
     }
     return;
   }
-  
+  VPrintf(2, "[CheckAddress] ptr=%p sz=%d\n", (void*)p, 1 << LogSize);
 
   // bool isRP = getR(tag);
   // if (isRP) {

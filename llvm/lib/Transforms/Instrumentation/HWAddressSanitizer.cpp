@@ -2935,8 +2935,8 @@ Value *HWAddressSanitizer::AddOneModuloSomething(IRBuilder<> &IRB,
   return PlusOne;
 }
 
-int getArrayDimension(Type *AT) {
-  int Dim = 0;
+uint64_t getArrayDimension(Type *AT) {
+  uint64_t Dim = 0;
   while (AT && AT->isArrayTy()) {
     Dim++;
     AT = dyn_cast<ArrayType>(AT->getArrayElementType());
@@ -2955,6 +2955,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
   auto DstType = GEPI->getResultElementType();
   bool DstIsStruct = DstType->isStructTy();
   bool DstIsArrOfStructs = isArrayOfStructs(DstType);
+  bool DstIsArray = DstType->isArrayTy();
 
   auto PtrOp = GEPI->getPointerOperand();
   auto GEPNAME = GEPI->hasName() ? GEPI->getName().str()
@@ -2968,7 +2969,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
   }
 
   IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
-  auto GEPLong = IRB.CreatePtrToInt(PtrOp, IntptrTy);
+  Value* GEPLong = nullptr;
   std::string endResultName = "";
   Value *taggedPointer = nullptr;
   uint64_t PTR_MASK = ((1ULL << PointerTagShift) - 1);
@@ -2996,7 +2997,8 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
       tag = performChecksOnGEP(GEPI);
 
     auto sonIsScalar =
-        !DstIsStruct && !DstType->isVectorTy() && !DstIsArrOfStructs;
+        !DstIsStruct && !DstType->isVectorTy() && !DstIsArrOfStructs && (!DstIsArray || DstIsArray && getArrayDimension(DstType) == 1);
+    // 1D arrays are treated as a single field.
 
     if (tag) {
       if (sonIsScalar) {
@@ -3014,12 +3016,21 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
           T = 1;
 
         Value *untagged = maskPointerIntrinsic(IRB, GEPI, PTR_MASK);
-        Value *untaggedLong = IRB.CreatePtrToInt(untagged, IntptrTy);
+        GEPLong = IRB.CreatePtrToInt(untagged, IntptrTy);
         Value *TBits_CONST = ConstantInt::get(IntptrTy, T << (PointerTagShift));
-        Value *untaggedLongWithT = IRB.CreateOr(untaggedLong, TBits_CONST);
-        taggedPointer = IRB.CreateIntToPtr(untaggedLongWithT, GEPI->getType());
+        Value *GEPLongWithT = IRB.CreateOr(GEPLong, TBits_CONST);
+        taggedPointer = IRB.CreateIntToPtr(GEPLongWithT, GEPI->getType());
         endResultName = GEPNAME + ".fsan.scalar";
       } // sonIsScalar
+      else if(DstIsArray && getArrayDimension(DstType) > 1){
+        // set bit 5 in the tag
+        Value *untagged = maskPointerIntrinsic(IRB, GEPI, PTR_MASK);
+        GEPLong = IRB.CreatePtrToInt(untagged, IntptrTy);
+        Value *TBits_CONST = ConstantInt::get(IntptrTy, (1ULL << (PointerTagShift + 5))); // TODO: fix properly
+        Value *GEPLongWithT = IRB.CreateOr(GEPLong, TBits_CONST);
+        taggedPointer = IRB.CreateIntToPtr(GEPLongWithT, GEPI->getType());
+        endResultName = GEPNAME + ".fsan.array";
+      }
     } // if tag
 
     else {
@@ -3028,6 +3039,157 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
       endResultName = GEPNAME + ".fsan.untagged";
     } // else tag
   } // SrcIsStruct
+  else{
+    // // SRC is not struct
+    bool ThreeOpsGEP = nOperands == 3;
+    bool TwoOpsGEP = nOperands == 2; // already decayed
+    if(SrcIsArray && DstIsArray && !SROA) {
+      uint64_t NSrc = getArrayDimension(SrcType);
+      uint64_t NDst = getArrayDimension(DstType);
+
+      bool arrayTraversal = NDst < NSrc && NDst > 0; // array indexing or decay, or incdec
+      bool isArrayOfScalars = !isArrayOfStructs(SrcType);
+if (isArrayOfScalars) {
+  errs() << "[FSAN] ARRAY GEP: " << *GEPI << "\n";
+
+  /*
+   * Compute the static position inside the tag.
+   *
+   * TwoOpsGEP:
+   *   operand 0 = pointer
+   *   operand 1 = index
+   *
+   * Otherwise:
+   *   operand 0 = pointer
+   *   operand 2 = relevant index
+   */
+  const uint64_t ShiftAdjustment = TwoOpsGEP ? 1ULL : 2ULL;
+
+  assert(NSrc >= ShiftAdjustment && "Invalid NSrc for array GEP");
+
+  const uint64_t SHIFT = NSrc - ShiftAdjustment;
+
+  /*
+   * The previous code checked SHIFT before recomputing it for TwoOpsGEP.
+   * That was wrong. Check the final SHIFT.
+   */
+  if (SHIFT >= TAG_BITS)
+    return;
+
+  const unsigned IndexOperand = TwoOpsGEP ? 1U : 2U;
+
+  assert(IndexOperand < GEPI->getNumOperands() &&
+         "Missing array GEP index operand");
+
+  Value *Index = GEPI->getOperand(IndexOperand);
+  auto *IndexTy = dyn_cast<IntegerType>(Index->getType());
+
+  if (!IndexTy) {
+    errs() << "[FSAN] Non-integer GEP index: " << *Index << "\n";
+    return;
+  }
+
+  auto *IntPtrITy = cast<IntegerType>(IntptrTy);
+  const unsigned PointerBits = IntPtrITy->getBitWidth();
+
+  /*
+   * For six-bit LAM:
+   *
+   *   PointerTagShift = 57
+   *   SHIFT           = 0..5
+   *   BitPosition     = 57..62
+   */
+  const uint64_t BitPosition = PointerTagShift + SHIFT;
+
+  if (BitPosition >= PointerBits) {
+    errs() << "[FSAN] Invalid tag-bit position: " << BitPosition
+           << ", pointer width: " << PointerBits << "\n";
+    return;
+  }
+
+  /*
+   * Compute index parity at runtime:
+   *
+   *   even index -> 0
+   *   odd index  -> 1
+   *
+   * Using AND 1 works for both positive and negative LLVM integer
+   * bit patterns and preserves exactly the parity bit.
+   */
+  Value *ParityInIndexTy =
+      IRB.CreateAnd(Index, ConstantInt::get(IndexTy, 1),
+                    GEPNAME + ".fsan.parity");
+
+  /*
+   * Convert the single parity bit to uintptr_t width before shifting it
+   * into the pointer tag.
+   */
+  Value *Parity =
+      IRB.CreateZExtOrTrunc(ParityInIndexTy, IntPtrITy,
+                            GEPNAME + ".fsan.parity.intptr");
+
+  Value *RuntimeTagBit =
+      IRB.CreateShl(Parity, BitPosition,
+                    GEPNAME + ".fsan.tagbit");
+
+  /*
+   * Build:
+   *
+   *   ~(1 << BitPosition)
+   *
+   * using APInt, avoiding host-side 64-bit shift assumptions.
+   */
+  APInt ClearMask = APInt::getAllOnes(PointerBits);
+  ClearMask.clearBit(static_cast<unsigned>(BitPosition));
+
+  GEPLong =
+      IRB.CreatePtrToInt(GEPI, IntPtrITy,
+                         GEPNAME + ".fsan.ptrint");
+
+  if(ThreeOpsGEP){
+    Value *PointerWithBitCleared =
+      IRB.CreateAnd(
+          GEPLong,
+          ConstantInt::get(IntPtrITy, ClearMask),
+          GEPNAME + ".fsan.clearbit");
+  Value *TaggedInteger =
+      IRB.CreateOr(PointerWithBitCleared, RuntimeTagBit,
+                   GEPNAME + ".fsan.setbit");
+
+  taggedPointer =
+      IRB.CreateIntToPtr(TaggedInteger, GEPI->getType(),
+                         GEPNAME + ".fsan.tagged");
+
+  }
+  else if (TwoOpsGEP){
+    // because bits alternate in our pattern
+    Value *TaggedInteger =
+      IRB.CreateXor(GEPLong, RuntimeTagBit,
+                   GEPNAME + ".fsan.XOR");
+
+  taggedPointer =
+      IRB.CreateIntToPtr(TaggedInteger, GEPI->getType(),
+                         GEPNAME + ".fsan.tagged");
+  }
+  
+  // errs() << "[FSAN] ARRAY GEP: " << *GEPI
+  //        << "\n\tNSrc: " << NSrc
+  //        << "\n\tNDst: " << NDst
+  //        << "\n\tSHIFT: " << SHIFT
+  //        << "\n\tBitPosition: " << BitPosition
+  //        << "\n\tIndex: " << *Index
+  //        << "\n\tParity: " << *ParityInIndexTy
+  //        << "\n\tRuntimeTagBit: " << *RuntimeTagBit
+  //        << "\n\tTaggedPointer: " << *taggedPointer
+  //        << "\n";
+  assert(taggedPointer != nullptr && "TAGGED POINTER");
+  endResultName =
+      GEPNAME + ".fsan.array" +
+      (arrayTraversal ? ".traversal" : ".decay");
+}// array of scalars
+    }
+
+  }
 
   if (!taggedPointer) {
     return;
