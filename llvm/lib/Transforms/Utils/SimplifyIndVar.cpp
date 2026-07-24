@@ -740,7 +740,13 @@ bool SimplifyIndvar::replaceFloatIVWithIntegerIV(Instruction *UseInst) {
 /// Eliminate any operation that SCEV can prove is an identity function.
 bool SimplifyIndvar::eliminateIdentitySCEV(Instruction *UseInst,
                                            Instruction *IVOperand) {
-  if (!SE->isSCEVable(UseInst->getType()) ||
+  if(GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(IVOperand)) {
+    // if (GEP->hasAllZeroIndices()) {
+    errs() << "INDVARS: Eliminated identity: " << *UseInst << '\n';
+      return false;
+    // }
+  }
+                                            if (!SE->isSCEVable(UseInst->getType()) ||
       UseInst->getType() != IVOperand->getType())
     return false;
 
