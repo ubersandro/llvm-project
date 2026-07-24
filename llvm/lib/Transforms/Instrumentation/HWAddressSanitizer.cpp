@@ -70,8 +70,8 @@ static cl::opt<bool>
 
 static cl::opt<bool>
     ClFSAN_AggressiveTrimmer("fsan-instrument-mem-access-aggressive-trimming",
-                             cl::desc("trim memory accesses aggressively"), cl::Hidden,
-                             cl::init(false));
+                             cl::desc("trim memory accesses aggressively"),
+                             cl::Hidden, cl::init(false));
 
 static cl::opt<bool>
     ClFSAN_heap("fsan-instrument-heap",
@@ -192,7 +192,8 @@ STATISTIC(NumInstrumentedFuncs, " instrumented funcs");
 // for BOP and CMP, instrumented means operands were untagged
 // mem accesses/intrinsics instrumented means a callback was inserted
 STATISTIC(SkippedMemAccesses, " # skipped memory accesses");
-STATISTIC(SkippedMemAccessesAggressive, " # skipped memory accesses with heuristics");
+STATISTIC(SkippedMemAccessesAggressive,
+          " # skipped memory accesses with heuristics");
 
 STATISTIC(NumInstrumentedGEPs, " # instrumented GEP instructions");
 // NOTE: these are the GEPs for which we explictly remove the tag
@@ -1221,7 +1222,7 @@ void HWAddressSanitizer::getInterestingMemoryOperands(
   // Skip memory accesses inserted by another instrumentation.
   // TODO : try and retrofit this
   if (I->hasMetadata(LLVMContext::MD_nosanitize)) // TODO: use this fucking hell
-    return; 
+    return;
   auto DL = M.getDataLayout();
 
   // Do not instrument the load fetching the dynamic shadow address.
@@ -1233,37 +1234,38 @@ void HWAddressSanitizer::getInterestingMemoryOperands(
     // CFR: bug in 526.blender_r.
     // if (!ClInstrumentReads || ignoreAccess(ORE, I, LI->getPointerOperand()))
     //   return;
-    InterestingMemoryOperand OP = InterestingMemoryOperand(I, LI->getPointerOperandIndex(), false,
-                                  LI->getType(), LI->getAlign());
-    if(canBeSkipped(OP, DL))
+    InterestingMemoryOperand OP = InterestingMemoryOperand(
+        I, LI->getPointerOperandIndex(), false, LI->getType(), LI->getAlign());
+    if (canBeSkipped(OP, DL))
       return;
     Interesting.emplace_back(OP);
   } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
     // if (!ClInstrumentWrites || ignoreAccess(ORE, I, SI->getPointerOperand()))
     //   return;
-    InterestingMemoryOperand OP = InterestingMemoryOperand(I, SI->getPointerOperandIndex(), true,
-                                  SI->getValueOperand()->getType(),
-                                  SI->getAlign());
-    if(canBeSkipped(OP, DL))
+    InterestingMemoryOperand OP = InterestingMemoryOperand(
+        I, SI->getPointerOperandIndex(), true, SI->getValueOperand()->getType(),
+        SI->getAlign());
+    if (canBeSkipped(OP, DL))
       return;
     Interesting.emplace_back(OP);
   } else if (AtomicRMWInst *RMW = dyn_cast<AtomicRMWInst>(I)) {
     // if (!ClInstrumentAtomics || ignoreAccess(ORE, I,
     // RMW->getPointerOperand()))
     //   return;
-    InterestingMemoryOperand OP = InterestingMemoryOperand(I, RMW->getPointerOperandIndex(), true,
-                             RMW->getValOperand()->getType(), std::nullopt);
-    if(canBeSkipped(OP, DL))
+    InterestingMemoryOperand OP =
+        InterestingMemoryOperand(I, RMW->getPointerOperandIndex(), true,
+                                 RMW->getValOperand()->getType(), std::nullopt);
+    if (canBeSkipped(OP, DL))
       return;
     Interesting.emplace_back(OP);
   } else if (AtomicCmpXchgInst *XCHG = dyn_cast<AtomicCmpXchgInst>(I)) {
     // if (!ClInstrumentAtomics || ignoreAccess(ORE, I,
     // XCHG->getPointerOperand()))
     //   return;
-    InterestingMemoryOperand OP = InterestingMemoryOperand(I, XCHG->getPointerOperandIndex(), true,
-                             XCHG->getCompareOperand()->getType(),
-                             std::nullopt);
-    if(canBeSkipped(OP, DL))
+    InterestingMemoryOperand OP = InterestingMemoryOperand(
+        I, XCHG->getPointerOperandIndex(), true,
+        XCHG->getCompareOperand()->getType(), std::nullopt);
+    if (canBeSkipped(OP, DL))
       return;
     Interesting.emplace_back(OP);
   } else if (auto *CI = dyn_cast<CallInst>(I)) {
@@ -1570,15 +1572,16 @@ int computeMemoryAccessSize(Instruction *I, const DataLayout &DL) {
   return -1;
 }
 
-bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O, const DataLayout &DL) {
+bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
+                                      const DataLayout &DL) {
   // TODO: debug, might be removing too many checks
   if (AllocaInst *AI = dyn_cast<AllocaInst>(O.getPtr())) {
     if (AI->getAllocatedType()->isPointerTy() ||
         AI->getAllocatedType()->isIntegerTy() ||
         AI->getAllocatedType()->isFloatingPointTy() ||
-        (AI->getAllocatedType()->isArrayTy() && !isArrayOfStructs(AI->getAllocatedType())))
-      {
-        SkippedMemAccesses++;
+        (AI->getAllocatedType()->isArrayTy() &&
+         !isArrayOfStructs(AI->getAllocatedType()))) {
+      SkippedMemAccesses++;
       return true;
     }
   } // it's alloca
@@ -1589,93 +1592,118 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O, const DataLay
       return true;
     }
   }
-  if(!ClFSAN_AggressiveTrimmer) 
+  if (!ClFSAN_AggressiveTrimmer)
     return false;
-  if(GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(O.getPtr())) {
+  if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(O.getPtr())) {
     /** H1: FILTER OUT WHATEVER IS NOT STRUCT FOR SURE */
 
     // H1.a = ALLOCAs
-    if(AllocaInst* AI = dyn_cast<AllocaInst>(GEP->getPointerOperand())) {
+    if (AllocaInst *AI = dyn_cast<AllocaInst>(GEP->getPointerOperand())) {
       Type *AllocatedType = AI->getAllocatedType();
-      if(!AllocatedType->isStructTy() || (AllocatedType->isArrayTy() && !isArrayOfStructs(AllocatedType))) {
+      if (!AllocatedType->isStructTy() ||
+          (AllocatedType->isArrayTy() && !isArrayOfStructs(AllocatedType))) {
         // RULE1: skip GEPs into ALLOCAs of non-struct types
-        errs() << "[FSAN] SKIP " << *O.getInsn() << ", NON-STRUCT GEP: " << *AllocatedType << "\n";
+        errs() << "[FSAN] SKIP " << *O.getInsn()
+               << ", NON-STRUCT GEP: " << *AllocatedType << "\n";
         SkippedMemAccessesAggressive++;
-        return true; 
-      }// if is struct
+        return true;
+      } // if is struct
     } // if AllocaInst
-    
+
     // H1.b = GLOBALS
-    if(GlobalVariable* GV = dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {
+    if (GlobalVariable *GV =
+            dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {
       Type *AllocatedType = GV->getValueType();
-      if(!AllocatedType->isStructTy() || (AllocatedType->isArrayTy() && !isArrayOfStructs(AllocatedType))) {
+      if (!AllocatedType->isStructTy() ||
+          (AllocatedType->isArrayTy() && !isArrayOfStructs(AllocatedType))) {
         // RULE1: skip GEPs into GLOBALs of non-struct types
-        errs() << "[FSAN] GV SKIP " << *O.getInsn() << ", NON-STRUCT GEP: " << *AllocatedType << "\n";
+        errs() << "[FSAN] GV SKIP " << *O.getInsn()
+               << ", NON-STRUCT GEP: " << *AllocatedType << "\n";
         SkippedMemAccessesAggressive++;
-        return true; 
-      }// if is struct
+        return true;
+      } // if is struct
     } // if GlobalVariable
 
-    // H2: some GEPs are just in bound based on the type of the underlying memory (Globals, Allocas only). Instrumenting a memory access when the check will succeed 100% is redundant.
-    // H2.a = ALLOCAs
-    if(AllocaInst* AI = dyn_cast<AllocaInst>(GEP->getPointerOperand())) {
-      auto UnderlyingMemTy = dyn_cast<StructType>(AI->getAllocatedType()); // discard arrays for now
-      if(!UnderlyingMemTy)
+    // H2: some GEPs are just in bound based on the type of the underlying
+    // memory (Globals, Allocas only). Instrumenting a memory access when the
+    // check will succeed 100% is redundant. H2.a = ALLOCAs
+    if (AllocaInst *AI = dyn_cast<AllocaInst>(GEP->getPointerOperand())) {
+      auto UnderlyingMemTy = dyn_cast<StructType>(
+          AI->getAllocatedType()); // discard arrays for now
+      if (!UnderlyingMemTy)
         return false;
 
       auto nOperandsGEP = GEP->getNumOperands();
-      if(nOperandsGEP != 3)
+      if (nOperandsGEP != 3)
         return false;
-      if(ConstantInt* IDX = dyn_cast<ConstantInt>(GEP->getOperand(2))) {
+      if (ConstantInt *IDX = dyn_cast<ConstantInt>(GEP->getOperand(2))) {
         auto idxVal = IDX->getZExtValue();
-        if(idxVal >= UnderlyingMemTy->getNumElements())
+        if (idxVal >= UnderlyingMemTy->getNumElements())
           return false; // out of bounds?
         auto TypeOfFieldAtIdx = UnderlyingMemTy->getElementType(idxVal);
-        if(TypeOfFieldAtIdx->isAggregateType())
+        if (TypeOfFieldAtIdx->isAggregateType())
           return false; // TODO: this is a case for later
-        
-        auto SizeOfTypeOfFieldAtIdx = DL.getTypeSizeInBits(TypeOfFieldAtIdx); // in BYTES
-        // errs() << "[FSAN-DBG] ACCESS: " << *O.getInsn() << "\n\tGEP into ALLOCA: " << *UnderlyingMemTy << ", field idx: " << idxVal << ", field type: " << *TypeOfFieldAtIdx << ", field size " << SizeOfTypeOfFieldAtIdx << "\n";
+
+        auto SizeOfTypeOfFieldAtIdx =
+            DL.getTypeSizeInBits(TypeOfFieldAtIdx); // in BYTES
+        // errs() << "[FSAN-DBG] ACCESS: " << *O.getInsn() << "\n\tGEP into
+        // ALLOCA: " << *UnderlyingMemTy << ", field idx: " << idxVal << ",
+        // field type: " << *TypeOfFieldAtIdx << ", field size " <<
+        // SizeOfTypeOfFieldAtIdx << "\n";
         auto SizeOfTheMemOp = computeMemoryAccessSize(O.getInsn(), DL);
         // NOTE: LT because we account for unions.
-        if(SizeOfTypeOfFieldAtIdx >= SizeOfTheMemOp) {
-          errs() << "[FSAN] SKIP " << *O.getInsn() << ", trivial check on GEP into ALLOCA: " << *UnderlyingMemTy << ", field idx: " << idxVal << ", field type: " << *TypeOfFieldAtIdx << ", field size: " << SizeOfTypeOfFieldAtIdx << ", access size: " << SizeOfTheMemOp << "\n";
+        if (SizeOfTypeOfFieldAtIdx >= SizeOfTheMemOp) {
+          errs() << "[FSAN] SKIP " << *O.getInsn()
+                 << ", trivial check on GEP into ALLOCA: " << *UnderlyingMemTy
+                 << ", field idx: " << idxVal
+                 << ", field type: " << *TypeOfFieldAtIdx
+                 << ", field size: " << SizeOfTypeOfFieldAtIdx
+                 << ", access size: " << SizeOfTheMemOp << "\n";
           SkippedMemAccessesAggressive++;
           return true;
         }
       }
     } // if AllocaInst
 
-     // CASE H2.b = GLOBALs
-    if(GlobalVariable* GV = dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {
-      auto UnderlyingMemTy = dyn_cast<StructType>(GV->getValueType()); // discard arrays for now
-      if(!UnderlyingMemTy)
+    // CASE H2.b = GLOBALs
+    if (GlobalVariable *GV =
+            dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {
+      auto UnderlyingMemTy =
+          dyn_cast<StructType>(GV->getValueType()); // discard arrays for now
+      if (!UnderlyingMemTy)
         return false;
 
       auto nOperandsGEP = GEP->getNumOperands();
-      if(nOperandsGEP != 3)
+      if (nOperandsGEP != 3)
         return false;
-      if(ConstantInt* IDX = dyn_cast<ConstantInt>(GEP->getOperand(2))) {
+      if (ConstantInt *IDX = dyn_cast<ConstantInt>(GEP->getOperand(2))) {
         auto idxVal = IDX->getZExtValue();
-        if(idxVal >= UnderlyingMemTy->getNumElements())
+        if (idxVal >= UnderlyingMemTy->getNumElements())
           return false; // out of bounds?
         auto TypeOfFieldAtIdx = UnderlyingMemTy->getElementType(idxVal);
-        if(TypeOfFieldAtIdx->isAggregateType())
+        if (TypeOfFieldAtIdx->isAggregateType())
           return false; // TODO: this is a case for later
-        
-        auto SizeOfTypeOfFieldAtIdx = DL.getTypeSizeInBits(TypeOfFieldAtIdx); // in BYTES
+
+        auto SizeOfTypeOfFieldAtIdx =
+            DL.getTypeSizeInBits(TypeOfFieldAtIdx); // in BYTES
         auto SizeOfTheMemOp = computeMemoryAccessSize(O.getInsn(), DL);
         // NOTE: LT because we account for unions.
-        if(SizeOfTypeOfFieldAtIdx >= SizeOfTheMemOp) {
-          errs() << "[FSAN] SKIP " << *O.getInsn() << ", trivial check on GEP into GV: " << *UnderlyingMemTy << ", field idx: " << idxVal << ", field type: " << *TypeOfFieldAtIdx << ", field size: " << SizeOfTypeOfFieldAtIdx << ", access size: " << SizeOfTheMemOp << "\n";
+        if (SizeOfTypeOfFieldAtIdx >= SizeOfTheMemOp) {
+          errs() << "[FSAN] SKIP " << *O.getInsn()
+                 << ", trivial check on GEP into GV: " << *UnderlyingMemTy
+                 << ", field idx: " << idxVal
+                 << ", field type: " << *TypeOfFieldAtIdx
+                 << ", field size: " << SizeOfTypeOfFieldAtIdx
+                 << ", access size: " << SizeOfTheMemOp << "\n";
           SkippedMemAccessesAggressive++;
           return true;
         }
       }
     } // if GV
 
-  }// if GEP
-  /** H2: if all accesses to a certain alloca are in-bounds, skip instrumenting the alloca marking it with some metadataum */
+  } // if GEP
+  /** H2: if all accesses to a certain alloca are in-bounds, skip instrumenting
+   * the alloca marking it with some metadataum */
 
   return false;
 }
@@ -1705,7 +1733,6 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
     return false; // FIXME
 
   Instruction *I = O.getInsn();
-    
 
   // // BLOCKLISTING CORNER CASES
   // // 1. store { i64, i64 } zeroinitializer, ptr %fToCall.fsan.struct
@@ -2457,12 +2484,13 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   bool skipMemAccessInst = false;
   if (!F.hasFnAttribute(Attribute::SanitizeHWAddress)) {
-    return; 
+    return;
     // TODO: questo puzza di merda
     // auto FNNAME = F.getName().str();
-    // if(FNNAME.find("llvm.") != std::string::npos || FNNAME.find("__hwasan") != std::string::npos)
-    //   return; 
-    // // else 
+    // if(FNNAME.find("llvm.") != std::string::npos || FNNAME.find("__hwasan")
+    // != std::string::npos)
+    //   return;
+    // // else
     // skipMemAccessInst = true;
     // errs() << "[FSAN] Function " << F.getName()
     //        << " does not have the attribute 'sanitize_hwaddress', skipping "
@@ -2501,13 +2529,13 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       LandingPadVec.push_back(&Inst);
 
     getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
-    // mem ops must be trimmed BEFORE applying FSAN instrumentation otherwise situation gets complicated fast
-    // for(auto &MO : OperandsToInstrument) {
+    // mem ops must be trimmed BEFORE applying FSAN instrumentation otherwise
+    // situation gets complicated fast for(auto &MO : OperandsToInstrument) {
     //   if (canBeSkipped(MO, DL)) {
-    //     std::remove(OperandsToInstrument.begin(), OperandsToInstrument.end(), MO);
+    //     std::remove(OperandsToInstrument.begin(), OperandsToInstrument.end(),
+    //     MO);
     //   }
     // }
-    
 
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
       IntrinToInstrument.push_back(MI);
@@ -2638,7 +2666,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   DomTreeUpdater DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy);
   if (ClFSAN_memAccesses)
     for (auto &Operand : OperandsToInstrument)
-      if(!skipMemAccessInst)
+      if (!skipMemAccessInst)
         instrumentMemAccess(Operand, DTU, LI, DL);
   DTU.flush(); // TODO: does this have an interplay with optimizations?
 
@@ -2969,7 +2997,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
   }
 
   IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
-  Value* GEPLong = nullptr;
+  Value *GEPLong = nullptr;
   std::string endResultName = "";
   Value *taggedPointer = nullptr;
   uint64_t PTR_MASK = ((1ULL << PointerTagShift) - 1);
@@ -2997,7 +3025,8 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
       tag = performChecksOnGEP(GEPI);
 
     auto sonIsScalar =
-        !DstIsStruct && !DstType->isVectorTy() && !DstIsArrOfStructs && (!DstIsArray || DstIsArray && getArrayDimension(DstType) == 1);
+        !DstIsStruct && !DstType->isVectorTy() && !DstIsArrOfStructs &&
+        (!DstIsArray || DstIsArray && getArrayDimension(DstType) == 1);
     // 1D arrays are treated as a single field.
 
     if (tag) {
@@ -3008,10 +3037,10 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         ConstantInt *CI = dyn_cast<ConstantInt>(op2);
         idx = (uint64_t)CI->getZExtValue();
 
-        uint64_t IdxModuloT_MAX_CONST = (idx + 1) % T_MAX_CONST;
-        uint64_t IdxDivT_MAX_CONST = (idx + 1) / T_MAX_CONST;
-        uint64_t T = (IdxModuloT_MAX_CONST + IdxDivT_MAX_CONST);
-        T = T % T_MAX_CONST;
+        uint64_t IdxModuloT_MAX = (idx + 1) % T_MAX;
+        uint64_t IdxDivT_MAX = (idx + 1) / T_MAX;
+        uint64_t T = (IdxModuloT_MAX + IdxDivT_MAX);
+        T = T % T_MAX;
         if (T == 0ULL)
           T = 1;
 
@@ -3022,11 +3051,12 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         taggedPointer = IRB.CreateIntToPtr(GEPLongWithT, GEPI->getType());
         endResultName = GEPNAME + ".fsan.scalar";
       } // sonIsScalar
-      else if(DstIsArray && getArrayDimension(DstType) > 1){
+      else if (DstIsArray && getArrayDimension(DstType) > 1) {
         // set bit 5 in the tag
         Value *untagged = maskPointerIntrinsic(IRB, GEPI, PTR_MASK);
         GEPLong = IRB.CreatePtrToInt(untagged, IntptrTy);
-        Value *TBits_CONST = ConstantInt::get(IntptrTy, (1ULL << (PointerTagShift + 5))); // TODO: fix properly
+        Value *TBits_CONST = ConstantInt::get(
+            IntptrTy, (1ULL << (PointerTagShift + 5))); // TODO: fix properly
         Value *GEPLongWithT = IRB.CreateOr(GEPLong, TBits_CONST);
         taggedPointer = IRB.CreateIntToPtr(GEPLongWithT, GEPI->getType());
         endResultName = GEPNAME + ".fsan.array";
@@ -3039,156 +3069,130 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
       endResultName = GEPNAME + ".fsan.untagged";
     } // else tag
   } // SrcIsStruct
-  else{
+  else {
     // // SRC is not struct
     bool ThreeOpsGEP = nOperands == 3;
     bool TwoOpsGEP = nOperands == 2; // already decayed
-    if(SrcIsArray && DstIsArray && !SROA) {
+    if (SrcIsArray && DstIsArray && !SROA) {
       uint64_t NSrc = getArrayDimension(SrcType);
       uint64_t NDst = getArrayDimension(DstType);
 
-      bool arrayTraversal = NDst < NSrc && NDst > 0; // array indexing or decay, or incdec
+      bool arrayTraversal =
+          NDst < NSrc && NDst > 0; // array indexing or decay, or incdec
       bool isArrayOfScalars = !isArrayOfStructs(SrcType);
-if (isArrayOfScalars) {
-  errs() << "[FSAN] ARRAY GEP: " << *GEPI << "\n";
+      if (isArrayOfScalars) {
+        errs() << "[FSAN] ARRAY GEP: " << *GEPI << "\n";
+        const uint64_t ShiftAdjustment = TwoOpsGEP ? 1ULL : 2ULL;
+        assert(NSrc >= ShiftAdjustment && "Invalid NSrc for array GEP");
 
-  /*
-   * Compute the static position inside the tag.
-   *
-   * TwoOpsGEP:
-   *   operand 0 = pointer
-   *   operand 1 = index
-   *
-   * Otherwise:
-   *   operand 0 = pointer
-   *   operand 2 = relevant index
-   */
-  const uint64_t ShiftAdjustment = TwoOpsGEP ? 1ULL : 2ULL;
+        const uint64_t SHIFT = NSrc - ShiftAdjustment;
 
-  assert(NSrc >= ShiftAdjustment && "Invalid NSrc for array GEP");
+        /*
+         * The previous code checked SHIFT before recomputing it for TwoOpsGEP.
+         * That was wrong. Check the final SHIFT.
+         */
+        if (SHIFT >= TBits)
+          return;
 
-  const uint64_t SHIFT = NSrc - ShiftAdjustment;
+        const unsigned IndexOperand = TwoOpsGEP ? 1U : 2U;
 
-  /*
-   * The previous code checked SHIFT before recomputing it for TwoOpsGEP.
-   * That was wrong. Check the final SHIFT.
-   */
-  if (SHIFT >= TAG_BITS)
-    return;
+        assert(IndexOperand < GEPI->getNumOperands() &&
+               "Missing array GEP index operand");
 
-  const unsigned IndexOperand = TwoOpsGEP ? 1U : 2U;
+        Value *Index = GEPI->getOperand(IndexOperand);
+        auto *IndexTy = dyn_cast<IntegerType>(Index->getType());
 
-  assert(IndexOperand < GEPI->getNumOperands() &&
-         "Missing array GEP index operand");
+        if (!IndexTy) {
+          errs() << "[FSAN] Non-integer GEP index: " << *Index << "\n";
+          return;
+        }
 
-  Value *Index = GEPI->getOperand(IndexOperand);
-  auto *IndexTy = dyn_cast<IntegerType>(Index->getType());
+        auto *IntPtrITy = cast<IntegerType>(IntptrTy);
+        const unsigned PointerBits = IntPtrITy->getBitWidth();
 
-  if (!IndexTy) {
-    errs() << "[FSAN] Non-integer GEP index: " << *Index << "\n";
-    return;
-  }
+        /*
+         * For six-bit LAM:
+         *
+         *   PointerTagShift = 57
+         *   SHIFT           = 0..5
+         *   BitPosition     = 57..62
+         */
+        const uint64_t BitPosition = PointerTagShift + SHIFT;
 
-  auto *IntPtrITy = cast<IntegerType>(IntptrTy);
-  const unsigned PointerBits = IntPtrITy->getBitWidth();
+        if (BitPosition >= PointerBits) {
+          errs() << "[FSAN] Invalid tag-bit position: " << BitPosition
+                 << ", pointer width: " << PointerBits << "\n";
+          return;
+        }
 
-  /*
-   * For six-bit LAM:
-   *
-   *   PointerTagShift = 57
-   *   SHIFT           = 0..5
-   *   BitPosition     = 57..62
-   */
-  const uint64_t BitPosition = PointerTagShift + SHIFT;
+        /*
+         * Compute index parity at runtime:
+         *
+         *   even index -> 0
+         *   odd index  -> 1
+         *
+         * Using AND 1 works for both positive and negative LLVM integer
+         * bit patterns and preserves exactly the parity bit.
+         */
+        Value *ParityInIndexTy = IRB.CreateAnd(
+            Index, ConstantInt::get(IndexTy, 1), GEPNAME + ".fsan.parity");
 
-  if (BitPosition >= PointerBits) {
-    errs() << "[FSAN] Invalid tag-bit position: " << BitPosition
-           << ", pointer width: " << PointerBits << "\n";
-    return;
-  }
+        /*
+         * Convert the single parity bit to uintptr_t width before shifting it
+         * into the pointer tag.
+         */
+        Value *Parity = IRB.CreateZExtOrTrunc(ParityInIndexTy, IntPtrITy,
+                                              GEPNAME + ".fsan.parity.intptr");
 
-  /*
-   * Compute index parity at runtime:
-   *
-   *   even index -> 0
-   *   odd index  -> 1
-   *
-   * Using AND 1 works for both positive and negative LLVM integer
-   * bit patterns and preserves exactly the parity bit.
-   */
-  Value *ParityInIndexTy =
-      IRB.CreateAnd(Index, ConstantInt::get(IndexTy, 1),
-                    GEPNAME + ".fsan.parity");
+        Value *RuntimeTagBit =
+            IRB.CreateShl(Parity, BitPosition, GEPNAME + ".fsan.tagbit");
 
-  /*
-   * Convert the single parity bit to uintptr_t width before shifting it
-   * into the pointer tag.
-   */
-  Value *Parity =
-      IRB.CreateZExtOrTrunc(ParityInIndexTy, IntPtrITy,
-                            GEPNAME + ".fsan.parity.intptr");
+        /*
+         * Build:
+         *
+         *   ~(1 << BitPosition)
+         *
+         * using APInt, avoiding host-side 64-bit shift assumptions.
+         */
+        APInt ClearMask = APInt::getAllOnes(PointerBits);
+        ClearMask.clearBit(static_cast<unsigned>(BitPosition));
 
-  Value *RuntimeTagBit =
-      IRB.CreateShl(Parity, BitPosition,
-                    GEPNAME + ".fsan.tagbit");
+        GEPLong = IRB.CreatePtrToInt(GEPI, IntPtrITy, GEPNAME + ".fsan.ptrint");
 
-  /*
-   * Build:
-   *
-   *   ~(1 << BitPosition)
-   *
-   * using APInt, avoiding host-side 64-bit shift assumptions.
-   */
-  APInt ClearMask = APInt::getAllOnes(PointerBits);
-  ClearMask.clearBit(static_cast<unsigned>(BitPosition));
+        if (ThreeOpsGEP) {
+          Value *PointerWithBitCleared =
+              IRB.CreateAnd(GEPLong, ConstantInt::get(IntPtrITy, ClearMask),
+                            GEPNAME + ".fsan.clearbit");
+          Value *TaggedInteger = IRB.CreateOr(
+              PointerWithBitCleared, RuntimeTagBit, GEPNAME + ".fsan.setbit");
 
-  GEPLong =
-      IRB.CreatePtrToInt(GEPI, IntPtrITy,
-                         GEPNAME + ".fsan.ptrint");
+          taggedPointer = IRB.CreateIntToPtr(TaggedInteger, GEPI->getType(),
+                                             GEPNAME + ".fsan.tagged");
 
-  if(ThreeOpsGEP){
-    Value *PointerWithBitCleared =
-      IRB.CreateAnd(
-          GEPLong,
-          ConstantInt::get(IntPtrITy, ClearMask),
-          GEPNAME + ".fsan.clearbit");
-  Value *TaggedInteger =
-      IRB.CreateOr(PointerWithBitCleared, RuntimeTagBit,
-                   GEPNAME + ".fsan.setbit");
+        } else if (TwoOpsGEP) {
+          // because bits alternate in our pattern
+          Value *TaggedInteger =
+              IRB.CreateXor(GEPLong, RuntimeTagBit, GEPNAME + ".fsan.XOR");
 
-  taggedPointer =
-      IRB.CreateIntToPtr(TaggedInteger, GEPI->getType(),
-                         GEPNAME + ".fsan.tagged");
+          taggedPointer = IRB.CreateIntToPtr(TaggedInteger, GEPI->getType(),
+                                             GEPNAME + ".fsan.tagged");
+        }
 
-  }
-  else if (TwoOpsGEP){
-    // because bits alternate in our pattern
-    Value *TaggedInteger =
-      IRB.CreateXor(GEPLong, RuntimeTagBit,
-                   GEPNAME + ".fsan.XOR");
-
-  taggedPointer =
-      IRB.CreateIntToPtr(TaggedInteger, GEPI->getType(),
-                         GEPNAME + ".fsan.tagged");
-  }
-  
-  // errs() << "[FSAN] ARRAY GEP: " << *GEPI
-  //        << "\n\tNSrc: " << NSrc
-  //        << "\n\tNDst: " << NDst
-  //        << "\n\tSHIFT: " << SHIFT
-  //        << "\n\tBitPosition: " << BitPosition
-  //        << "\n\tIndex: " << *Index
-  //        << "\n\tParity: " << *ParityInIndexTy
-  //        << "\n\tRuntimeTagBit: " << *RuntimeTagBit
-  //        << "\n\tTaggedPointer: " << *taggedPointer
-  //        << "\n";
-  assert(taggedPointer != nullptr && "TAGGED POINTER");
-  endResultName =
-      GEPNAME + ".fsan.array" +
-      (arrayTraversal ? ".traversal" : ".decay");
-}// array of scalars
+        // errs() << "[FSAN] ARRAY GEP: " << *GEPI
+        //        << "\n\tNSrc: " << NSrc
+        //        << "\n\tNDst: " << NDst
+        //        << "\n\tSHIFT: " << SHIFT
+        //        << "\n\tBitPosition: " << BitPosition
+        //        << "\n\tIndex: " << *Index
+        //        << "\n\tParity: " << *ParityInIndexTy
+        //        << "\n\tRuntimeTagBit: " << *RuntimeTagBit
+        //        << "\n\tTaggedPointer: " << *taggedPointer
+        //        << "\n";
+        assert(taggedPointer != nullptr && "TAGGED POINTER");
+        endResultName = GEPNAME + ".fsan.array" +
+                        (arrayTraversal ? ".traversal" : ".decay");
+      } // array of scalars
     }
-
   }
 
   if (!taggedPointer) {
@@ -3198,7 +3202,7 @@ if (isArrayOfScalars) {
   assert(taggedPointer->isPointerTy() &&
          "Tagged pointer must be of pointer type");
   taggedPointer->setName(endResultName);
-
+  
   GEPI->replaceUsesWithIf(
       taggedPointer, [GEPI, DstType, GEPLong](const Use &U) {
         auto *User = U.getUser();
@@ -3445,10 +3449,10 @@ void HWAddressSanitizer::InstrumentGEP_L(GetElementPtrInst *GEPI) {
         uint64_t T = -1;
         ConstantInt *CI = dyn_cast<ConstantInt>(op2);
         idx = (uint64_t)CI->getZExtValue();
-        uint64_t IdxModuloT_MAX_CONST = (idx + 1) % T_MAX_CONST;
-        uint64_t IdxDivT_MAX_CONST = (idx + 1) / T_MAX_CONST;
-        T = (IdxModuloT_MAX_CONST + IdxDivT_MAX_CONST);
-        T = T % T_MAX_CONST;
+        uint64_t IdxModuloT_MAX = (idx + 1) % T_MAX;
+        uint64_t IdxDivT_MAX = (idx + 1) / T_MAX;
+        T = (IdxModuloT_MAX + IdxDivT_MAX);
+        T = T % T_MAX;
         if (T == 0)
           T = 1;
         // SET T, preserve L, remove R

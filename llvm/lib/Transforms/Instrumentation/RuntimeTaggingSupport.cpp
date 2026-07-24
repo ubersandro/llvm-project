@@ -22,20 +22,17 @@ static cl::opt<bool> clFSAN_SKIP_ANON_STRUCTS(
 
 static cl::opt<bool> clFSAN_DEPTH_AWARE_TAGGING(
     "fsan-depth-aware-tagging",
-    cl::desc("Enable depth-aware tagging for nested structures"),
-    cl::Hidden, cl::init(false));
+    cl::desc("Enable depth-aware tagging for nested structures"), cl::Hidden,
+    cl::init(false));
 namespace RuntimeTaggingSupport {
 #if defined(__x86_64__)
 uint64_t TBits = 3;
-uint64_t LBits = 3;
+uint64_t LBits = 2;
+#else
+// TODO
+#endif
 uint64_t L_MAX = (1ULL << LBits);
 uint64_t T_MAX = (1ULL << TBits); // 0b100000
-#else
-uint64_t TBits = 5;
-uint64_t LBits = 2;
-int L_MAX = (1ULL << LBits);
-uint64_t T_MAX = (1ULL << TBits); // 0b100000
-#endif
 
 __attribute__((noinline)) void createTagVector(StructType *ST, Module &M,
                                                int depth) {
@@ -152,7 +149,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
   std::deque<std::tuple<Type *, uint8_t, int, uint64_t, uint64_t>> AggQueue;
   auto FieldsOffsets = DL.getStructLayout(Ty)->getMemberOffsets();
 
-  uint8_t fatherT = 0;                 /* unused */
+  uint8_t fatherT = 0; /* unused */
   // int fatherL = (depth & (L_MAX - 1)); // modulo L_MAX --> level-aware
   int fatherL = 0; // NO L
   uint64_t sonIdx = 1;
@@ -230,13 +227,13 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
     }
     if (CurFieldStructType != nullptr && !CurFieldIsLiteral &&
         !CurFieldIsUnion && !CurFieldIsBlockListedStruct) {
-      
+
       int Count = 0;
       // auto ContainedSubTypes = CurFieldType->getNumContainedTypes();
 
       auto ContainedSubTyOffsets =
           DL.getStructLayout(CurFieldStructType)->getMemberOffsets();
-        auto ContainedSubTypes = CurFieldStructType->getNumElements();
+      auto ContainedSubTypes = CurFieldStructType->getNumElements();
       size_t CurContainedSubTy = 0;
       // for struct types, we go one level deeper
       // auto NextL = (fatherL + 1) & (L_MAX - 1); // modulo L_MAX
@@ -267,8 +264,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         Elements *= CurArrayType->getNumElements();
         ArrayDims++;
       }
-      int OverallDepth =
-          (ArrayDims + fatherL) & (L_MAX - 1); // as a struct member, level is already +1
+      int OverallDepth = (ArrayDims + fatherL) &
+                         (L_MAX - 1); // as a struct member, level is already +1
       // check type
       if (ElemType->isStructTy()) {
         // retrieve or create tag vector for struct type
@@ -278,7 +275,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         size_t ElemStructSize = DL.getTypeAllocSize(ElemStructType);
         OverallDepth = 0; // NO L
         auto *TagVector =
-            RetrieveOrCreateTagVector(ElemStructType, M, OverallDepth+1);
+            RetrieveOrCreateTagVector(ElemStructType, M, OverallDepth + 1);
         assert(TagVector && "Failed to retrieve or create tag vector for "
                             "struct element type.");
         GlobalVariable *TVGV = dyn_cast<GlobalVariable>(TagVector);
@@ -309,49 +306,57 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         uint8_t Tag = T;
         // if it's monodimensional, we tag it with T
         if (ArrayDims == 1) {
-          for (uint64_t idx = 0; idx < OuterArrayType->getNumElements(); idx++) {
+          for (uint64_t idx = 0; idx < OuterArrayType->getNumElements();
+               idx++) {
             auto el = OuterArrayType->getElementType();
             auto Offset = CurFieldOffset + idx * DL.getTypeAllocSize(el);
             memset(&Tags[Offset], Tag, DL.getTypeAllocSize(el));
           }
-        }// if ArrayDims == 1
+        } // if ArrayDims == 1
 
-        else{
-          std::deque<std::tuple<Type * /*EL*/, uint64_t /*L_TMP*/, uint64_t /*offset inside tag vector*/, uint64_t /*cur dim */, uint64_t /*cur arr idx */>> Stack;
-          for(uint64_t idx=0; idx<OuterArrayType->getNumElements(); idx++){
+        else {
+          std::deque<
+              std::tuple<Type * /*EL*/, uint64_t /*L_TMP*/,
+                         uint64_t /*offset inside tag vector*/,
+                         uint64_t /*cur dim */, uint64_t /*cur arr idx */>>
+              Stack;
+          for (uint64_t idx = 0; idx < OuterArrayType->getNumElements();
+               idx++) {
             auto el = OuterArrayType->getElementType();
             auto Offset = CurFieldOffset + idx * DL.getTypeAllocSize(el);
             uint64_t T_TMP = -1;
             uint64_t bit = idx % 2;
             // T_TMP = 1ULL<<5 | (bit << (ArrayDims - 1));
-            T_TMP = 1ULL<<5;
+            T_TMP = 1ULL << 5;
 
-            Stack.push_back(std::make_tuple(el, T_TMP, Offset, ArrayDims-1, idx));
+            Stack.push_back(
+                std::make_tuple(el, T_TMP, Offset, ArrayDims - 1, idx));
           }
 
-        
+          while (!Stack.empty()) {
+            auto [EL, T_TMP, Offset, Depth, IDX] = Stack.back();
+            Stack.pop_back();
 
-        while(!Stack.empty()){
-          auto [EL, T_TMP, Offset, Depth, IDX] = Stack.back();
-          Stack.pop_back();
+            if (EL->isArrayTy()) {
+              auto *ArrTy = dyn_cast<ArrayType>(EL);
+              auto *ElemTy = ArrTy->getArrayElementType();
+              uint64_t NumElems = ArrTy->getNumElements();
 
-          if(EL->isArrayTy()){
-            auto *ArrTy = dyn_cast<ArrayType>(EL);
-            auto *ElemTy = ArrTy->getArrayElementType();
-            uint64_t NumElems = ArrTy->getNumElements();
-
-            for(uint64_t idx=0; idx<NumElems; idx++){
+              for (uint64_t idx = 0; idx < NumElems; idx++) {
                 uint64_t T_TMP_NEW = T_TMP | ((IDX % 2) << (Depth - 1));
-                Stack.push_back(std::make_tuple(ElemTy, T_TMP_NEW, Offset + idx * DL.getTypeAllocSize(ElemTy), Depth-1, idx));
-            }// for 
-          } // if element is array 
-          else {
-            // arrays of depth 1 have same tag for all elems
-            Tag = T_TMP;
-            memset(&Tags[Offset], Tag, DL.getTypeAllocSize(EL));
-          }// else
-        }// while
-      }// array dims > 1
+                Stack.push_back(
+                    std::make_tuple(ElemTy, T_TMP_NEW,
+                                    Offset + idx * DL.getTypeAllocSize(ElemTy),
+                                    Depth - 1, idx));
+              } // for
+            } // if element is array
+            else {
+              // arrays of depth 1 have same tag for all elems
+              Tag = T_TMP;
+              memset(&Tags[Offset], Tag, DL.getTypeAllocSize(EL));
+            } // else
+          } // while
+        } // array dims > 1
         auto *arrTy = dyn_cast<ArrayType>(CurFieldType);
         auto ArrayFieldElems = arrTy->getNumElements();
 

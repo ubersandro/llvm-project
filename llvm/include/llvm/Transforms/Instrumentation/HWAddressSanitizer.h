@@ -75,18 +75,16 @@ namespace llvm {
 class Module;
 class StringRef;
 class raw_ostream;
-#if defined(__x86_64__)
-#define T_MAX_CONST (1ULL << 3);
-#define T_BITS 3ULL
-#define L_BITS 2ULL // use ALL bits
-#define TAG_BITS 5ULL
+// #if defined(__x86_64__)
+// #define T_MAX_CONST (1ULL << 3);
+// #define T_BITS 3ULL
+// #define L_BITS 2ULL // use ALL bits
+// #define TAG_BITS 5ULL
 
-#elif defined(__aarch64__)
-#define T_MAX_CONST (1ULL << 5);
-#define T_BITS 5ULL
-#define T_BITS 2ULL
-
-#endif
+// #elif defined(__aarch64__)
+// #define T_MAX_CONST (1ULL << 5);
+// // TODO TODO TODO
+// #endif
 
 struct HWAddressSanitizerOptions {
   HWAddressSanitizerOptions()
@@ -201,10 +199,14 @@ private:
 
 // FieldArmor addenda
 #if defined(__aarch64__)
-  u_int64_t RPTag = 0x1UL << 7;
+  // TODO
 #else
-  u_int64_t RPTag = 0x1UL << 5;
+  uint64_t LBits = 2ULL;
+  uint64_t TBits = 3ULL;
 #endif
+  uint64_t L_MAX = (1ULL << LBits);
+  uint64_t T_MAX = (1ULL << TBits);
+  u_int64_t RPTag = 0x1UL << (TBits + LBits);
 
   void InstrumentGEP_L(GetElementPtrInst *GEPI);
   void InstrumentGEP_NoL(GetElementPtrInst *GEPI); /** for later */
@@ -383,10 +385,6 @@ private:
   uint64_t LMask;
   uint64_t TMask;
   uint64_t RMask;
-
-  unsigned TBits;
-  unsigned LBits;
-  unsigned L_MAX;
 
   uint64_t TagMaskByte;
 
