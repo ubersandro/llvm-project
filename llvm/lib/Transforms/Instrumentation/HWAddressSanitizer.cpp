@@ -1572,12 +1572,12 @@ int computeMemoryAccessSize(Instruction *I, const DataLayout &DL) {
   return -1;
 }
 
-bool HWAddressSanitizer::isAccessToVPtr(InterestingMemoryOperand &O,
-                                        const DataLayout &DL) {
-  // These accesses should not be instrumented since they are completely
-  // compiler managed.
-  return false;
-}
+// bool HWAddressSanitizer::isAccessToVPtr(InterestingMemoryOperand &O,
+//                                         const DataLayout &DL) {
+//   // These accesses should not be instrumented since they are completely
+//   // compiler managed.
+//   return false;
+// }
 
 // access to a global/local statically allocated scalar var
 bool HWAddressSanitizer::isAccessToScalar(InterestingMemoryOperand &O,
@@ -1596,54 +1596,113 @@ bool HWAddressSanitizer::isAccessToScalar(InterestingMemoryOperand &O,
     SkippedMemAccesses++;
   return ret;
 }
+Type *HWAddressSanitizer::extractTypeFromTypedAllocatorOrNew(CallBase *CI) {
+  auto nArgs = CI->arg_size();
+  for (int i = 0; i < nArgs; i++) {
+    auto arg = CI->getArgOperand(i);
+    // stop when you find an arg called typeName
+    auto argName = CI->getArgOperand(i)->getName();
+    if (argName == "typeName") {
+      errs() << "[FSAN] Found typeName arg: " << *arg << "\n";
+      if (ConstantDataArray *CDA = dyn_cast<ConstantDataArray>(arg)) {
+        if (CDA->isString()) {
+          auto typeName = CDA->getAsString();
+          errs() << "[FSAN] Extracted typeName: " << typeName << "\n";
+        }
+      } // if CDA
+      else
+        assert(false && "typeName arg is not a ConstantDataArray");
+    }
+  }
+  return nullptr;
+}
+// TODO: getUnderlyingMemoryType(Instruction*I, const DataLayout &DL)
+
+Type *HWAddressSanitizer::extractUnderlyingMemType(Value *I,
+                                                   const DataLayout &DL) {
+  Type *BaseTY = nullptr;
+  if (AllocaInst *AI = dyn_cast<AllocaInst>(I)) {
+    BaseTY = AI->getAllocatedType();
+  } else if (GlobalVariable *GV = dyn_cast<GlobalVariable>(I)) {
+    BaseTY = GV->getValueType();
+  }
+  // TODO: heap
+  else if (CallBase *CI = dyn_cast<CallInst>(I)) {
+    if (IsTypedAllocator(CI) || IsTypedNew(CI)) {
+      BaseTY = extractTypeFromTypedAllocatorOrNew(CI); // TODO
+    }
+  }
+  return BaseTY;
+}
 
 bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
                                       const DataLayout &DL) {
   // NOTE: we care about accesses to N-D scalar arrays, structs/classes and
   // their aggregates. All the rest is out-of-scope.
-  bool scalar = isAccessToScalar(O.getInsn(), DL);
+  bool scalar = isAccessToScalar(O, DL);
   if (scalar)
     return true;
-
   Type *BaseTY = nullptr; // base type modulo all the GEPs.
-  Value* OffsetIntoBaseTY = nullptr; // TODO: for each access, compute offset. If offset fully static, check safety based on UNDERLYING memory type. If safe, skip instrumentation. 
-
+  Value *OffsetIntoBaseTY =
+      nullptr; // TODO: for each access, compute offset. If offset fully static,
+               // check safety based on UNDERLYING memory type. If safe, skip
+               // instrumentation.
+  SmallVector<Value *, 4> GEPChain;
   if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(O.getPtr())) {
-    GetElementrPtrInst *tmp = GEP;
+    GetElementPtrInst *tmp = GEP, *prev = GEP;
     while (tmp != nullptr) {
+      GEPChain.push_back(tmp);
+      prev = tmp;
       tmp = dyn_cast<GetElementPtrInst>(tmp->getPointerOperand());
     }
-    bool LocalOrGlobalVar = dyn_cast<AllocaInst>(tmp->getPointerOperand()) ||
-                            dyn_cast<GlobalVariable>(tmp->getPointerOperand());
-    if (!LocalOrGlobalVar)
+    tmp = prev;
+
+    bool LocalOrGlobalVarOrDynAlloc =
+        dyn_cast<AllocaInst>(tmp->getPointerOperand()) ||
+        dyn_cast<GlobalVariable>(tmp->getPointerOperand()) ||
+        dyn_cast<CallBase>(tmp->getPointerOperand());
+    if (!LocalOrGlobalVarOrDynAlloc)
       // DONT SKIP, could be function arg, loaded from memory, etc.
       return false;
 
-    if (AllocaInst *AI = dyn_cast<AllocaInst>(tmp->getPointerOperand())) {
-      BaseTY = AI->getAllocatedType();
-    } else if (GlobalVariable *GV =
-                   dyn_cast<GlobalVariable>(tmp->getPointerOperand())) {
-      BaseTY = GV->getValueType();
-    }
-    // TODO: heap
+    BaseTY = extractUnderlyingMemType(tmp->getPointerOperand(), DL);
   } // if GEP
+  // TODO: implement else
 
   if (!BaseTY) {
     // TODO: check on these
+
+    // RULES:
+    // if it's unknown, instrument
+    // if it's pointer passed to function, instrument
+    // if it's loaded from memory, instrument
     errs() << "[FSAN] BaseTY nullptr: " << *O.getInsn()
            << "\n\t OP: " << *O.getPtr() << "\n";
     return false;
   }
+  // TODO: dump chain of GEPs
+  size_t ChainLen = 0;
+  std::string GEPChainStr;
 
-  // at this point, it's a GEP into either a local or global variable.
-  bool isStructArray = BaseTY->isArray() && isArrayOfStructs(BaseTY);
-  bool isStructOrArrayOfStructs = BaseTy->isStructTy() || isStructArray;
+  {
+    raw_string_ostream OS(GEPChainStr);
+
+    // OS << "CHAIN\n\t";
+    for (const auto *GEP : GEPChain)
+      OS << ChainLen++ << ": " << *GEP << "\n\t";
+
+    OS << '\n';
+  } // raw_string_ostream flushes into GEPChainStr
+
+  bool isStructArray = BaseTY->isArrayTy() && isArrayOfStructs(BaseTY);
+  bool isStructOrArrayOfStructs = BaseTY->isStructTy() || isStructArray;
 
   bool ShouldSkipStruct =
       BaseTY->isStructTy() &&
-      (BaseTY->isLiteral() ||
-       (BaseTY->hasName() && BaseTY->getName().startswith("union.")));
-  if (ShoulSkipStruct) {
+      (dyn_cast<StructType>(BaseTY)->isLiteral() ||
+       (dyn_cast<StructType>(BaseTY)->hasName() &&
+        dyn_cast<StructType>(BaseTY)->getStructName().starts_with("union.")));
+  if (ShouldSkipStruct) {
     // it's a struct or an array of structs, but it's a literal/anonymous/union
     // struct.
     SkippedMemAccessesAggressive++;
@@ -1651,132 +1710,65 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
   }
 
   bool isNDArrayOfScalars =
-      BaseTy->isArray() && !isStructArray &&
-      dyn_cast<ArrayType>(BaseTy)->getElementType()->isArrayTy();
+      BaseTY->isArrayTy() && !isStructArray &&
+      dyn_cast<ArrayType>(BaseTY)->getElementType()->isArrayTy();
+
+  // DO NOT SKIP THESE FOR NOW
+  if (isNDArrayOfScalars)
+    return false;
 
   // at this point, it's an access to an aggregate. If the aggregate is a
   // struct/class (array), we instrument it only if NOT literal/anonymous/union.
   // If it is scalar aggregate, we instrument it only if it's not N-D array of
   // scalars.
 
-  // if it's unknown, instrument
-  // if it's pointer passed to function, instrument
-  // if it's loaded from memory, instrument
+  // if (!ClFSAN_AggressiveTrimmer)
+  //   return false;
 
-  if (!ClFSAN_AggressiveTrimmer)
+  // TODO: extend to chain of GEPs
+  if(ChainLen == 0 || ChainLen > 1)
     return false;
-    
   if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(O.getPtr())) {
-    /** H1: FILTER OUT WHATEVER IS NOT STRUCT FOR SURE */
-
-    // H1.a = ALLOCAs
-    if (AllocaInst *AI = dyn_cast<AllocaInst>(GEP->getPointerOperand())) {
-      Type *AllocatedType = AI->getAllocatedType();
-      if (!AllocatedType->isStructTy() ||
-          (AllocatedType->isArrayTy() && !isArrayOfStructs(AllocatedType))) {
-        // RULE1: skip GEPs into ALLOCAs of non-struct types
-        errs() << "[FSAN] SKIP " << *O.getInsn()
-               << ", NON-STRUCT GEP: " << *AllocatedType << "\n";
-        SkippedMemAccessesAggressive++;
-        return true;
-      } // if is struct
-    } // if AllocaInst
-
-    // H1.b = GLOBALS
-    if (GlobalVariable *GV =
-            dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {
-      Type *AllocatedType = GV->getValueType();
-      if (!AllocatedType->isStructTy() ||
-          (AllocatedType->isArrayTy() && !isArrayOfStructs(AllocatedType))) {
-        // RULE1: skip GEPs into GLOBALs of non-struct types
-        errs() << "[FSAN] GV SKIP " << *O.getInsn()
-               << ", NON-STRUCT GEP: " << *AllocatedType << "\n";
-        SkippedMemAccessesAggressive++;
-        return true;
-      } // if is struct
-    } // if GlobalVariable
-
-    // H2: some GEPs are just in bound based on the type of the underlying
-    // memory (Globals, Allocas only). Instrumenting a memory access when the
-    // check will succeed 100% is redundant. H2.a = ALLOCAs
-    if (AllocaInst *AI = dyn_cast<AllocaInst>(GEP->getPointerOperand())) {
-      auto UnderlyingMemTy = dyn_cast<StructType>(
-          AI->getAllocatedType()); // discard arrays for now
-      if (!UnderlyingMemTy)
-        return false;
-
+    // NOTE : this only skips accesses on the structs.
+    if (StructType *ST = dyn_cast<StructType>(BaseTY)) {
       auto nOperandsGEP = GEP->getNumOperands();
       if (nOperandsGEP != 3)
         return false;
       if (ConstantInt *IDX = dyn_cast<ConstantInt>(GEP->getOperand(2))) {
         auto idxVal = IDX->getZExtValue();
-        if (idxVal >= UnderlyingMemTy->getNumElements())
+        if (idxVal >= ST->getNumElements())
           return false; // out of bounds?
-        auto TypeOfFieldAtIdx = UnderlyingMemTy->getElementType(idxVal);
-        if (TypeOfFieldAtIdx->isAggregateType())
-          return false; // TODO: this is a case for later
-
-        auto SizeOfTypeOfFieldAtIdx =
-            DL.getTypeSizeInBits(TypeOfFieldAtIdx); // in BYTES
-        // errs() << "[FSAN-DBG] ACCESS: " << *O.getInsn() << "\n\tGEP into
-        // ALLOCA: " << *UnderlyingMemTy << ", field idx: " << idxVal << ",
-        // field type: " << *TypeOfFieldAtIdx << ", field size " <<
-        // SizeOfTypeOfFieldAtIdx << "\n";
-        auto SizeOfTheMemOp = computeMemoryAccessSize(O.getInsn(), DL);
-        // NOTE: LT because we account for unions.
-        if (SizeOfTypeOfFieldAtIdx >= SizeOfTheMemOp) {
-          errs() << "[FSAN] SKIP " << *O.getInsn()
-                 << ", trivial check on GEP into ALLOCA: " << *UnderlyingMemTy
-                 << ", field idx: " << idxVal
-                 << ", field type: " << *TypeOfFieldAtIdx
-                 << ", field size: " << SizeOfTypeOfFieldAtIdx
-                 << ", access size: " << SizeOfTheMemOp << "\n";
-          SkippedMemAccessesAggressive++;
-          return true;
+        auto TypeOfFieldAtIdx = ST->getElementType(idxVal);
+        if (TypeOfFieldAtIdx->isAggregateType()) {
+          // TODO: more opportunities for optimization on UNIONS, ARRAYS
+          errs() << "\t ACC TO AGG " << *O.getInsn() << "\n\tGEP: " << *ST
+                 << "\n\tfield idx: " << idxVal
+                 << "\n\tfield type: " << *TypeOfFieldAtIdx << "\n";
+          return false;
         }
-      }
-    } // if AllocaInst
-
-    // CASE H2.b = GLOBALs
-    if (GlobalVariable *GV =
-            dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {
-      auto UnderlyingMemTy =
-          dyn_cast<StructType>(GV->getValueType()); // discard arrays for now
-      if (!UnderlyingMemTy)
-        return false;
-
-      auto nOperandsGEP = GEP->getNumOperands();
-      if (nOperandsGEP != 3)
-        return false;
-      if (ConstantInt *IDX = dyn_cast<ConstantInt>(GEP->getOperand(2))) {
-        auto idxVal = IDX->getZExtValue();
-        if (idxVal >= UnderlyingMemTy->getNumElements())
-          return false; // out of bounds?
-        auto TypeOfFieldAtIdx = UnderlyingMemTy->getElementType(idxVal);
-        if (TypeOfFieldAtIdx->isAggregateType())
-          return false; // TODO: this is a case for later
 
         auto SizeOfTypeOfFieldAtIdx =
             DL.getTypeSizeInBits(TypeOfFieldAtIdx); // in BYTES
         auto SizeOfTheMemOp = computeMemoryAccessSize(O.getInsn(), DL);
         // NOTE: LT because we account for unions.
         if (SizeOfTypeOfFieldAtIdx >= SizeOfTheMemOp) {
-          errs() << "[FSAN] SKIP " << *O.getInsn()
-                 << ", trivial check on GEP into GV: " << *UnderlyingMemTy
-                 << ", field idx: " << idxVal
-                 << ", field type: " << *TypeOfFieldAtIdx
-                 << ", field size: " << SizeOfTypeOfFieldAtIdx
-                 << ", access size: " << SizeOfTheMemOp << "\n";
           SkippedMemAccessesAggressive++;
-          return true;
-        }
-      }
-    } // if GV
+          errs() << "[FSAN] Skipping instrumentation of access to struct field "
+                    "of size >= memaccess size: "
+                 << *O.getInsn() << "\n\tGEP: " << *GEP
+                 << "\n\tfield idx: " << idxVal
+                 << "\n\tfield type: " << *TypeOfFieldAtIdx
+                 << "\n\tfield size: " << SizeOfTypeOfFieldAtIdx
+                 << "\n\tmemaccess size: " << SizeOfTheMemOp
+                 << "\n\tGEPChain: " << GEPChainStr
+                 << "\n\tBaseTY: " << *BaseTY << "\n\tOP: " << *O.getPtr()
+                 << '\n';
 
+          return true;
+        } // if SizeOfTypeOfFieldAtId
+      } // ConstantIdx GEP
+    } // if it's struct
   } // if GEP
-  /** H2: if all accesses to a certain alloca are in-bounds, skip instrumenting
-   * the alloca marking it with some metadataum */
-
   return false;
 }
 
@@ -2565,8 +2557,6 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       LandingPadVec.push_back(&Inst);
 
     getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
-    errs() << "[FSAN] FUNC: " << F.getName()
-           << " # MEM ACCESSES: " << OperandsToInstrument.size() << " \n";
 
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
       IntrinToInstrument.push_back(MI);
@@ -2605,7 +2595,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     }
   }
   memtag::StackInfo &SInfo = SIB.get();
-
+  errs() << "[FSAN] FUNC: " << F.getName() << " # MEM ACC "
+         << OperandsToInstrument.size() << "\n";
   initializeCallbacks(*F.getParent());
 
   if (!LandingPadVec.empty())

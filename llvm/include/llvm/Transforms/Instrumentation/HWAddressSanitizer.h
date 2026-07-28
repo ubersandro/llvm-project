@@ -208,6 +208,8 @@ private:
   uint64_t T_MAX = (1ULL << TBits);
   u_int64_t RPTag = 0x1UL << (TBits + LBits);
   bool isAccessToScalar(InterestingMemoryOperand &O, const DataLayout &DL);
+  Type *extractTypeFromTypedAllocatorOrNew(CallBase *CI);
+  Type *extractUnderlyingMemType(Value *I, const DataLayout &DL);
 
   void InstrumentGEP_L(GetElementPtrInst *GEPI);
   void InstrumentGEP_NoL(GetElementPtrInst *GEPI); /** for later */
