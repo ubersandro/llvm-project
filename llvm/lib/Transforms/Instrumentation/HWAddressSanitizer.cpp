@@ -1572,41 +1572,100 @@ int computeMemoryAccessSize(Instruction *I, const DataLayout &DL) {
   return -1;
 }
 
-bool isGEPIntoVPtr(Value *Operand) {
-  if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Operand))
-    if (StructType *ST = dyn_cast<StructType>(GEP->getSourceElementType())) {
-      
-    }
+bool HWAddressSanitizer::isAccessToVPtr(InterestingMemoryOperand &O,
+                                        const DataLayout &DL) {
+  // These accesses should not be instrumented since they are completely
+  // compiler managed.
   return false;
+}
+
+// access to a global/local statically allocated scalar var
+bool HWAddressSanitizer::isAccessToScalar(InterestingMemoryOperand &O,
+                                          const DataLayout &DL) {
+  Type *TY = nullptr;
+  bool ret = false;
+  if (AllocaInst *AI = dyn_cast<AllocaInst>(O.getPtr())) {
+    TY = AI->getAllocatedType();
+    ret = !TY->isAggregateType();
+  } // it's alloca
+
+  if (GlobalVariable *GV = dyn_cast<GlobalVariable>(O.getPtr()))
+    if (!GV->getMetadata("fsan.instrument"))
+      ret = true;
+  if (ret)
+    SkippedMemAccesses++;
+  return ret;
 }
 
 bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
                                       const DataLayout &DL) {
-  // TODO: debug, might be removing too many checks
+  // NOTE: we care about accesses to N-D scalar arrays, structs/classes and
+  // their aggregates. All the rest is out-of-scope.
+  bool scalar = isAccessToScalar(O.getInsn(), DL);
+  if (scalar)
+    return true;
 
-  // TODO: skip checks on accesses to GEPs to the vptr of a Cpp object. BOTH R
-  // AND W.
+  Type *BaseTY = nullptr; // base type modulo all the GEPs.
+  Value* OffsetIntoBaseTY = nullptr; // TODO: for each access, compute offset. If offset fully static, check safety based on UNDERLYING memory type. If safe, skip instrumentation. 
 
-  // TODO:
-  if (AllocaInst *AI = dyn_cast<AllocaInst>(O.getPtr())) {
-    if (AI->getAllocatedType()->isPointerTy() ||
-        AI->getAllocatedType()->isIntegerTy() ||
-        AI->getAllocatedType()->isFloatingPointTy() ||
-        (AI->getAllocatedType()->isArrayTy() &&
-         !isArrayOfStructs(AI->getAllocatedType()))) {
-      SkippedMemAccesses++;
-      return true;
+  if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(O.getPtr())) {
+    GetElementrPtrInst *tmp = GEP;
+    while (tmp != nullptr) {
+      tmp = dyn_cast<GetElementPtrInst>(tmp->getPointerOperand());
     }
-  } // it's alloca
-  // skip on globals with no "instrument" metadata
-  if (GlobalVariable *GV = dyn_cast<GlobalVariable>(O.getPtr())) {
-    if (!GV->getMetadata("fsan.instrument")) {
-      SkippedMemAccesses++;
-      return true;
+    bool LocalOrGlobalVar = dyn_cast<AllocaInst>(tmp->getPointerOperand()) ||
+                            dyn_cast<GlobalVariable>(tmp->getPointerOperand());
+    if (!LocalOrGlobalVar)
+      // DONT SKIP, could be function arg, loaded from memory, etc.
+      return false;
+
+    if (AllocaInst *AI = dyn_cast<AllocaInst>(tmp->getPointerOperand())) {
+      BaseTY = AI->getAllocatedType();
+    } else if (GlobalVariable *GV =
+                   dyn_cast<GlobalVariable>(tmp->getPointerOperand())) {
+      BaseTY = GV->getValueType();
     }
+    // TODO: heap
+  } // if GEP
+
+  if (!BaseTY) {
+    // TODO: check on these
+    errs() << "[FSAN] BaseTY nullptr: " << *O.getInsn()
+           << "\n\t OP: " << *O.getPtr() << "\n";
+    return false;
   }
+
+  // at this point, it's a GEP into either a local or global variable.
+  bool isStructArray = BaseTY->isArray() && isArrayOfStructs(BaseTY);
+  bool isStructOrArrayOfStructs = BaseTy->isStructTy() || isStructArray;
+
+  bool ShouldSkipStruct =
+      BaseTY->isStructTy() &&
+      (BaseTY->isLiteral() ||
+       (BaseTY->hasName() && BaseTY->getName().startswith("union.")));
+  if (ShoulSkipStruct) {
+    // it's a struct or an array of structs, but it's a literal/anonymous/union
+    // struct.
+    SkippedMemAccessesAggressive++;
+    return true;
+  }
+
+  bool isNDArrayOfScalars =
+      BaseTy->isArray() && !isStructArray &&
+      dyn_cast<ArrayType>(BaseTy)->getElementType()->isArrayTy();
+
+  // at this point, it's an access to an aggregate. If the aggregate is a
+  // struct/class (array), we instrument it only if NOT literal/anonymous/union.
+  // If it is scalar aggregate, we instrument it only if it's not N-D array of
+  // scalars.
+
+  // if it's unknown, instrument
+  // if it's pointer passed to function, instrument
+  // if it's loaded from memory, instrument
+
   if (!ClFSAN_AggressiveTrimmer)
     return false;
+    
   if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(O.getPtr())) {
     /** H1: FILTER OUT WHATEVER IS NOT STRUCT FOR SURE */
 
@@ -2506,13 +2565,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
       LandingPadVec.push_back(&Inst);
 
     getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
-    // mem ops must be trimmed BEFORE applying FSAN instrumentation otherwise
-    // situation gets complicated fast for(auto &MO : OperandsToInstrument) {
-    //   if (canBeSkipped(MO, DL)) {
-    //     std::remove(OperandsToInstrument.begin(), OperandsToInstrument.end(),
-    //     MO);
-    //   }
-    // }
+    errs() << "[FSAN] FUNC: " << F.getName()
+           << " # MEM ACCESSES: " << OperandsToInstrument.size() << " \n";
 
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
       IntrinToInstrument.push_back(MI);

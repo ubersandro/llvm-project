@@ -207,6 +207,7 @@ private:
   uint64_t L_MAX = (1ULL << LBits);
   uint64_t T_MAX = (1ULL << TBits);
   u_int64_t RPTag = 0x1UL << (TBits + LBits);
+  bool isAccessToScalar(InterestingMemoryOperand &O, const DataLayout &DL);
 
   void InstrumentGEP_L(GetElementPtrInst *GEPI);
   void InstrumentGEP_NoL(GetElementPtrInst *GEPI); /** for later */
@@ -272,7 +273,8 @@ private:
       const TargetLibraryInfo &TLI,
       SmallVectorImpl<InterestingMemoryOperand> &Interesting);
 
-  void tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, const DataLayout &DL, Type* InnerTy, int ArraySize, int depth);
+  void tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, const DataLayout &DL,
+                 Type *InnerTy, int ArraySize, int depth);
   void untagAlloca(IRBuilder<> &IRB, AllocaInst *AI, const DataLayout &DL);
   Value *tagPointer(IRBuilder<> &IRB, Type *Ty, Value *PtrLong, Value *Tag);
   Value *untagPointer(IRBuilder<> &IRB, Value *PtrLong);

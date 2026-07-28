@@ -346,7 +346,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   }
   
   if (UNLIKELY(ShadowTag == 0)) {
-    VPrintf(2, "[CheckAddress] uninited shadow detected at address %p\n", (void*)p);
+    // VPrintf(2, "[CheckAddress] uninited shadow detected at address %p\n", (void*)p);
     // atomic_fetch_add(&checks_on_uninited_shadow, 1ULL, memory_order_relaxed);
 
     // if (atomic_load(&checks_on_uninited_shadow, memory_order_relaxed) == 0) {
