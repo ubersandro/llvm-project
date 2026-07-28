@@ -1572,9 +1572,22 @@ int computeMemoryAccessSize(Instruction *I, const DataLayout &DL) {
   return -1;
 }
 
+bool isGEPIntoVPtr(Value *Operand) {
+  if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Operand))
+    if (StructType *ST = dyn_cast<StructType>(GEP->getSourceElementType())) {
+      
+    }
+  return false;
+}
+
 bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
                                       const DataLayout &DL) {
   // TODO: debug, might be removing too many checks
+
+  // TODO: skip checks on accesses to GEPs to the vptr of a Cpp object. BOTH R
+  // AND W.
+
+  // TODO:
   if (AllocaInst *AI = dyn_cast<AllocaInst>(O.getPtr())) {
     if (AI->getAllocatedType()->isPointerTy() ||
         AI->getAllocatedType()->isIntegerTy() ||
@@ -2170,48 +2183,32 @@ void HWAddressSanitizer::untagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
 } // untagAlloca
 
 void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI,
-                                   const DataLayout &DL) {
-  if (StructType *ST = dyn_cast<StructType>(AI->getAllocatedType())) {
-    // force base depth = 0
-    auto *TagVector = RetrieveOrCreateTagVector(ST, M, /*depth=*/0);
-    assert(TagVector && "Tag vector must exist here - tagAlloca");
-    IRB.CreateCall(FSANTaggingFunc,
-                   {IRB.CreatePointerCast(AI, PtrTy),
-                    IRB.CreatePointerCast(TagVector, PtrTy),
-                    ConstantInt::get(Int64Ty, DL.getTypeAllocSize(ST)),
-                    ConstantInt::get(Int64Ty, 1)});
+                                   const DataLayout &DL, Type *InnerTy,
+                                   int ArraySize, int depth) {
+  // ASSUMPTION: based on how ArraySize is used, N-D aggregates of structs are
+  // interpreted as 1D. NOTE: depth does not matter. In tag computation, it's
+  // either 0 or GT 0.
+  Value *TV = nullptr;
 
-  } // StructType
-  else if (ArrayType *AT = dyn_cast<ArrayType>(AI->getAllocatedType())) {
-    auto *InTY = AT->getElementType();
-    int nElems = AT->getNumElements();
-    int depth = 1;
-
-    while (ArrayType *INAT = dyn_cast<ArrayType>(InTY)) {
-      InTY = INAT->getElementType();
-      nElems *= INAT->getNumElements();
-      depth++;
-    }
-    auto *ST = dyn_cast<StructType>(InTY);
-    assert(ST && "Innermost element type of array must be struct for RLT");
-    auto *TV = RetrieveOrCreateTagVector(ST, M, depth);
+  if (StructType *ST = dyn_cast<StructType>(InnerTy)) {
+    TV = RetrieveOrCreateTagVector(ST, M, depth);
     assert(TV && "Tag vector must exist here - tagAlloca");
-
     IRB.CreateCall(FSANTaggingFunc,
                    {IRB.CreatePointerCast(AI, PtrTy),
                     IRB.CreatePointerCast(TV, PtrTy),
                     ConstantInt::get(Int64Ty, DL.getTypeAllocSize(ST)),
-                    ConstantInt::get(Int64Ty, nElems)});
-  } // ArrayType
-
-  else {
-    errs() << "[FSAN] WARNING: Alloca of unsupported type for RLT: "
-           << *(AI->getAllocatedType()) << "\n";
-    errs() << "Is vector? " << AI->getAllocatedType()->isVectorTy() << "\n";
-    errs() << "Is struct? " << AI->getAllocatedType()->isStructTy() << "\n";
-    errs() << "Is array? " << AI->getAllocatedType()->isArrayTy() << "\n";
-    errs() << "Is pointer? " << AI->getAllocatedType()->isPointerTy() << "\n";
-    errs() << AI->getAllocatedType() << "\n";
+                    ConstantInt::get(Int64Ty, ArraySize)});
+  } else {
+    // N-D scalar arrays have a different shadow memory striping pattern.
+    // TODO
+    // TODO: compute TV
+    TV = RetrieveOrCreateTagVector(AI->getAllocatedType(), M, depth);
+    assert(TV && "Tag vector must exist here - tagAlloca");
+    IRB.CreateCall(
+        FSANTaggingFunc,
+        {IRB.CreatePointerCast(AI, PtrTy), TV,
+         ConstantInt::get(Int64Ty, DL.getTypeAllocSize(AI->getAllocatedType())),
+         ConstantInt::get(Int64Ty, ArraySize)});
   }
   return;
 } // tagAlloca
@@ -2323,77 +2320,45 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
                                          const LoopInfo &LI,
                                          const DataLayout &DL) {
   unsigned int I = 0;
-
+  // structs, N-D arrays of structs, N-D arrays of scalar
   for (auto &KV : SInfo.AllocasToInstrument) {
     auto N = I++;
-    auto *AI = KV.first;
+    AllocaInst *AI = KV.first;
     assert(AI && "Alloca must not be null");
     memtag::AllocaInfo &Info = KV.second;
-    // assert(KV.second != nullptr && "AllocaInfo must not be null");
-    Value *Tag = nullptr;
+    // Value *Tag = nullptr;
     int depth = 0;
+    Type *AllocaTy = AI->getAllocatedType();
+    if (!AllocaTy->isStructTy() && !AllocaTy->isArrayTy())
+      continue;
 
-    if (AllocaInst *AIcast = dyn_cast<AllocaInst>(AI)) {
-      Type *allocatedType = AIcast->getAllocatedType();
-      bool IsArray = allocatedType->isArrayTy();
+    bool IsArray = AllocaTy->isArrayTy();
+    Type *TY = AllocaTy;
+    int ArraySize = 1;
+    // extact the innermost type and the depth of the array
+    while (1)
+      if (ArrayType *AT = dyn_cast<ArrayType>(TY)) {
+        TY = AT->getElementType();
+        ArraySize *= AT->getNumElements();
+        depth++;
+      } else
+        break;
 
-      Type *TY = allocatedType;
-      while (1) {
-        if (ArrayType *AT = dyn_cast<ArrayType>(TY)) {
-          TY = AT->getElementType();
-          depth++;
-        } else {
-          break;
-        }
-      }
-
-      if (depth == 0 && !TY->isStructTy()) {
-        // not an array, not a struct -> SKIP
+    // rule out structs and aggregates of structs that are literal or unions
+    if (StructType *ST = dyn_cast<StructType>(TY))
+      if (ST->isLiteral() || ST->getName().str().find("union.") == 0)
         continue;
-      }
 
-      if (IsArray && !TY->isStructTy()) {
-        // multi-dim array of non-structs -> SKIP
-        continue;
-      }
-
-      if (IsArray && TY->isStructTy()) {
-        // multi-dim array of structs -> check if struct is safe
-        StructType *ST = dyn_cast<StructType>(TY);
-        if (ST->isLiteral()) {
-          if (ClFSAN_verbose)
-            errs() << "[FSAN] LITERAL ARRAY ALLOCA SKIP " << *AI << "\n";
+    // rule out 1-D arrays of scalars, ASAN protects them
+    if (AllocaTy->isArrayTy() && depth == 1)
+      if (ArrayType *AT = dyn_cast<ArrayType>(AllocaTy))
+        if (!AT->getElementType()->isStructTy())
           continue;
-        }
-        if (ST->getName().str().find("union.") == 0) {
-          if (ClFSAN_verbose)
-            errs() << "[FSAN] UNION ARRAY ALLOCA SKIP " << *AI << "\n";
-          continue;
-        }
-      } else if (allocatedType->isStructTy()) {
-        StructType *ST = dyn_cast<StructType>(allocatedType);
-        if (ST->isLiteral()) {
-          if (ClFSAN_verbose)
-            errs() << "[FSAN] LITERAL ALLOCA SKIP " << *AI << "\n";
-          continue;
-        }
-        if (ST->getName().str().find("union.") == 0) {
-          if (ClFSAN_verbose)
-            errs() << "[FSAN] UNION ALLOCA SKIP " << *AI << "\n";
-          continue;
-        }
-      }
-    } // cast AI
-    else
-      assert(false && "Allocas must be AllocaInsts");
 
     IRBuilder<> IRB(AI->getNextNonDebugInstruction());
-    // NOTE: since root pointers are not tagged, no need for replacing the
-    // pointer to the alloca with a tagged version.
     size_t Size = memtag::getAllocaSizeInBytes(*AI);
     Value *AICast = IRB.CreatePointerCast(AI, PtrTy);
 
-    // TODO: in my case, this can go!
     auto HandleLifetime = [&](IntrinsicInst *II) {
       II->setArgOperand(0, ConstantInt::get(Int64Ty, Size));
       II->setArgOperand(1, AICast);
@@ -2401,28 +2366,40 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
 
     llvm::for_each(Info.LifetimeStart, HandleLifetime);
     llvm::for_each(Info.LifetimeEnd, HandleLifetime);
+    // TODO: if pointer to array of scalar, set MSB in tag.
+    bool IsStructArray = false;
 
-    // could be a struct or an array of structs. No unions, no literals
-
-    // ALL ALLOCAS PTRS are tagged when they're an aggregate
-    if (ClFSAN_levels) {
+    Type *tmp = AllocaTy;
+    if (IsArray) {
+      while (1)
+        if (ArrayType *AT = dyn_cast<ArrayType>(tmp)) {
+          tmp = AT->getElementType();
+          if (StructType *ST = dyn_cast<StructType>(tmp)) {
+            IsStructArray = true;
+            break;
+          }
+        } else
+          break;
+    }
+    if (IsArray && !IsStructArray) {
       auto *AILong = IRB.CreatePtrToInt(AI, IntptrTy);
       // LEVEL 0, T 0, R is set
+      // TODO: restrict to array case
       auto *TaggedAlloca = tagPointer(IRB, AI->getType(), AILong,
                                       ConstantInt::get(IntptrTy, RPTag));
       TaggedAlloca->setName(AI->getName() + ".tagged");
-
+      ArraySize = 1;
       AI->replaceUsesWithIf(TaggedAlloca, [AICast, AILong](const Use &U) {
         auto *User = U.getUser();
         return User != AILong && User != AICast &&
                !isa<LifetimeIntrinsic>(User); // TODO: fix this when tagging
       });
-      AllocaInst *NewAI = dyn_cast<AllocaInst>(TaggedAlloca);
-      assert(NewAI && "Tagged alloca must be an AllocaInst");
-      AI = NewAI;
     }
-
-    tagAlloca(IRB, AI, DL);
+    // AllocaInst *NewAI = dyn_cast<AllocaInst>(TaggedAlloca);
+    // assert(NewAI && "Tagged alloca must be an AllocaInst");
+    // AI = NewAI;
+    bool isStructArray = IsArray && IsStructArray;
+    tagAlloca(IRB, AI, DL, isStructArray ? TY : AllocaTy, ArraySize, depth);
     NumInstrumentedAllocas++;
     auto TagEnd = [&](Instruction *Node) {
       IRB.SetInsertPoint(Node);
@@ -3026,7 +3003,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
 
     auto sonIsScalar =
         !DstIsStruct && !DstType->isVectorTy() && !DstIsArrOfStructs &&
-        (!DstIsArray || DstIsArray && getArrayDimension(DstType) == 1);
+        (!DstIsArray || (DstIsArray && getArrayDimension(DstType) == 1));
     // 1D arrays are treated as a single field.
 
     if (tag) {
@@ -3053,10 +3030,15 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
       } // sonIsScalar
       else if (DstIsArray && getArrayDimension(DstType) > 1) {
         // set bit 5 in the tag
+        // TODO: this might no longer be necessary in the future
         Value *untagged = maskPointerIntrinsic(IRB, GEPI, PTR_MASK);
         GEPLong = IRB.CreatePtrToInt(untagged, IntptrTy);
         Value *TBits_CONST = ConstantInt::get(
-            IntptrTy, (1ULL << (PointerTagShift + 5))); // TODO: fix properly
+            IntptrTy,
+            (1ULL << (PointerTagShift +
+                      (TBits +
+                       LBits)))); // keep pointer to array tagged, otherwise
+                                  // checks shortcircuit to noop
         Value *GEPLongWithT = IRB.CreateOr(GEPLong, TBits_CONST);
         taggedPointer = IRB.CreateIntToPtr(GEPLongWithT, GEPI->getType());
         endResultName = GEPNAME + ".fsan.array";
@@ -3081,17 +3063,14 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
           NDst < NSrc && NDst > 0; // array indexing or decay, or incdec
       bool isArrayOfScalars = !isArrayOfStructs(SrcType);
       if (isArrayOfScalars) {
-        errs() << "[FSAN] ARRAY GEP: " << *GEPI << "\n";
+        // errs() << "[FSAN] ARRAY GEP: " << *GEPI << "\n";
         const uint64_t ShiftAdjustment = TwoOpsGEP ? 1ULL : 2ULL;
         assert(NSrc >= ShiftAdjustment && "Invalid NSrc for array GEP");
 
+        // flattening the uppermost level
         const uint64_t SHIFT = NSrc - ShiftAdjustment;
 
-        /*
-         * The previous code checked SHIFT before recomputing it for TwoOpsGEP.
-         * That was wrong. Check the final SHIFT.
-         */
-        if (SHIFT >= TBits)
+        if (SHIFT >= TBits + LBits)
           return;
 
         const unsigned IndexOperand = TwoOpsGEP ? 1U : 2U;
@@ -3101,59 +3080,23 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
 
         Value *Index = GEPI->getOperand(IndexOperand);
         auto *IndexTy = dyn_cast<IntegerType>(Index->getType());
-
-        if (!IndexTy) {
-          errs() << "[FSAN] Non-integer GEP index: " << *Index << "\n";
-          return;
-        }
+        assert(IndexTy != nullptr && "Array GEP index must be an integer type");
 
         auto *IntPtrITy = cast<IntegerType>(IntptrTy);
         const unsigned PointerBits = IntPtrITy->getBitWidth();
-
-        /*
-         * For six-bit LAM:
-         *
-         *   PointerTagShift = 57
-         *   SHIFT           = 0..5
-         *   BitPosition     = 57..62
-         */
         const uint64_t BitPosition = PointerTagShift + SHIFT;
+        assert(BitPosition < PointerBits &&
+               "Invalid tag-bit position for pointer width");
 
-        if (BitPosition >= PointerBits) {
-          errs() << "[FSAN] Invalid tag-bit position: " << BitPosition
-                 << ", pointer width: " << PointerBits << "\n";
-          return;
-        }
-
-        /*
-         * Compute index parity at runtime:
-         *
-         *   even index -> 0
-         *   odd index  -> 1
-         *
-         * Using AND 1 works for both positive and negative LLVM integer
-         * bit patterns and preserves exactly the parity bit.
-         */
         Value *ParityInIndexTy = IRB.CreateAnd(
             Index, ConstantInt::get(IndexTy, 1), GEPNAME + ".fsan.parity");
 
-        /*
-         * Convert the single parity bit to uintptr_t width before shifting it
-         * into the pointer tag.
-         */
         Value *Parity = IRB.CreateZExtOrTrunc(ParityInIndexTy, IntPtrITy,
                                               GEPNAME + ".fsan.parity.intptr");
 
         Value *RuntimeTagBit =
             IRB.CreateShl(Parity, BitPosition, GEPNAME + ".fsan.tagbit");
 
-        /*
-         * Build:
-         *
-         *   ~(1 << BitPosition)
-         *
-         * using APInt, avoiding host-side 64-bit shift assumptions.
-         */
         APInt ClearMask = APInt::getAllOnes(PointerBits);
         ClearMask.clearBit(static_cast<unsigned>(BitPosition));
 
@@ -3178,16 +3121,6 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
                                              GEPNAME + ".fsan.tagged");
         }
 
-        // errs() << "[FSAN] ARRAY GEP: " << *GEPI
-        //        << "\n\tNSrc: " << NSrc
-        //        << "\n\tNDst: " << NDst
-        //        << "\n\tSHIFT: " << SHIFT
-        //        << "\n\tBitPosition: " << BitPosition
-        //        << "\n\tIndex: " << *Index
-        //        << "\n\tParity: " << *ParityInIndexTy
-        //        << "\n\tRuntimeTagBit: " << *RuntimeTagBit
-        //        << "\n\tTaggedPointer: " << *taggedPointer
-        //        << "\n";
         assert(taggedPointer != nullptr && "TAGGED POINTER");
         endResultName = GEPNAME + ".fsan.array" +
                         (arrayTraversal ? ".traversal" : ".decay");
@@ -3202,7 +3135,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
   assert(taggedPointer->isPointerTy() &&
          "Tagged pointer must be of pointer type");
   taggedPointer->setName(endResultName);
-  
+
   GEPI->replaceUsesWithIf(
       taggedPointer, [GEPI, DstType, GEPLong](const Use &U) {
         auto *User = U.getUser();
@@ -3898,8 +3831,10 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
         "[FSAN] Expected only structs or arrays of structs to be instrumented");
   }
   Constant *ArraySize = ConstantInt::get(Int32Ty, nElems);
+  if (!STType)
+    ArraySize = ConstantInt::get(Int32Ty, 1);
 
-  if (STType->isLiteral()) {
+  if (STType && STType->isLiteral()) {
     auto *tmp = getStructTypeFromDbgInfo(GV, nullptr, nullptr);
     if (tmp) {
       STType = tmp;
@@ -3959,10 +3894,15 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
                 DescriptorPos)), // NOTE: when descriptor pos is 0, omitted
         Int32Ty);
 
-    assert(STType &&
-           "Struct type must be valid to instrument global variable.");
-    GlobalVariable *TagVector =
-        dyn_cast<GlobalVariable>(RetrieveOrCreateTagVector(STType, M, depth));
+    // assert(STType &&
+    //        "Struct type must be valid to instrument global variable.");
+    GlobalVariable *TagVector = nullptr;
+    if (STType)
+      TagVector =
+          dyn_cast<GlobalVariable>(RetrieveOrCreateTagVector(STType, M, depth));
+    else
+      TagVector =
+          dyn_cast<GlobalVariable>(RetrieveOrCreateTagVector(GVType, M, depth));
     assert(TagVector &&
            "Tag vector global must exist and be properly initialized.");
     auto *TVRelPtr = ConstantExpr::getTrunc(
@@ -3972,8 +3912,14 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     assert(ArraySize && "Array size constant must be valid.");
     // uint32_t Size = std::min(SizeInBytes - DescriptorPos, MaxDescriptorSize);
     // auto *SizeAndTag = ConstantInt::get(Int32Ty, Size);
-    auto *SizeOfTheStruct =
-        ConstantInt::get(Int32Ty, M.getDataLayout().getTypeAllocSize(STType));
+    Constant *SizeOfTheStruct = nullptr;
+    if (STType)
+      SizeOfTheStruct =
+          ConstantInt::get(Int32Ty, M.getDataLayout().getTypeAllocSize(STType));
+    else
+      SizeOfTheStruct = ConstantInt::get(
+          Int32Ty,
+          M.getDataLayout().getTypeAllocSize(GVType)); // improperly named
     Descriptor->setComdat(NewGV->getComdat());
     Descriptor->setInitializer(ConstantStruct::getAnon(
         {GVRelPtr, SizeOfTheStruct, TVRelPtr, ArraySize}));
@@ -3984,13 +3930,13 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     appendToCompilerUsed(M, Descriptor);
   }
   uint8_t Tag = 0;
-  if (ClFSAN_levels) {
+  if (!STType) {
     Tag = RPTag; // NOTE: both structs and arrays of structs have RP set
-    auto AdjDepth =
-        (depth /*> 0 ? depth - 1 : 0*/) &
-        (L_MAX); // depth is 0 for structs, 1 for arrays, 2 for matrices, etc
-    Tag |= (AdjDepth << TBits); // set L to struct aggregate depth IF AGGREGATE
-    Tag |= AdjDepth;
+    // auto AdjDepth =
+    //     (depth /*> 0 ? depth - 1 : 0*/) &
+    //     (L_MAX); // depth is 0 for structs, 1 for arrays, 2 for matrices, etc
+    // Tag |= (AdjDepth << TBits); // set L to struct aggregate depth IF
+    // AGGREGATE Tag |= AdjDepth;
   }
 
   Constant *Aliasee = ConstantExpr::getIntToPtr(
@@ -4040,9 +3986,7 @@ void HWAddressSanitizer::instrumentGlobals() {
         TY = AT->getElementType();
       }
 
-      if (!TY->isStructTy()) {
-        continue;
-      } else {
+      if (TY->isStructTy()) {
         auto ST = dyn_cast<StructType>(TY);
         if (ST->hasName() &&
             ST->getStructName().str().find("union.") != std::string::npos) {

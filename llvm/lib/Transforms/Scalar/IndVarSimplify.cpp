@@ -2040,6 +2040,7 @@ bool IndVarSimplify::run(Loop *L) {
 PreservedAnalyses IndVarSimplifyPass::run(Loop &L, LoopAnalysisManager &AM,
                                           LoopStandardAnalysisResults &AR,
                                           LPMUpdater &) {
+  return PreservedAnalyses::all();
   Function *F = L.getHeader()->getParent();
   const DataLayout &DL = F->getDataLayout();
 

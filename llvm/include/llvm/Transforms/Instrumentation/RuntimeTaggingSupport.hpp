@@ -11,9 +11,11 @@
 using namespace llvm;
 
 namespace RuntimeTaggingSupport {
-Value *RetrieveOrCreateTagVector(StructType *ST, Module &M, int depth = 0);
-u_int8_t *ComputeTags(StructType *Ty, Module &M, int depth = 0);
-void createTagVector(StructType *ST, Module &M, int depth = 0);
+Value *RetrieveOrCreateTagVector(Type* TY, Module &M, int depth = 0);
+u_int8_t *ComputeTags(StructType *Ty, Module &M, int depth = 0, u_int8_t * Tags = nullptr);
+void ComputeTagsOnNDArray(ArrayType *Ty, Module &M, const DataLayout &DL, int depth = 0, u_int8_t *Tags = nullptr, uint64_t BaseOffset = 0);
+
+void createTagVector(Type *TY, Module &M, int depth = 0);
 } // namespace RuntimeTaggingSupport
 
 #endif

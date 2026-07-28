@@ -272,7 +272,7 @@ private:
       const TargetLibraryInfo &TLI,
       SmallVectorImpl<InterestingMemoryOperand> &Interesting);
 
-  void tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, const DataLayout &DL);
+  void tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, const DataLayout &DL, Type* InnerTy, int ArraySize, int depth);
   void untagAlloca(IRBuilder<> &IRB, AllocaInst *AI, const DataLayout &DL);
   Value *tagPointer(IRBuilder<> &IRB, Type *Ty, Value *PtrLong, Value *Tag);
   Value *untagPointer(IRBuilder<> &IRB, Value *PtrLong);

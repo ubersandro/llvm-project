@@ -326,7 +326,16 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
 
   // DEBUG
   if (UNLIKELY(GetTagFromPointer(p) == 0)) {
-    VPrintf(2, "[CheckAddress] untagged ptr detected at address %p\n", (void*)p);
+    // if(UNLIKELY(ShadowTag != 0 && getT(ShadowTag) != 1)) {
+    //   VPrintf(
+    //       0,
+    //       "[check-null] Tag mismatch detected at address %p: ptr "
+    //       "tag=%02x mem tag=%02x \n\t PL=%02x ML=%02x \n\t PT=%02x MT=%02x\n",
+    //       (void*)p, tag, ShadowTag, getL(tag), getL(ShadowTag),
+    //       getT(tag), getT(ShadowTag));
+    //   SigTrap<EA, AT, LogSize>(p);
+    // }
+    // VPrintf(2, "[CheckAddress] untagged ptr detected at address %p\n", (void*)p);
     // atomic_fetch_add(&checks_on_untagged_ptr, 1ULL, memory_order_relaxed);
     // if (atomic_load(&checks_on_untagged_ptr, memory_order_relaxed) == 0) {
     //   // overflow detected
@@ -363,14 +372,12 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
   VPrintf(2, "[CheckAddress] ptr=%p sz=%d\n", (void*)p, 1 << LogSize);
 
   // bool isRP = getR(tag);
+  // NOTE: array pointers are now tagged!
   // if (isRP) {
-    // TODO: use this to debug loops at O2
-    // TODO: do we want to keep this kind of check? Or do we delegate this check
-    // to type sanitizers? It's FP-prone on C++
-    // VPrintf(2, "[CheckAddress] R PTR %p, SZ %d\n", (void*)p, 1 << LogSize);
+  //   VPrintf(2, "[CheckAddress] R PTR %p, SZ %d\n", (void*)p, 1 << LogSize);
   //   return;
   // }
-  // VPrintf(2, "[CheckAddress] NON-RP PTR %p, SZ %d\n", (void*)p, 1 << LogSize);
+  VPrintf(2, "[CheckAddress] NON-RP PTR %p, SZ %d\n", (void*)p, 1 << LogSize);
 
   auto ptr_L = getL(tag);
   auto mem_L = getL(ShadowTag);

@@ -221,8 +221,8 @@ TagFromBitcast(llvm::Value *Src, clang::QualType DestTy,
             llvm::StringRef IRPointeeTyName(IRTyNameStr);
             llvm::Value *NewTypeStr =
                 CGF.Builder.CreateGlobalString(IRPointeeTyName);
-            llvm::errs() << "[FSAN-FE] Replacing placeholder type string with: "
-                         << IRPointeeTyName << "\n";
+            // llvm::errs() << "[FSAN-FE] Replacing placeholder type string with: "
+            //              << IRPointeeTyName << "\n";
             CI->setArgOperand(typeStrArgIdx, NewTypeStr);
           }
         }

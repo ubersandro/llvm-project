@@ -6499,7 +6499,6 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
     // ,realloc for realloc etc)
     auto FnNameStr = CalleeDecl->getName().str(); // NOTE: not fully qualified name
     auto FullyQualifiedName = CalleeDecl->getQualifiedNameAsString();
-    llvm::errs() << "FSAN-FE: REWRITING CALL TO: " << FullyQualifiedName << "\n";
     llvm::Value *OrigFnName = Builder.CreateGlobalString(FnNameStr);
     args.add(RValue::get(OrigFnName),
              getContext().getPointerType(getContext().CharTy));
