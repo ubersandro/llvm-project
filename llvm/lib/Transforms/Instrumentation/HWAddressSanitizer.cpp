@@ -1586,7 +1586,7 @@ bool HWAddressSanitizer::isAccessToScalar(InterestingMemoryOperand &O,
   bool ret = false;
   if (AllocaInst *AI = dyn_cast<AllocaInst>(O.getPtr())) {
     TY = AI->getAllocatedType();
-    ret = !TY->isAggregateType();
+    ret = !TY->isAggregateType(); // TODO: this might go
   } // it's alloca
 
   if (GlobalVariable *GV = dyn_cast<GlobalVariable>(O.getPtr()))
@@ -1598,23 +1598,26 @@ bool HWAddressSanitizer::isAccessToScalar(InterestingMemoryOperand &O,
 }
 Type *HWAddressSanitizer::extractTypeFromTypedAllocatorOrNew(CallBase *CI) {
   auto nArgs = CI->arg_size();
+  Type *TY = nullptr;
   for (int i = 0; i < nArgs; i++) {
     auto arg = CI->getArgOperand(i);
     // stop when you find an arg called typeName
     auto argName = CI->getArgOperand(i)->getName();
-    if (argName == "typeName") {
+    if (argName.find("typeName") != std::string::npos) {
       errs() << "[FSAN] Found typeName arg: " << *arg << "\n";
       if (ConstantDataArray *CDA = dyn_cast<ConstantDataArray>(arg)) {
         if (CDA->isString()) {
           auto typeName = CDA->getAsString();
           errs() << "[FSAN] Extracted typeName: " << typeName << "\n";
+          typeName = typeName.substr(0, typeName.size() - 1);
+          TY = StructType::getTypeByName(CI->getContext(), typeName);
         }
       } // if CDA
       else
         assert(false && "typeName arg is not a ConstantDataArray");
     }
   }
-  return nullptr;
+  return TY;
 }
 // TODO: getUnderlyingMemoryType(Instruction*I, const DataLayout &DL)
 
@@ -1643,20 +1646,21 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
   if (scalar)
     return true;
   Type *BaseTY = nullptr; // base type modulo all the GEPs.
-  Value *OffsetIntoBaseTY =
-      nullptr; // TODO: for each access, compute offset. If offset fully static,
-               // check safety based on UNDERLYING memory type. If safe, skip
-               // instrumentation.
   SmallVector<Value *, 4> GEPChain;
+  GetElementPtrInst *tmp = nullptr;
   if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(O.getPtr())) {
-    GetElementPtrInst *tmp = GEP, *prev = GEP;
+    tmp = GEP;
+    GetElementPtrInst *prev = GEP;
+
+    // push GEPs backwards
     while (tmp != nullptr) {
       GEPChain.push_back(tmp);
       prev = tmp;
-      tmp = dyn_cast<GetElementPtrInst>(tmp->getPointerOperand());
+      auto PtrOP = tmp->getPointerOperand();
+      tmp = dyn_cast<GetElementPtrInst>(PtrOP);
     }
-    tmp = prev;
 
+    tmp = prev;
     bool LocalOrGlobalVarOrDynAlloc =
         dyn_cast<AllocaInst>(tmp->getPointerOperand()) ||
         dyn_cast<GlobalVariable>(tmp->getPointerOperand()) ||
@@ -1667,6 +1671,7 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
 
     BaseTY = extractUnderlyingMemType(tmp->getPointerOperand(), DL);
   } // if GEP
+
   // TODO: implement else
 
   if (!BaseTY) {
@@ -1676,32 +1681,110 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
     // if it's unknown, instrument
     // if it's pointer passed to function, instrument
     // if it's loaded from memory, instrument
-    errs() << "[FSAN] BaseTY nullptr: " << *O.getInsn()
-           << "\n\t OP: " << *O.getPtr() << "\n";
+
+    // CASE 1: store of vtable ptr to vptr. We assume these accesses are in
+    // bounds, since we are not a type sanitizer.
+    if (StoreInst *SI = dyn_cast<StoreInst>(O.getInsn())) {
+      auto StoredValue = SI->getValueOperand();
+      if (GEPOperator *GEPV = dyn_cast<GEPOperator>(StoredValue)) {
+        auto PtrOpGEPV = GEPV->getPointerOperand();
+        if (demangle(PtrOpGEPV->getName().str()).find("vtable for") !=
+            std::string::npos)
+          return true;
+      } // GEPV
+    } // StoreInst
+
+    // CASE 2: load of vtable from vptr. In case of type error, this load may be
+    // OOB inter-object, which is ASAN stuff. If not a ptr, it SEGFAULTS. We do
+    // not instrument these loads.
+    if (LoadInst *LI = dyn_cast<LoadInst>(O.getInsn())) {
+      auto ValueName = LI->getPointerOperand()->getName().str();
+      if (demangle(ValueName).find("vtable") == 0)
+        return true;
+    } // LoadInst
     return false;
   }
-  // TODO: dump chain of GEPs
-  size_t ChainLen = 0;
+  int ChainLen = 0;
   std::string GEPChainStr;
-
-  {
-    raw_string_ostream OS(GEPChainStr);
-
-    // OS << "CHAIN\n\t";
-    for (const auto *GEP : GEPChain)
-      OS << ChainLen++ << ": " << *GEP << "\n\t";
-
-    OS << '\n';
-  } // raw_string_ostream flushes into GEPChainStr
+  raw_string_ostream OS(GEPChainStr);
+  for (const auto *GEP : GEPChain)
+    OS << ChainLen++ << ": " << *GEP << "\n\t";
+  OS << '\n';
 
   bool isStructArray = BaseTY->isArrayTy() && isArrayOfStructs(BaseTY);
-  bool isStructOrArrayOfStructs = BaseTY->isStructTy() || isStructArray;
 
+  bool isNDArrayOfScalars = BaseTY->isArrayTy() && !isStructArray;
+  // DO NOT SKIP THESE FOR NOW
+  if (isNDArrayOfScalars)
+    return false;
+
+  // if it's a struct, check if type coercion and other opts --> TODO: this is
+  // NOT working if (StructType *ST = dyn_cast<StructType>(BaseTY)) {
+  //   if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
+  //     auto *GEP = dyn_cast<GetElementPtrInst>(O.getPtr());
+  //     bool tag = performChecksOnGEP(GEP);
+  //     if (!tag) {
+  //       errs() << "[FSAN] SKIP UNTAGGED GEP: " << *O.getInsn()
+  //              << "\n\tGEP: " << *GEP << "\n\tGEPChain: " << GEPChainStr
+  //              << "\n\tBaseTY: " << *BaseTY << "\n\tOP: " << *O.getPtr()
+  //              << "\n\tChainLen " << ChainLen << "\n";
+  //       return true;
+  //     }
+  //   }
+  // }
+
+  // TODO: potentially rule out all accesses on structs coerced.
+  SmallVector<Value *, 4> ChainInReverse(GEPChain.rbegin(), GEPChain.rend());
+  for (Value *GEP_ith_V : ChainInReverse) {
+    GetElementPtrInst *GEP_ith = dyn_cast<GetElementPtrInst>(GEP_ith_V);
+    if (GEP_ith->getSourceElementType()->isStructTy()) {
+      if (((GEP_ith->getResultElementType()->isStructTy() &&
+            GEP_ith->getResultElementType() !=
+                GEP_ith->getSourceElementType()) ||
+           (GEP_ith->getResultElementType()->isArrayTy() &&
+            isArrayOfStructs(GEP_ith->getResultElementType()))) &&
+          GEP_ith != ChainInReverse.back()) {
+        if (GEP_ith->hasName() && GEP_ith->getName().starts_with("coerce."))
+          return true;
+        errs() << "DETECTED TRAVERSAL OF STRUCT TO ANOTHER AGGREGATE FIELD: "
+               << *O.getInsn() << "\n\tGEPChain: " << GEPChainStr
+               << "\n\t GEP_ith " << *GEP_ith << "\n\tBaseTY: " << *BaseTY
+               << "\n\tAccessedType: " << *GEP_ith->getSourceElementType()
+               << "\n\tOP: " << *O.getPtr() << "\n";
+
+        return false; // cant skip this
+      }
+    } // if
+  } // FOR
+
+  StructType *BaseStructTY = nullptr;
+  if (BaseTY->isStructTy())
+    BaseStructTY = dyn_cast<StructType>(BaseTY);
+  else {
+    assert(isArrayOfStructs(BaseTY) &&
+           "BaseTY should be a struct or an array of structs");
+    while (ArrayType *AT = dyn_cast<ArrayType>(BaseTY)) {
+      BaseTY = AT->getElementType();
+      if (BaseTY->isStructTy()) {
+        BaseStructTY = dyn_cast<StructType>(BaseTY);
+        break;
+      }
+    }
+  }
+
+  if (!BaseStructTY) {
+    errs() << "[FSAN] BaseTY is not a struct or an array of structs: "
+           << *BaseTY << "\n\tGEPChain: " << GEPChainStr
+           << "\n\tAccessedType: " << *BaseTY << "\n\tOP: " << *O.getPtr()
+           << "\n";
+    return false;
+  }
+
+  // skip structs or arrays of structs that are literal/anonymous/union structs.
   bool ShouldSkipStruct =
-      BaseTY->isStructTy() &&
-      (dyn_cast<StructType>(BaseTY)->isLiteral() ||
-       (dyn_cast<StructType>(BaseTY)->hasName() &&
-        dyn_cast<StructType>(BaseTY)->getStructName().starts_with("union.")));
+      BaseStructTY->isLiteral() ||
+      BaseStructTY->hasName() &&
+          BaseStructTY->getStructName().starts_with("union.");
   if (ShouldSkipStruct) {
     // it's a struct or an array of structs, but it's a literal/anonymous/union
     // struct.
@@ -1709,28 +1792,9 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
     return true;
   }
 
-  bool isNDArrayOfScalars =
-      BaseTY->isArrayTy() && !isStructArray &&
-      dyn_cast<ArrayType>(BaseTY)->getElementType()->isArrayTy();
-
-  // DO NOT SKIP THESE FOR NOW
-  if (isNDArrayOfScalars)
-    return false;
-
-  // at this point, it's an access to an aggregate. If the aggregate is a
-  // struct/class (array), we instrument it only if NOT literal/anonymous/union.
-  // If it is scalar aggregate, we instrument it only if it's not N-D array of
-  // scalars.
-
-  // if (!ClFSAN_AggressiveTrimmer)
-  //   return false;
-
-  // TODO: extend to chain of GEPs
-  if(ChainLen == 0 || ChainLen > 1)
-    return false;
   if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(O.getPtr())) {
-    // NOTE : this only skips accesses on the structs.
-    if (StructType *ST = dyn_cast<StructType>(BaseTY)) {
+    // NOTE : this only skips accesses on the structs OR arrays of structs.
+    if (StructType *ST = dyn_cast<StructType>(GEP->getSourceElementType())) {
       auto nOperandsGEP = GEP->getNumOperands();
       if (nOperandsGEP != 3)
         return false;
@@ -1760,10 +1824,9 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
                  << "\n\tfield type: " << *TypeOfFieldAtIdx
                  << "\n\tfield size: " << SizeOfTypeOfFieldAtIdx
                  << "\n\tmemaccess size: " << SizeOfTheMemOp
-                 << "\n\tGEPChain: " << GEPChainStr
-                 << "\n\tBaseTY: " << *BaseTY << "\n\tOP: " << *O.getPtr()
-                 << '\n';
-
+                 << "\n\tGEPChain: " << GEPChainStr << "\n\tBaseTY: " << *BaseTY
+                 << "\n\tOP: " << *O.getPtr() << "\n\tChainLen " << ChainLen
+                 << "\n";
           return true;
         } // if SizeOfTypeOfFieldAtId
       } // ConstantIdx GEP
@@ -2555,18 +2618,21 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
     if (InstrumentLandingPads && isa<LandingPadInst>(Inst))
       LandingPadVec.push_back(&Inst);
-
-    getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
+    if (ClFSAN_memAccesses)
+      getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
 
     if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
-      IntrinToInstrument.push_back(MI);
+      if (ClFSAN_memIntr)
+        IntrinToInstrument.push_back(MI);
 
     if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(&Inst)) {
-      GEPsToInstrument.push_back(GEPI);
+      if (ClFSAN_GEP)
+        GEPsToInstrument.push_back(GEPI);
     }
 
     if (CmpInst *CI = dyn_cast<CmpInst>(&Inst)) {
-      CMPsToInstrument.push_back(CI);
+      if (ClFSAN_CMP)
+        CMPsToInstrument.push_back(CI);
     }
 
     // HEAP instrumentation: calls & invokes
@@ -2580,13 +2646,13 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     }
 
     if (auto *BO = dyn_cast<BinaryOperator>(&Inst)) {
-      if (BO->getOpcode() == Instruction::Sub) {
+      if (ClFSAN_BOP && BO->getOpcode() == Instruction::Sub) {
         // NOTE: only subs, because adding ptrs should be against the standard
         // NOTE: ptr subtractions make sense only if the two pointers point to
         // (parts of) the same object. Ow they are just undefined behavior.
         BOPsToInstrument.push_back(BO);
       }
-      if (BO->getOpcode() == Instruction::Add) {
+      if (ClFSAN_BOP && BO->getOpcode() == Instruction::Add) {
         // NOTE: only add, because adding ptrs should be against the standard
         // NOTE: ptr additions make sense only if one of the two operands is an
         // integer offset. Ow they are just undefined behavior.
@@ -2947,7 +3013,7 @@ bool HWAddressSanitizer::isArrayOfStructs(llvm::Type *T) {
     T = T->getArrayElementType();
 
   // Check if the base element is an aggregate
-  return T->isAggregateType() && T->isStructTy();
+  return T->isStructTy();
 }
 
 Value *HWAddressSanitizer::zeroOutLevelBits(IRBuilder<> &IRB, Value *Ptr) {
