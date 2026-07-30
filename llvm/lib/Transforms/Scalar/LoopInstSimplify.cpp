@@ -170,9 +170,6 @@ static bool simplifyLoopInst(Loop &L, DominatorTree &DT, LoopInfo &LI,
 PreservedAnalyses LoopInstSimplifyPass::run(Loop &L, LoopAnalysisManager &AM,
                                             LoopStandardAnalysisResults &AR,
                                             LPMUpdater &) {
-  // auto F = L.getHeader()->getParent();
-  // if (F->hasFnAttribute(Attribute::SanitizeHWAddress))
-  //   return PreservedAnalyses::all();
   std::optional<MemorySSAUpdater> MSSAU;
   if (AR.MSSA) {
     MSSAU = MemorySSAUpdater(AR.MSSA);

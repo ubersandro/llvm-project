@@ -146,7 +146,7 @@ MaxArraySize("instcombine-maxarray-size", cl::init(1024),
              cl::desc("Maximum array size considered when doing a combine"));
 
 static cl::opt<bool> clFSAN_EnableInstructionCombining(
-    "instcombine-fsan", cl::init(false),
+    "instcombine-fsan", cl::init(true),
     cl::desc("Enable IC with FSAN"));
 
 // FIXME: Remove this flag when it is no longer necessary to convert

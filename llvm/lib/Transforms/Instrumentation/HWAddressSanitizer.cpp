@@ -1746,11 +1746,11 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
           GEP_ith != ChainInReverse.back()) {
         if (GEP_ith->hasName() && GEP_ith->getName().starts_with("coerce."))
           return true;
-        errs() << "DETECTED TRAVERSAL OF STRUCT TO ANOTHER AGGREGATE FIELD: "
-               << *O.getInsn() << "\n\tGEPChain: " << GEPChainStr
-               << "\n\t GEP_ith " << *GEP_ith << "\n\tBaseTY: " << *BaseTY
-               << "\n\tAccessedType: " << *GEP_ith->getSourceElementType()
-               << "\n\tOP: " << *O.getPtr() << "\n";
+        // errs() << "DETECTED TRAVERSAL OF STRUCT TO ANOTHER AGGREGATE FIELD: "
+        //        << *O.getInsn() << "\n\tGEPChain: " << GEPChainStr
+        //        << "\n\t GEP_ith " << *GEP_ith << "\n\tBaseTY: " << *BaseTY
+        //        << "\n\tAccessedType: " << *GEP_ith->getSourceElementType()
+        //        << "\n\tOP: " << *O.getPtr() << "\n";
 
         return false; // cant skip this
       }
@@ -1773,10 +1773,10 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
   }
 
   if (!BaseStructTY) {
-    errs() << "[FSAN] BaseTY is not a struct or an array of structs: "
-           << *BaseTY << "\n\tGEPChain: " << GEPChainStr
-           << "\n\tAccessedType: " << *BaseTY << "\n\tOP: " << *O.getPtr()
-           << "\n";
+    // errs() << "[FSAN] BaseTY is not a struct or an array of structs: "
+    //        << *BaseTY << "\n\tGEPChain: " << GEPChainStr
+    //        << "\n\tAccessedType: " << *BaseTY << "\n\tOP: " << *O.getPtr()
+    //        << "\n";
     return false;
   }
 
@@ -1805,9 +1805,9 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
         auto TypeOfFieldAtIdx = ST->getElementType(idxVal);
         if (TypeOfFieldAtIdx->isAggregateType()) {
           // TODO: more opportunities for optimization on UNIONS, ARRAYS
-          errs() << "\t ACC TO AGG " << *O.getInsn() << "\n\tGEP: " << *ST
-                 << "\n\tfield idx: " << idxVal
-                 << "\n\tfield type: " << *TypeOfFieldAtIdx << "\n";
+          // errs() << "\t ACC TO AGG " << *O.getInsn() << "\n\tGEP: " << *ST
+          //        << "\n\tfield idx: " << idxVal
+          //        << "\n\tfield type: " << *TypeOfFieldAtIdx << "\n";
           return false;
         }
 
@@ -1817,16 +1817,16 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
         // NOTE: LT because we account for unions.
         if (SizeOfTypeOfFieldAtIdx >= SizeOfTheMemOp) {
           SkippedMemAccessesAggressive++;
-          errs() << "[FSAN] Skipping instrumentation of access to struct field "
-                    "of size >= memaccess size: "
-                 << *O.getInsn() << "\n\tGEP: " << *GEP
-                 << "\n\tfield idx: " << idxVal
-                 << "\n\tfield type: " << *TypeOfFieldAtIdx
-                 << "\n\tfield size: " << SizeOfTypeOfFieldAtIdx
-                 << "\n\tmemaccess size: " << SizeOfTheMemOp
-                 << "\n\tGEPChain: " << GEPChainStr << "\n\tBaseTY: " << *BaseTY
-                 << "\n\tOP: " << *O.getPtr() << "\n\tChainLen " << ChainLen
-                 << "\n";
+          // errs() << "[FSAN] Skipping instrumentation of access to struct field "
+          //           "of size >= memaccess size: "
+          //        << *O.getInsn() << "\n\tGEP: " << *GEP
+          //        << "\n\tfield idx: " << idxVal
+          //        << "\n\tfield type: " << *TypeOfFieldAtIdx
+          //        << "\n\tfield size: " << SizeOfTypeOfFieldAtIdx
+          //        << "\n\tmemaccess size: " << SizeOfTheMemOp
+          //        << "\n\tGEPChain: " << GEPChainStr << "\n\tBaseTY: " << *BaseTY
+          //        << "\n\tOP: " << *O.getPtr() << "\n\tChainLen " << ChainLen
+          //        << "\n";
           return true;
         } // if SizeOfTypeOfFieldAtId
       } // ConstantIdx GEP

@@ -112,7 +112,10 @@ static cl::opt<bool> GVNEnableLoadInLoopPRE("enable-load-in-loop-pre",
 static cl::opt<bool>
 GVNEnableSplitBackedgeInLoadPRE("enable-split-backedge-in-load-pre",
                                 cl::init(false));
-static cl::opt<bool> GVNEnableMemDep("enable-gvn-memdep", cl::init(true));
+
+static ::cl::opt<bool> clFSAN_disableGVN("fsan-disable-gvn", cl::init(false), cl::Hidden);
+static cl::opt<bool>
+    GVNEnableMemDep("enable-gvn-memdep", cl::init(true));
 static cl::opt<bool> GVNEnableMemorySSA("enable-gvn-memoryssa",
                                         cl::init(false));
 
@@ -431,28 +434,28 @@ GVNPass::Expression GVNPass::ValueTable::createGEPExpr(GetElementPtrInst *GEP) {
   unsigned BitWidth = DL.getIndexTypeSizeInBits(PtrTy);
   SmallMapVector<Value *, APInt, 4> VariableOffsets;
   APInt ConstantOffset(BitWidth, 0);
-  if (GEP->collectOffset(DL, BitWidth, VariableOffsets, ConstantOffset)) {
-    // Convert into offset representation, to recognize equivalent address
-    // calculations that use different type encoding.
-    LLVMContext &Context = GEP->getContext();
-    E.Opcode = GEP->getOpcode();
-    E.Ty = nullptr;
-    E.VarArgs.push_back(lookupOrAdd(GEP->getPointerOperand()));
-    for (const auto &[V, Scale] : VariableOffsets) {
-      E.VarArgs.push_back(lookupOrAdd(V));
-      E.VarArgs.push_back(lookupOrAdd(ConstantInt::get(Context, Scale)));
-    }
-    if (!ConstantOffset.isZero())
-      E.VarArgs.push_back(
-          lookupOrAdd(ConstantInt::get(Context, ConstantOffset)));
-  } else {
+  // if (GEP->collectOffset(DL, BitWidth, VariableOffsets, ConstantOffset)) {
+  //   // Convert into offset representation, to recognize equivalent address
+  //   // calculations that use different type encoding.
+  //   LLVMContext &Context = GEP->getContext();
+  //   E.Opcode = GEP->getOpcode();
+  //   E.Ty = nullptr;
+  //   E.VarArgs.push_back(lookupOrAdd(GEP->getPointerOperand()));
+  //   for (const auto &[V, Scale] : VariableOffsets) {
+  //     E.VarArgs.push_back(lookupOrAdd(V));
+  //     E.VarArgs.push_back(lookupOrAdd(ConstantInt::get(Context, Scale)));
+  //   }
+  //   if (!ConstantOffset.isZero())
+  //     E.VarArgs.push_back(
+  //         lookupOrAdd(ConstantInt::get(Context, ConstantOffset)));
+  // } else {
     // If converting to offset representation fails (for scalable vectors),
     // fall back to type-based implementation.
     E.Opcode = GEP->getOpcode();
     E.Ty = GEP->getSourceElementType();
     for (Use &Op : GEP->operands())
       E.VarArgs.push_back(lookupOrAdd(Op));
-  }
+  // }
   return E;
 }
 
@@ -716,10 +719,10 @@ uint32_t GVNPass::ValueTable::lookupOrAdd(Value *V) {
     case Instruction::ExtractValue:
       Exp = createExtractvalueExpr(cast<ExtractValueInst>(I));
       break;
-    case Instruction::PHI:
-      ValueNumbering[V] = NextValueNumber;
-      NumberingPhi[NextValueNumber] = cast<PHINode>(V);
-      return NextValueNumber++;
+    // case Instruction::PHI:
+    //   ValueNumbering[V] = NextValueNumber;
+    //   NumberingPhi[NextValueNumber] = cast<PHINode>(V);
+    //   return NextValueNumber++;
     case Instruction::Load:
     case Instruction::Store:
       return computeLoadStoreVN(I);
@@ -883,8 +886,9 @@ PreservedAnalyses GVNPass::run(Function &F, FunctionAnalysisManager &AM) {
   // significant! Re-ordering these variables will cause GVN when run alone to
   // be less effective! We should fix memdep and basic-aa to not exhibit this
   // behavior, but until then don't change the order here.
-  if (F.hasFnAttribute(Attribute::SanitizeHWAddress))
+  if (F.hasFnAttribute(Attribute::SanitizeHWAddress) && clFSAN_disableGVN){
     return PreservedAnalyses::all(); // FSAN
+  }
   auto &AC = AM.getResult<AssumptionAnalysis>(F);
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
   auto &TLI = AM.getResult<TargetLibraryAnalysis>(F);
@@ -2029,7 +2033,7 @@ bool GVNPass::processNonLocalLoad(LoadInst *Load) {
           dyn_cast<GetElementPtrInst>(Load->getOperand(0))) {
     for (Use &U : GEP->indices())
       if (Instruction *I = dyn_cast<Instruction>(U.get()))
-        Changed |= performScalarPRE(I);
+        Changed |= performScalarPRE(I); // in this implementation, GEP PRE is disabled.
   }
 
   // Step 2: Analyze the availability of the load.
