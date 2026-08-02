@@ -1817,14 +1817,16 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
         // NOTE: LT because we account for unions.
         if (SizeOfTypeOfFieldAtIdx >= SizeOfTheMemOp) {
           SkippedMemAccessesAggressive++;
-          // errs() << "[FSAN] Skipping instrumentation of access to struct field "
+          // errs() << "[FSAN] Skipping instrumentation of access to struct
+          // field "
           //           "of size >= memaccess size: "
           //        << *O.getInsn() << "\n\tGEP: " << *GEP
           //        << "\n\tfield idx: " << idxVal
           //        << "\n\tfield type: " << *TypeOfFieldAtIdx
           //        << "\n\tfield size: " << SizeOfTypeOfFieldAtIdx
           //        << "\n\tmemaccess size: " << SizeOfTheMemOp
-          //        << "\n\tGEPChain: " << GEPChainStr << "\n\tBaseTY: " << *BaseTY
+          //        << "\n\tGEPChain: " << GEPChainStr << "\n\tBaseTY: " <<
+          //        *BaseTY
           //        << "\n\tOP: " << *O.getPtr() << "\n\tChainLen " << ChainLen
           //        << "\n";
           return true;
@@ -2661,8 +2663,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     }
   }
   memtag::StackInfo &SInfo = SIB.get();
-  errs() << "[FSAN] FUNC: " << F.getName() << " # MEM ACC "
-         << OperandsToInstrument.size() << "\n";
+  // errs() << "[FSAN] FUNC: " << F.getName() << " # MEM ACC "
+  //        << OperandsToInstrument.size() << "\n";
   initializeCallbacks(*F.getParent());
 
   if (!LandingPadVec.empty())
