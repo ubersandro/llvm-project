@@ -88,6 +88,10 @@ STATISTIC(NumReplaced    , "Number of exit values replaced");
 STATISTIC(NumLFTR        , "Number of loop exit tests replaced");
 STATISTIC(NumElimExt     , "Number of IV sign/zero extends eliminated");
 STATISTIC(NumElimIV      , "Number of congruent IVs eliminated");
+static cl::opt<bool> clFSAN_disableIndVarSimplify(
+    "fsan-disable-indvarsimplify", cl::init(false), cl::Hidden,
+    cl::desc("Disable induction variable simplification for FSAN.")
+);
 
 static cl::opt<ReplaceExitVal> ReplaceExitValue(
     "replexitval", cl::Hidden, cl::init(OnlyCheapRepl),
@@ -1875,6 +1879,10 @@ bool IndVarSimplify::predicateLoopExits(Loop *L, SCEVExpander &Rewriter) {
 //===----------------------------------------------------------------------===//
 
 bool IndVarSimplify::run(Loop *L) {
+  auto F = L->getHeader()->getParent();
+  if (F->hasFnAttribute(Attribute::SanitizeHWAddress) &&
+      clFSAN_disableIndVarSimplify)
+    return false;
   // We need (and expect!) the incoming loop to be in LCSSA.
   assert(L->isRecursivelyLCSSAForm(*DT, *LI) &&
          "LCSSA required to run indvars!");
@@ -2040,7 +2048,7 @@ bool IndVarSimplify::run(Loop *L) {
 PreservedAnalyses IndVarSimplifyPass::run(Loop &L, LoopAnalysisManager &AM,
                                           LoopStandardAnalysisResults &AR,
                                           LPMUpdater &) {
-  return PreservedAnalyses::all();
+  // return PreservedAnalyses::all(); // FSAN
   Function *F = L.getHeader()->getParent();
   const DataLayout &DL = F->getDataLayout();
 
