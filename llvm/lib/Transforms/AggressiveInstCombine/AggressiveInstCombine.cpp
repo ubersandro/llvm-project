@@ -44,7 +44,9 @@ STATISTIC(NumGuardedRotates,
 STATISTIC(NumGuardedFunnelShifts,
           "Number of guarded funnel shifts transformed into funnel shifts");
 STATISTIC(NumPopCountRecognized, "Number of popcount idioms recognized");
-
+static cl::opt<bool> clFSAN_disableAggressiveInstCombine(
+    "fsan-disable-aggressive-instcombine", cl::init(false), cl::Hidden,
+    cl::desc("Disable aggressive instcombine when building with FSAN"));
 static cl::opt<unsigned> MaxInstrsToScan(
     "aggressive-instcombine-max-scan-instrs", cl::init(64), cl::Hidden,
     cl::desc("Max number of instructions to scan for aggressive instcombine."));
@@ -1322,7 +1324,7 @@ static bool foldUnusualPatterns(Function &F, DominatorTree &DT,
       MadeChange |= tryToRecognizePopCount(I);
       MadeChange |= tryToFPToSat(I, TTI);
       MadeChange |= tryToRecognizeTableBasedCttz(I);
-      MadeChange |= foldConsecutiveLoads(I, DL, TTI, AA, DT);
+      // MadeChange |= foldConsecutiveLoads(I, DL, TTI, AA, DT);
       MadeChange |= foldPatternedLoads(I, DL);
       MadeChange |= foldICmpOrChain(I, DL, TTI, AA, DT);
       // NOTE: This function introduces erasing of the instruction `I`, so it
@@ -1362,7 +1364,7 @@ PreservedAnalyses AggressiveInstCombinePass::run(Function &F,
   auto &AA = AM.getResult<AAManager>(F);
   bool MadeCFGChange = false;
   bool BuildingWithFSAN = F.hasFnAttribute(Attribute::SanitizeHWAddress);
-  if(BuildingWithFSAN) {
+  if(BuildingWithFSAN && clFSAN_disableAggressiveInstCombine) {
     return PreservedAnalyses::all();
   }
   if (!runImpl(F, AC, TTI, TLI, DT, AA, MadeCFGChange)) {
