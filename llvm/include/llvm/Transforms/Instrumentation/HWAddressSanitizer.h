@@ -213,6 +213,9 @@ private:
 
   void InstrumentGEP_L(GetElementPtrInst *GEPI);
   void InstrumentGEP_NoL(GetElementPtrInst *GEPI); /** for later */
+  bool isSLPVectorizedStoreOrLoad(InterestingMemoryOperand &O,
+                                  const DataLayout &DL);
+
   bool canBeSkipped(InterestingMemoryOperand &O, const DataLayout &DL);
   bool isArrayOfStructs(llvm::Type *T);
   bool performChecksOnGEP(GetElementPtrInst *GEPI);

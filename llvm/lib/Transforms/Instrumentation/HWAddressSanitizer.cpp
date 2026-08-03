@@ -1638,11 +1638,64 @@ Type *HWAddressSanitizer::extractUnderlyingMemType(Value *I,
   return BaseTY;
 }
 
+// TODO: implement check on the very last element
+bool HWAddressSanitizer::isSLPVectorizedStoreOrLoad(InterestingMemoryOperand &O,
+                                                    const DataLayout &DL) {
+  // skip the following stores since compiler can prove safety of these accesses
+  //   store <4 x i32> <i32 30, i32 0, i32 1, i32 60>, ptr
+  //   %castleflag.fsan.scalar, align 4, !dbg !14084, !tbaa !2809
+  if (StoreInst *ST = dyn_cast<StoreInst>(O.getInsn())) {
+    if (ST->getValueOperand()->getType()->isVectorTy()) {
+      if (VectorType *VTY =
+              dyn_cast<VectorType>(ST->getValueOperand()->getType())) {
+        auto NElems = VTY->getElementCount().getKnownMinValue();
+        if (NElems > 1) {
+          return true;
+        }
+      }
+    }
+  }
+
+  if (LoadInst *LI = dyn_cast<LoadInst>(O.getInsn())) {
+    if (LI->getType()->isVectorTy()) {
+      // if (LI->getType()->getElementCount().getZExtValue() > 1) {
+      if (VectorType *VTY = dyn_cast<VectorType>(LI->getType())) {
+        auto NElems = VTY->getElementCount().getKnownMinValue();
+        if (NElems > 1) {
+          return true;
+        }
+      }
+    }
+  } //
+
+  bool ret = false;
+  return ret;
+} // isSLPVectorizedStoreOrLoad
+
 bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
                                       const DataLayout &DL) {
   // NOTE: we care about accesses to N-D scalar arrays, structs/classes and
   // their aggregates. All the rest is out-of-scope.
   bool scalar = isAccessToScalar(O, DL);
+  bool isSLP = isSLPVectorizedStoreOrLoad(O, DL);
+  if (isSLP) {
+    // skip load from/store of SROA slices and type coerced structs
+    bool isSROA = false, isTypeCoerced = false;
+    std::string Name = "";
+    if (LoadInst *LD = dyn_cast<LoadInst>(O.getInsn())) {
+      if (LD->hasName())
+        Name = LD->getName().str(); // maybe loading some SROA slice
+    } else if (StoreInst *ST = dyn_cast<StoreInst>(O.getInsn())) {
+      if (ST->getPointerOperand()->hasName())
+        Name = ST->getPointerOperand()->getName().str();
+    }
+    if (Name.find(".sroa.") != std::string::npos)
+      isSROA = true;
+    if (Name.find(".coerce.") != std::string::npos)
+      isTypeCoerced = true;
+    if (isSROA || isTypeCoerced)
+      return false;
+  }// isSLP
   if (scalar)
     return true;
   Type *BaseTY = nullptr; // base type modulo all the GEPs.
@@ -2262,15 +2315,47 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
       (!O.Alignment || *O.Alignment >= Mapping.getObjectAlignment() ||
        *O.Alignment >= O.TypeStoreSize / 8)) {
     size_t AccessSizeIndex = TypeSizeToSizeIndex(O.TypeStoreSize);
-
-    if (!ClFSAN_memAccessesInline) {
-      SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
-      IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
-                     Args);
+    bool isSLP = isSLPVectorizedStoreOrLoad(O, DL);
+    if (isSLP) {
+      errs() << "[FSAN] INSTR SLP VECT: " << *O.getInsn() << "\n";
+      VectorType *LoadedOrStoredValVecTy = nullptr;
+      if (StoreInst *ST = dyn_cast<StoreInst>(O.getInsn())) {
+        LoadedOrStoredValVecTy =
+            dyn_cast<VectorType>(ST->getValueOperand()->getType());
+      } else if (LoadInst *LD = dyn_cast<LoadInst>(O.getInsn())) {
+        LoadedOrStoredValVecTy = dyn_cast<VectorType>(LD->getType());
+      }
+      if (LoadedOrStoredValVecTy && LoadedOrStoredValVecTy->isVectorTy()) {
+        auto BaseElemTy =
+            LoadedOrStoredValVecTy->getElementType(); // scalar? TODO
+        unsigned BaseElemSize = DL.getTypeStoreSize(BaseElemTy);
+        unsigned NumElems = LoadedOrStoredValVecTy->getElementCount()
+                                .getKnownMinValue(); // what if it's not known?
+        errs() << "[FSAN] SLP VECT: BaseElemTy: " << *BaseElemTy
+               << ", BaseElemSize: " << BaseElemSize
+               << ", NumElems: " << NumElems << "\n";
+        // call this function __hwasan_accessN_SLP
+        FunctionCallee checkSLPFunc = M.getOrInsertFunction(
+            "__hwasan_accessN_SLP",
+            FunctionType::get(IRB.getVoidTy(), {IntptrTy, Int64Ty, Int64Ty},
+                              false));
+        assert(checkSLPFunc &&
+               "Failed to get or insert function __hwasan_accessN_SLP");
+        IRB.CreateCall(checkSLPFunc, {IRB.CreatePointerCast(Addr, IntptrTy),
+                                      ConstantInt::get(Int64Ty, BaseElemSize),
+                                      ConstantInt::get(Int64Ty, NumElems)});
+      }
+      // create call to __hwasan_accessN_SLP
     } else {
-      instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, I, DTU, LI);
-      NumMemAccessesInlined++;
-    }
+      if (!ClFSAN_memAccessesInline) {
+        SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
+        IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
+                       Args);
+      } else {
+        instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, I, DTU, LI);
+        NumMemAccessesInlined++;
+      }
+    } // NOT SLP
 
   } else {
     SmallVector<Value *, 3> Args{
