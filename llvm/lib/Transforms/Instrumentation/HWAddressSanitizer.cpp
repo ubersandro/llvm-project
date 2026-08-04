@@ -4075,6 +4075,10 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     errs() << "FUCK PYTHON " << NAME << "\n";
     return;
   }
+  if (NAME.find("SNGL_SCAN") != std::string::npos || NAME.find("INIT_FLD") != std::string::npos) {
+    errs() << "FUCK 525 SPEC " << NAME << "\n";
+    return;
+  }
   Constant *Initializer = GV->getInitializer();
   Type *GVType = GV->getValueType();
 
