@@ -242,7 +242,8 @@ private:
                                           FunctionAnalysisManager &FAM) const;
   void initializeModule();
   void createHwasanCtorComdat();
-
+  bool checkIfSROATypePunning(InterestingMemoryOperand &O,
+                                                  const DataLayout &DL);
   void initializeCallbacks(Module &M);
 
   Value *getOpaqueNoopCast(IRBuilder<> &IRB,
@@ -367,53 +368,53 @@ private:
     bool withFrameRecord() const { return WithFrameRecord; };
   };
 
-  ShadowMapping Mapping;
+    ShadowMapping Mapping;
 
-  Type *VoidTy = Type::getVoidTy(M.getContext());
-  Type *IntptrTy = M.getDataLayout().getIntPtrType(M.getContext());
-  PointerType *PtrTy = PointerType::getUnqual(M.getContext());
-  Type *Int8Ty = Type::getInt8Ty(M.getContext());
-  Type *Int32Ty = Type::getInt32Ty(M.getContext());
-  Type *Int64Ty = Type::getInt64Ty(M.getContext());
+    Type *VoidTy = Type::getVoidTy(M.getContext());
+    Type *IntptrTy = M.getDataLayout().getIntPtrType(M.getContext());
+    PointerType *PtrTy = PointerType::getUnqual(M.getContext());
+    Type *Int8Ty = Type::getInt8Ty(M.getContext());
+    Type *Int32Ty = Type::getInt32Ty(M.getContext());
+    Type *Int64Ty = Type::getInt64Ty(M.getContext());
 
-  bool CompileKernel;
-  bool OutlinedChecks;
-  bool InlineFastPath;
-  bool InstrumentLandingPads;
-  bool InstrumentWithCalls;
-  bool InstrumentStack;
-  bool InstrumentGlobals;
-  bool UseMatchAllCallback;
+    bool CompileKernel;
+    bool OutlinedChecks;
+    bool InlineFastPath;
+    bool InstrumentLandingPads;
+    bool InstrumentWithCalls;
+    bool InstrumentStack;
+    bool InstrumentGlobals;
+    bool UseMatchAllCallback;
 
-  std::optional<uint8_t> MatchAllTag;
+    std::optional<uint8_t> MatchAllTag;
 
-  unsigned PointerTagShift;
-  unsigned LevelShift;
-  uint64_t LMask;
-  uint64_t TMask;
-  uint64_t RMask;
+    unsigned PointerTagShift;
+    unsigned LevelShift;
+    uint64_t LMask;
+    uint64_t TMask;
+    uint64_t RMask;
 
-  uint64_t TagMaskByte;
+    uint64_t TagMaskByte;
 
-  Function *HwasanCtorFunction;
+    Function *HwasanCtorFunction;
 
-  FunctionCallee HwasanMemoryAccessCallback[2][kNumberOfAccessSizes];
-  FunctionCallee HwasanMemoryAccessCallbackSized[2];
+    FunctionCallee HwasanMemoryAccessCallback[2][kNumberOfAccessSizes];
+    FunctionCallee HwasanMemoryAccessCallbackSized[2];
 
-  FunctionCallee HwasanMemmove, HwasanMemcpy, HwasanMemset;
-  FunctionCallee HwasanHandleVfork;
+    FunctionCallee HwasanMemmove, HwasanMemcpy, HwasanMemset;
+    FunctionCallee HwasanHandleVfork;
 
-  FunctionCallee HwasanTagMemoryFunc;
-  FunctionCallee HwasanGenerateTagFunc;
-  FunctionCallee HwasanRecordFrameRecordFunc;
+    FunctionCallee HwasanTagMemoryFunc;
+    FunctionCallee HwasanGenerateTagFunc;
+    FunctionCallee HwasanRecordFrameRecordFunc;
 
-  Constant *ShadowGlobal;
+    Constant *ShadowGlobal;
 
-  Value *ShadowBase = nullptr;
+    Value *ShadowBase = nullptr;
 
-  Value *CachedFP = nullptr;
-  GlobalValue *ThreadPtrGlobal = nullptr;
-};
+    Value *CachedFP = nullptr;
+    GlobalValue *ThreadPtrGlobal = nullptr;
+  };
 
 } // end anonymous namespace
 } // namespace llvm

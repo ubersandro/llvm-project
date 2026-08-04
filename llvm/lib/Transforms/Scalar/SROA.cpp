@@ -121,8 +121,7 @@ STATISTIC(NumVectorized, "Number of vectorized aggregates");
 /// Disable running mem2reg during SROA in order to test or debug SROA.
 static cl::opt<bool> SROASkipMem2Reg("sroa-skip-mem2reg", cl::init(false),
                                      cl::Hidden);
-static cl::opt<bool> clFSAN_SROA("enable-sroa", cl::init(true),
-                                     cl::Hidden);
+static cl::opt<bool> clFSAN_SROA("enable-sroa", cl::init(true), cl::Hidden);
 namespace {
 
 class AllocaSliceRewriter;
@@ -5873,7 +5872,7 @@ std::pair<bool /*Changed*/, bool /*CFGChanged*/> SROA::runSROA(Function &F) {
 }
 
 PreservedAnalyses SROAPass::run(Function &F, FunctionAnalysisManager &AM) {
-  if(F.hasFnAttribute(Attribute::SanitizeHWAddress) && !clFSAN_SROA)
+  if (F.hasFnAttribute(Attribute::SanitizeHWAddress) && !clFSAN_SROA)
     return PreservedAnalyses::all(); // FSAN
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
   AssumptionCache &AC = AM.getResult<AssumptionAnalysis>(F);

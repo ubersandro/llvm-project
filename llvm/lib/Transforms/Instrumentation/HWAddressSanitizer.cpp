@@ -1672,6 +1672,77 @@ bool HWAddressSanitizer::isSLPVectorizedStoreOrLoad(InterestingMemoryOperand &O,
   return ret;
 } // isSLPVectorizedStoreOrLoad
 
+/**
+ * SROA could perform type punning to simplify accesses to aggregate of
+ * structures (cfr. FSAN 89a56bf35be37479695afd2c4939b92bca5353ef on SPEC2006
+ * 433.milc - coldlat function)
+ */
+/** EXAMPLE:
+ * %arrayidx14 = getelementptr inbounds nuw [3 x %struct.complex], ptr
+%arrayidx12, i64 0, i64 %idxprom13
+ * %call = tail call { double,  double } @cmplx(double noundef 0.000000e+00,
+double noundef 0.000000e+00)
+ * %5 = extractvalue { double, double } %call, 0
+ * %6 = store double %5, ptr %arrayidx14, align 8,
+*/
+bool HWAddressSanitizer::checkIfSROATypePunning(InterestingMemoryOperand &O,
+                                                const DataLayout &DL) {
+  bool ret = false;
+  // DETECT SROA type punning and skip instrumentation of these accesses
+  bool operandIsArrayIdx = false;
+  bool accessingArrayOfStructs = false;
+  StructType *ST = nullptr;
+  Type *TYOfAccessedElement = nullptr;
+  Type *TYOfMemAccess =
+      nullptr; // must match ty of accessed element, ow instrument
+  GetElementPtrInst *GEP = nullptr;
+  Type *ArrayTy = nullptr;
+
+  if (StoreInst *SI = dyn_cast<StoreInst>(O.getInsn())) {
+    GEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());
+    if (!GEP)
+      return ret;
+    TYOfMemAccess = SI->getValueOperand()->getType();
+
+  } else if (LoadInst *LI = dyn_cast<LoadInst>(O.getInsn())) {
+    GEP = dyn_cast<GetElementPtrInst>(LI->getPointerOperand());
+    if (!GEP)
+      return ret;
+    TYOfMemAccess = LI->getType();
+  }
+  else
+    return ret;
+  
+  if (GEP->hasName())
+    if (GEP->getName().str().find("arrayidx") != std::string::npos) {
+      if (GEP->getName().str().find("sroa_idx") != std::string::npos)
+        return true; // DONT BOTHER CHECKING, this is uninstrumented
+      operandIsArrayIdx = true;
+      Type *ArrayTy = dyn_cast<ArrayType>(GEP->getSourceElementType());
+      if (!ArrayTy)
+        return false; // DO NOT SKIP
+
+      TYOfAccessedElement = dyn_cast<StructType>(
+          dyn_cast<ArrayType>(GEP->getSourceElementType())->getElementType());
+      if (!TYOfAccessedElement)
+        return false; // DO NOT SKIP
+      Type *TypeOfFirstElementOfAccessedStruct = nullptr;
+      if (StructType *ST = dyn_cast<StructType>(TYOfAccessedElement)) {
+        if (ST->getNumElements() > 0) {
+          TypeOfFirstElementOfAccessedStruct = ST->getElementType(0);
+
+        } else
+          return false; // DO NOT SKIP
+        if (!TYOfMemAccess->isStructTy() &&
+            TYOfMemAccess != TYOfAccessedElement &&
+            TYOfMemAccess == TypeOfFirstElementOfAccessedStruct)
+          return true;
+      }
+    } // arrayidx
+  return ret;
+}
+
+// IntraObjectSafetyAnalysis v0
 bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
                                       const DataLayout &DL) {
   // NOTE: we care about accesses to N-D scalar arrays, structs/classes and
@@ -1679,6 +1750,7 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
   bool scalar = isAccessToScalar(O, DL);
   bool isSLP = isSLPVectorizedStoreOrLoad(O, DL);
   if (isSLP) {
+    // TODO: this needs more engineering to clarify what it is
     // skip load from/store of SROA slices and type coerced structs
     bool isSROA = false, isTypeCoerced = false;
     std::string Name = "";
@@ -1689,13 +1761,18 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
       if (ST->getPointerOperand()->hasName())
         Name = ST->getPointerOperand()->getName().str();
     }
-    if (Name.find(".sroa.") != std::string::npos)
+    if (Name.find("sroa") != std::string::npos)
       isSROA = true;
-    if (Name.find(".coerce.") != std::string::npos)
+    if (Name.find("coerce") != std::string::npos)
       isTypeCoerced = true;
     if (isSROA || isTypeCoerced)
       return false;
-  }// isSLP
+  } // isSLP
+
+  bool isSROATypePunning = checkIfSROATypePunning(O, DL);
+  if (isSROATypePunning)
+    return true; // SKIP to remove FP
+
   if (scalar)
     return true;
   Type *BaseTY = nullptr; // base type modulo all the GEPs.

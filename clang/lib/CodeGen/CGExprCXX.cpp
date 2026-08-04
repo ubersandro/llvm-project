@@ -1768,11 +1768,6 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     llvm::Value *allocationPtr = allocation.emitRawPointer(*this);
     llvm::Value *tagMemoryCall = Builder.CreateCall(
         FSANTagMemoryFunc, {allocationPtr, nullPtr, typeSize, arraySize});
-    llvm::errs() << "\t[DBG-FE] Emitted call to fsan_tag_memory for "
-                    "placement new, SRC LOC: "
-                 << E->getExprLoc().printToString(
-                        getContext().getSourceManager())
-                 << "\n";
     } // if it's a struct and we're instrumenting with HWAsan
 
     }
