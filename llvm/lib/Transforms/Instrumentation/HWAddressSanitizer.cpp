@@ -2742,17 +2742,9 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   bool skipMemAccessInst = false;
   if (!F.hasFnAttribute(Attribute::SanitizeHWAddress)) {
+    errs() << "[FSAN] Function " << F.getName()
+           << " does not have attribute SanitizeHWAddress, skipping\n";
     return;
-    // TODO: questo puzza di merda
-    // auto FNNAME = F.getName().str();
-    // if(FNNAME.find("llvm.") != std::string::npos || FNNAME.find("__hwasan")
-    // != std::string::npos)
-    //   return;
-    // // else
-    // skipMemAccessInst = true;
-    // errs() << "[FSAN] Function " << F.getName()
-    //        << " does not have the attribute 'sanitize_hwaddress', skipping "
-    //           "instrumentation of memory accesses.\n";
   }
 
   if (F.empty())
@@ -3025,13 +3017,14 @@ void HWAddressSanitizer::processOperand(Instruction *BOP, Value *OP, int idx) {
       auto *NewPtr = untagPointer(IRB, PTI);
       BOP->setOperand(idx, NewPtr);
     }
-  }
-  else if(PHINode* PN = dyn_cast<PHINode>(OP)) {
+  } else if (PHINode *PN = dyn_cast<PHINode>(OP)) {
     IRBuilder<> IRB(BOP);
-    auto * UntaggedPHI = IRB.CreateAnd(PN, ConstantInt::get(PN->getType(), ~(TagMaskByte << PointerTagShift)), "untagged_phi.fsan");
+    auto *UntaggedPHI = IRB.CreateAnd(
+        PN, ConstantInt::get(PN->getType(), ~(TagMaskByte << PointerTagShift)),
+        "untagged_phi.fsan");
     BOP->setOperand(idx, UntaggedPHI);
-  }
-  else assert(false && "Operand is neither PtrToIntInst nor PHINode");
+  } else
+    assert(false && "Operand is neither PtrToIntInst nor PHINode");
 }
 
 PtrToIntInst *getBasePtrToInt(Value *V, int Depth = 0) {
@@ -3154,8 +3147,8 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
     // FunctionCallee printf = M.getOrInsertFunction(
     //     "printf",
     //     FunctionType::get(IntegerType::getInt32Ty(M.getContext()),
-    //                       PointerType::get(Type::getInt8Ty(M.getContext()), 0),
-    //                       true));
+    //                       PointerType::get(Type::getInt8Ty(M.getContext()),
+    //                       0), true));
     IRBuilder<> IRB(BOP);
     auto *PTI_LHS = getBasePtrToInt(OP0);
     auto *PTI_RHS = getBasePtrToInt(OP1);
@@ -3177,7 +3170,7 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
   processOperand(BOP, OP0, 0); // OP0 is a ptrtoint
   processOperand(BOP, OP1, 1); // OP1 is a ptrtoint
   NumInstrumentedBOPs++;
-}
+} // InstrumentBOP
 
 bool HWAddressSanitizer::isArrayOfStructs(llvm::Type *T) {
   // Peel all array dimensions
@@ -3334,7 +3327,8 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         taggedPointer = IRB.CreateIntToPtr(GEPLongWithT, GEPI->getType());
         endResultName = GEPNAME + ".fsan.scalar";
       } // sonIsScalar
-      else if (DstIsArray && getArrayDimension(DstType) > 1 && !isArrayOfStructs(DstType)) {
+      else if (DstIsArray && getArrayDimension(DstType) > 1 &&
+               !isArrayOfStructs(DstType)) {
         // set bit 5 in the tag
         // TODO: this might no longer be necessary in the future
         Value *untagged = maskPointerIntrinsic(IRB, GEPI, PTR_MASK);
@@ -3345,7 +3339,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
                       (TBits +
                        LBits)))); // keep pointer to array tagged, otherwise
                                   // checks shortcircuit to noop
-        Value *GEPLongWithT = IRB.CreateOr(GEPLong, TBits_CONST);
+        Value *GEPLongWithT = IRB.CreateOr(GEPLong, TBits_CONST); // attach MSB
         taggedPointer = IRB.CreateIntToPtr(GEPLongWithT, GEPI->getType());
         endResultName = GEPNAME + ".fsan.array";
       }
@@ -3369,7 +3363,6 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
           NDst < NSrc && NDst > 0; // array indexing or decay, or incdec
       bool isArrayOfScalars = !isArrayOfStructs(SrcType);
       if (isArrayOfScalars) {
-        return; // DEBUG
         // errs() << "[FSAN] ARRAY GEP: " << *GEPI << "\n";
         const uint64_t ShiftAdjustment = TwoOpsGEP ? 1ULL : 2ULL;
         assert(NSrc >= ShiftAdjustment && "Invalid NSrc for array GEP");
@@ -3984,27 +3977,8 @@ void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
       auto untaggedPtr2 = IRB.CreateAnd(op2, Mask);
       CI->replaceUsesOfWith(op2, untaggedPtr2);
       NumInstrumentedCMPs++;
-    } else {
+    } else
       return;
-      IRBuilder<> IRB(CI);
-      FunctionCallee printf = M.getOrInsertFunction(
-          "printf",
-          FunctionType::get(
-              IntegerType::getInt32Ty(M.getContext()),
-              PointerType::get(Type::getInt8Ty(M.getContext()), 0), true));
-      Value *FormatStr =
-          IRB.CreateGlobalStringPtr("CMP SKIP: %s, OP0: %s %p, OP1: %s %p\n");
-      Value *FUNC_NAME =
-          IRB.CreateGlobalStringPtr(CI->getFunction()->getName());
-      Value *OP0NAME_global = op1->hasName()
-                                  ? IRB.CreateGlobalStringPtr(op1->getName())
-                                  : IRB.CreateGlobalStringPtr("unnamed");
-      Value *OP1NAME_global = op2->hasName()
-                                  ? IRB.CreateGlobalStringPtr(op2->getName())
-                                  : IRB.CreateGlobalStringPtr("unnamed");
-      IRB.CreateCall(printf, {FormatStr, FUNC_NAME, OP0NAME_global, op1,
-                              OP1NAME_global, op2});
-    }
   }
 } // InstrumentCMP
 
