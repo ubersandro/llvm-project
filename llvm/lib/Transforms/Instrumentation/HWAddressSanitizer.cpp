@@ -1590,8 +1590,12 @@ bool HWAddressSanitizer::isAccessToScalar(InterestingMemoryOperand &O,
   } // it's alloca
 
   if (GlobalVariable *GV = dyn_cast<GlobalVariable>(O.getPtr()))
-    if (!GV->getMetadata("fsan.instrument"))
+    if (!GV->getMetadata("fsan.instrument")) {
+      // errs() << "[FSAN] Skipping instrumentation of access to scalar global:
+      // "
+      //        << *GV << "\n";
       ret = true;
+    }
   if (ret)
     SkippedMemAccesses++;
   return ret;
@@ -1639,8 +1643,8 @@ Type *HWAddressSanitizer::extractUnderlyingMemType(Value *I,
 }
 
 // TODO: implement check on the very last element
-bool HWAddressSanitizer::isSLPVectorizedStoreOrLoad(InterestingMemoryOperand &O,
-                                                    const DataLayout &DL) {
+bool HWAddressSanitizer::isVectorizedStoreOrLoad(InterestingMemoryOperand &O,
+                                                 const DataLayout &DL) {
   // skip the following stores since compiler can prove safety of these accesses
   //   store <4 x i32> <i32 30, i32 0, i32 1, i32 60>, ptr
   //   %castleflag.fsan.scalar, align 4, !dbg !14084, !tbaa !2809
@@ -1670,7 +1674,7 @@ bool HWAddressSanitizer::isSLPVectorizedStoreOrLoad(InterestingMemoryOperand &O,
 
   bool ret = false;
   return ret;
-} // isSLPVectorizedStoreOrLoad
+} // isVectorizedStoreOrLoad
 
 /**
  * SROA could perform type punning to simplify accesses to aggregate of
@@ -1709,10 +1713,9 @@ bool HWAddressSanitizer::checkIfSROATypePunning(InterestingMemoryOperand &O,
     if (!GEP)
       return ret;
     TYOfMemAccess = LI->getType();
-  }
-  else
+  } else
     return ret;
-  
+
   if (GEP->hasName())
     if (GEP->getName().str().find("arrayidx") != std::string::npos) {
       if (GEP->getName().str().find("sroa_idx") != std::string::npos)
@@ -1748,8 +1751,8 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
   // NOTE: we care about accesses to N-D scalar arrays, structs/classes and
   // their aggregates. All the rest is out-of-scope.
   bool scalar = isAccessToScalar(O, DL);
-  bool isSLP = isSLPVectorizedStoreOrLoad(O, DL);
-  if (isSLP) {
+  bool isVect = isVectorizedStoreOrLoad(O, DL);
+  if (isVect) {
     // TODO: this needs more engineering to clarify what it is
     // skip load from/store of SROA slices and type coerced structs
     bool isSROA = false, isTypeCoerced = false;
@@ -1767,7 +1770,7 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
       isTypeCoerced = true;
     if (isSROA || isTypeCoerced)
       return false;
-  } // isSLP
+  } // isVect
 
   bool isSROATypePunning = checkIfSROATypePunning(O, DL);
   if (isSROATypePunning)
@@ -2392,9 +2395,9 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
       (!O.Alignment || *O.Alignment >= Mapping.getObjectAlignment() ||
        *O.Alignment >= O.TypeStoreSize / 8)) {
     size_t AccessSizeIndex = TypeSizeToSizeIndex(O.TypeStoreSize);
-    bool isSLP = isSLPVectorizedStoreOrLoad(O, DL);
-    if (isSLP) {
-      errs() << "[FSAN] INSTR SLP VECT: " << *O.getInsn() << "\n";
+    bool is = isVectorizedStoreOrLoad(O, DL);
+    if (is) {
+      errs() << "[FSAN] INSTR  VECT: " << *O.getInsn() << "\n";
       VectorType *LoadedOrStoredValVecTy = nullptr;
       if (StoreInst *ST = dyn_cast<StoreInst>(O.getInsn())) {
         LoadedOrStoredValVecTy =
@@ -2408,21 +2411,21 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
         unsigned BaseElemSize = DL.getTypeStoreSize(BaseElemTy);
         unsigned NumElems = LoadedOrStoredValVecTy->getElementCount()
                                 .getKnownMinValue(); // what if it's not known?
-        errs() << "[FSAN] SLP VECT: BaseElemTy: " << *BaseElemTy
+        errs() << "[FSAN]  VECT: BaseElemTy: " << *BaseElemTy
                << ", BaseElemSize: " << BaseElemSize
                << ", NumElems: " << NumElems << "\n";
-        // call this function __hwasan_accessN_SLP
-        FunctionCallee checkSLPFunc = M.getOrInsertFunction(
+        // call this function __hwasan_accessN_
+        FunctionCallee checkFunc = M.getOrInsertFunction(
             "__hwasan_accessN_SLP",
             FunctionType::get(IRB.getVoidTy(), {IntptrTy, Int64Ty, Int64Ty},
                               false));
-        assert(checkSLPFunc &&
-               "Failed to get or insert function __hwasan_accessN_SLP");
-        IRB.CreateCall(checkSLPFunc, {IRB.CreatePointerCast(Addr, IntptrTy),
-                                      ConstantInt::get(Int64Ty, BaseElemSize),
-                                      ConstantInt::get(Int64Ty, NumElems)});
+        assert(checkFunc &&
+               "Failed to get or insert function __hwasan_accessN_");
+        IRB.CreateCall(checkFunc, {IRB.CreatePointerCast(Addr, IntptrTy),
+                                   ConstantInt::get(Int64Ty, BaseElemSize),
+                                   ConstantInt::get(Int64Ty, NumElems)});
       }
-      // create call to __hwasan_accessN_SLP
+      // create call to __hwasan_accessN_
     } else {
       if (!ClFSAN_memAccessesInline) {
         SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
@@ -2432,7 +2435,7 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
         instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, I, DTU, LI);
         NumMemAccessesInlined++;
       }
-    } // NOT SLP
+    } // NOT
 
   } else {
     SmallVector<Value *, 3> Args{
@@ -3023,6 +3026,12 @@ void HWAddressSanitizer::processOperand(Instruction *BOP, Value *OP, int idx) {
       BOP->setOperand(idx, NewPtr);
     }
   }
+  else if(PHINode* PN = dyn_cast<PHINode>(OP)) {
+    IRBuilder<> IRB(BOP);
+    auto * UntaggedPHI = IRB.CreateAnd(PN, ConstantInt::get(PN->getType(), ~(TagMaskByte << PointerTagShift)), "untagged_phi.fsan");
+    BOP->setOperand(idx, UntaggedPHI);
+  }
+  else assert(false && "Operand is neither PtrToIntInst nor PHINode");
 }
 
 PtrToIntInst *getBasePtrToInt(Value *V, int Depth = 0) {
@@ -3063,7 +3072,7 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
   auto *OP0 = BOP->getOperand(0);
   auto *OP1 = BOP->getOperand(1);
   IRBuilder<> IRB(BOP);
-
+  // TODO UNTAG sub.ptr.lhs.cast.pre-phi
   if (BOP->getOpcode() == Instruction::Add) {
     /**
      * %282 = ptrtoint ptr %281 to i64, !dbg !866067
@@ -3129,6 +3138,7 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
   }
 
   if (!BothPtr) {
+    // sub.ptr.lhs.cast.pre-phi
     // look for sub.ptr in the operands name
     if ((OP0->hasName() &&
          OP0->getName().str().find("sub.ptr") != std::string::npos &&
@@ -3141,11 +3151,11 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
   }
 
   if (!BothPtr) {
-    FunctionCallee printf = M.getOrInsertFunction(
-        "printf",
-        FunctionType::get(IntegerType::getInt32Ty(M.getContext()),
-                          PointerType::get(Type::getInt8Ty(M.getContext()), 0),
-                          true));
+    // FunctionCallee printf = M.getOrInsertFunction(
+    //     "printf",
+    //     FunctionType::get(IntegerType::getInt32Ty(M.getContext()),
+    //                       PointerType::get(Type::getInt8Ty(M.getContext()), 0),
+    //                       true));
     IRBuilder<> IRB(BOP);
     auto *PTI_LHS = getBasePtrToInt(OP0);
     auto *PTI_RHS = getBasePtrToInt(OP1);
@@ -3224,6 +3234,10 @@ uint64_t getArrayDimension(Type *AT) {
   return Dim;
 }
 void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
+  // TODO: if the pointer is null, do not instrument that GEP -> UB
+  bool PtrOpIsNull = false;
+  bool PtrOpIsUndefOrPoison = false;
+  bool isVectorGEP = false;
   auto nOperands = GEPI->getNumOperands();
   Value *sonTag = nullptr;
   Value *sonIdx = nullptr;
@@ -3238,6 +3252,21 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
   bool DstIsArray = DstType->isArrayTy();
 
   auto PtrOp = GEPI->getPointerOperand();
+  PtrOpIsNull = isa<ConstantPointerNull>(PtrOp);
+  if (PtrOpIsNull) {
+    errs() << "[FSAN] GEP with NULL PTROP: " << *GEPI << "\n";
+    return;
+  }
+  PtrOpIsUndefOrPoison = isa<UndefValue>(PtrOp) || isa<PoisonValue>(PtrOp);
+  if (PtrOpIsUndefOrPoison) {
+    errs() << "[FSAN] GEP with UNDEF/POISON PTROP: " << *GEPI << "\n";
+    return;
+  }
+  if (PtrOp->getType()->isVectorTy()) {
+    errs() << "[FSAN] GEP with VECTOR PTROP: " << *GEPI << "\n";
+    isVectorGEP = true;
+    return; // TODO
+  }
   auto GEPNAME = GEPI->hasName() ? GEPI->getName().str()
                                  : "gep." + itostr(NumInstrumentedGEPs);
   auto PTR_OP_NAME = GEPI->getPointerOperand()->hasName()
@@ -3275,6 +3304,8 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
 
     if (ST && !ST->hasName() && ClSkipUnnamedStructs)
       tag = performChecksOnGEP(GEPI);
+    if (!tag)
+      errs() << "CHECK ON " << *GEPI << "\n";
 
     auto sonIsScalar =
         !DstIsStruct && !DstType->isVectorTy() && !DstIsArrOfStructs &&
@@ -3303,7 +3334,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         taggedPointer = IRB.CreateIntToPtr(GEPLongWithT, GEPI->getType());
         endResultName = GEPNAME + ".fsan.scalar";
       } // sonIsScalar
-      else if (DstIsArray && getArrayDimension(DstType) > 1) {
+      else if (DstIsArray && getArrayDimension(DstType) > 1 && !isArrayOfStructs(DstType)) {
         // set bit 5 in the tag
         // TODO: this might no longer be necessary in the future
         Value *untagged = maskPointerIntrinsic(IRB, GEPI, PTR_MASK);
@@ -3338,6 +3369,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
           NDst < NSrc && NDst > 0; // array indexing or decay, or incdec
       bool isArrayOfScalars = !isArrayOfStructs(SrcType);
       if (isArrayOfScalars) {
+        return; // DEBUG
         // errs() << "[FSAN] ARRAY GEP: " << *GEPI << "\n";
         const uint64_t ShiftAdjustment = TwoOpsGEP ? 1ULL : 2ULL;
         assert(NSrc >= ShiftAdjustment && "Invalid NSrc for array GEP");
@@ -4072,23 +4104,27 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
 void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   auto NAME = GV->hasName() ? GV->getName().str() : "unnamed";
   if (NAME.find("_kwtuple") != std::string::npos) {
-    errs() << "FUCK PYTHON " << NAME << "\n";
+    errs() << "FUCK 710 PYTHON " << NAME << "\n";
     return;
   }
-  if (NAME.find("SNGL_SCAN") != std::string::npos || NAME.find("INIT_FLD") != std::string::npos) {
+  if (NAME.find("SNGL_SCAN") != std::string::npos ||
+      NAME.find("INIT_FLD") != std::string::npos) {
     errs() << "FUCK 525 SPEC " << NAME << "\n";
     return;
   }
+  // if (NAME.find("days_in_month") != std::string::npos) {
+  //   errs() << "FUCK 500 SPEC " << NAME << "\n";
+  //   return;
+  // TODO: was this real? I don't recall, but it does not trigger...
+  // }
   Constant *Initializer = GV->getInitializer();
   Type *GVType = GV->getValueType();
-
   StructType *STType = nullptr;
   assert(GVType->isAggregateType() &&
          "[FSAN] Expected only aggregate types to be instrumented");
 
   uint64_t nElems = 1;
   uint64_t depth = 0;
-
   if (ArrayType *AT = dyn_cast<ArrayType>(GVType)) { // NEW
     auto InTY = AT->getElementType();
     nElems = AT->getNumElements();
@@ -4098,8 +4134,13 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
       nElems *= INAT->getNumElements();
       depth++;
     }
-    assert(InTY->isStructTy() &&
-           "[FSAN] Expected only arrays of structs to be instrumented");
+    // errs() << "[FSAN] GV ARR \n\t" << GV->getName() << "\n\ttype: " <<
+    // *GVType
+    //        << "\n\t InTY: " << *InTY << "\n\t nElems: " << nElems
+    //        << "\n\t depth: " << depth << "\n";
+
+    // assert(InTY->isStructTy() &&
+    //        "[FSAN] Expected only arrays of structs to be instrumented");
     STType = dyn_cast<StructType>(InTY);
   } // if it's an array
   else if (StructType *ST = dyn_cast<StructType>(GVType)) {
@@ -4217,6 +4258,8 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     // Tag |= (AdjDepth << TBits); // set L to struct aggregate depth IF
     // AGGREGATE Tag |= AdjDepth;
   }
+  // errs() << "[FSAN] Instrumented GV: " << GV->getName()
+  //        << " with tag: " << (int)Tag << ", type " << *GVType << "\n";
 
   Constant *Aliasee = ConstantExpr::getIntToPtr(
       ConstantExpr::getAdd(
@@ -4227,6 +4270,8 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
                                     GV->getLinkage(), "", Aliasee, &M);
   Alias->setVisibility(GV->getVisibility());
   Alias->takeName(GV);
+  // Alias->setMetadata("fsan.instrument", MD_node); // NOPE
+
   GV->replaceAllUsesWith(Alias);
   GV->eraseFromParent();
   NumInstrumentedGlobals++;
@@ -4259,13 +4304,16 @@ void HWAddressSanitizer::instrumentGlobals() {
       continue;
 
     if (GV.getValueType()->isArrayTy()) {
+      int N = 0;
       Type *TY = dyn_cast<ArrayType>(GV.getValueType());
 
       while (ArrayType *AT = dyn_cast<ArrayType>(TY)) {
         TY = AT->getElementType();
+        ++N;
       }
 
       if (TY->isStructTy()) {
+        // array of structs of arbitrary size
         auto ST = dyn_cast<StructType>(TY);
         if (ST->hasName() &&
             ST->getStructName().str().find("union.") != std::string::npos) {
@@ -4276,6 +4324,8 @@ void HWAddressSanitizer::instrumentGlobals() {
         }
 
       } // it's an array of structs
+      else if (N == 1)
+        continue; // IGNORE arrays with depth 1 of non structs
     } else if (GV.getValueType()->isStructTy()) {
       auto ST = dyn_cast<StructType>(GV.getValueType());
       if (ST->hasName() &&

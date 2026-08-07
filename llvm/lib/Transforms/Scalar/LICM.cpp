@@ -2507,7 +2507,9 @@ static bool hoistGEP(Instruction &I, Loop &L, ICFLoopSafetyInfo &SafetyInfo,
   auto *GEP = dyn_cast<GetElementPtrInst>(&I);
   if (!GEP)
     return false;
-
+  auto *Function = GEP->getFunction();
+  if(Function && Function->hasFnAttribute(Attribute::SanitizeHWAddress))
+    return false;
   auto *Src = dyn_cast<GetElementPtrInst>(GEP->getPointerOperand());
   if (!Src || !Src->hasOneUse() || !L.contains(Src))
     return false;
@@ -2919,17 +2921,17 @@ static bool hoistArithmetics(Instruction &I, Loop &L,
   }
 
   // Try to hoist GEPs by reassociation.
-  auto *F = I.getFunction();
-  if (!F->hasFnAttribute(Attribute::SanitizeHWAddress)) {
+  // auto *F = I.getFunction();
+  // if (!F->hasFnAttribute(Attribute::SanitizeHWAddress)) {
     if (hoistGEP(I, L, SafetyInfo, MSSAU, AC, DT)) {
       ++NumHoisted;
       ++NumGEPsHoisted;
       return true;
     }
-  }
+  // }
 
   // Try to hoist add/sub's by reassociation.
-  if (!F->hasFnAttribute(Attribute::SanitizeHWAddress))
+  // if (!F->hasFnAttribute(Attribute::SanitizeHWAddress))
     if (hoistAddSub(I, L, SafetyInfo, MSSAU, AC, DT)) {
       ++NumHoisted;
       ++NumAddSubHoisted;

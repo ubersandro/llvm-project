@@ -719,10 +719,10 @@ uint32_t GVNPass::ValueTable::lookupOrAdd(Value *V) {
     case Instruction::ExtractValue:
       Exp = createExtractvalueExpr(cast<ExtractValueInst>(I));
       break;
-    // case Instruction::PHI:
-    //   ValueNumbering[V] = NextValueNumber;
-    //   NumberingPhi[NextValueNumber] = cast<PHINode>(V);
-    //   return NextValueNumber++;
+    case Instruction::PHI:
+      ValueNumbering[V] = NextValueNumber;
+      NumberingPhi[NextValueNumber] = cast<PHINode>(V);
+      return NextValueNumber++;
     case Instruction::Load:
     case Instruction::Store:
       return computeLoadStoreVN(I);
@@ -1415,36 +1415,35 @@ GVNPass::AnalyzeLoadAvailability(LoadInst *Load, MemDepResult DepInfo,
           getInitialValueOfAllocation(DepInst, TLI, Load->getType()))
     return AvailableValue::get(InitVal);
 
-  // FSAN: 721.gcc_r is broken here, TODO: fix later, there is some UB in the benchmark
-  // if (StoreInst *S = dyn_cast<StoreInst>(DepInst)) {
-  //   // Reject loads and stores that are to the same address but are of
-  //   // different types if we have to. If the stored value is convertable to
-  //   // the loaded value, we can reuse it.
-  //   if (!canCoerceMustAliasedValueToLoad(S->getValueOperand(), Load->getType(),
-  //                                        S->getFunction()))
-  //     return std::nullopt;
+  if (StoreInst *S = dyn_cast<StoreInst>(DepInst)) {
+    // Reject loads and stores that are to the same address but are of
+    // different types if we have to. If the stored value is convertable to
+    // the loaded value, we can reuse it.
+    if (!canCoerceMustAliasedValueToLoad(S->getValueOperand(), Load->getType(),
+                                         S->getFunction()))
+      return std::nullopt;
 
-  //   // Can't forward from non-atomic to atomic without violating memory model.
-  //   if (S->isAtomic() < Load->isAtomic())
-  //     return std::nullopt;
+    // Can't forward from non-atomic to atomic without violating memory model.
+    if (S->isAtomic() < Load->isAtomic())
+      return std::nullopt;
 
-  //   return AvailableValue::get(S->getValueOperand());
-  // }
+    return AvailableValue::get(S->getValueOperand());
+  }
 
-  // if (LoadInst *LD = dyn_cast<LoadInst>(DepInst)) {
-  //   // If the types mismatch and we can't handle it, reject reuse of the load.
-  //   // If the stored value is larger or equal to the loaded value, we can reuse
-  //   // it.
-  //   if (!canCoerceMustAliasedValueToLoad(LD, Load->getType(),
-  //                                        LD->getFunction()))
-  //     return std::nullopt;
+  if (LoadInst *LD = dyn_cast<LoadInst>(DepInst)) {
+    // If the types mismatch and we can't handle it, reject reuse of the load.
+    // If the stored value is larger or equal to the loaded value, we can reuse
+    // it.
+    if (!canCoerceMustAliasedValueToLoad(LD, Load->getType(),
+                                         LD->getFunction()))
+      return std::nullopt;
 
-  //   // Can't forward from non-atomic to atomic without violating memory model.
-  //   if (LD->isAtomic() < Load->isAtomic())
-  //     return std::nullopt;
+    // Can't forward from non-atomic to atomic without violating memory model.
+    if (LD->isAtomic() < Load->isAtomic())
+      return std::nullopt;
 
-  //   return AvailableValue::getLoad(LD);
-  // }
+    return AvailableValue::getLoad(LD);
+  }
 
   // Check if load with Addr dependent from select can be converted to select
   // between load values. There must be no instructions between the found
