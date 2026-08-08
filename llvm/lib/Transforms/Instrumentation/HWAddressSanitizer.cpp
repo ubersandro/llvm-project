@@ -2742,8 +2742,8 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   bool skipMemAccessInst = false;
   if (!F.hasFnAttribute(Attribute::SanitizeHWAddress)) {
-    errs() << "[FSAN] Function " << F.getName()
-           << " does not have attribute SanitizeHWAddress, skipping\n";
+    // errs() << "[FSAN] Function " << F.getName()
+    //        << " does not have attribute SanitizeHWAddress, skipping\n";
     return;
   }
 
@@ -3086,6 +3086,7 @@ void HWAddressSanitizer::InstrumentBOP(BinaryOperator *BOP) {
     bool IsOp1Neg = OP1->hasName() &&
                     OP1->getName().str().find(".neg") != std::string::npos;
     if (IsOp0Neg || IsOp1Neg) {
+      // TODO: we are missing something here
       assert(!(IsOp0Neg && IsOp1Neg) && "Both operands cannot be negations");
       Value *NegOp = IsOp0Neg ? OP0 : OP1;
       Value *OtherOp = IsOp0Neg ? OP1 : OP0;
