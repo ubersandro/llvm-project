@@ -2187,7 +2187,7 @@ PreservedAnalyses MemCpyOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   auto *DT = &AM.getResult<DominatorTreeAnalysis>(F);
   auto *PDT = &AM.getResult<PostDominatorTreeAnalysis>(F);
   auto *MSSA = &AM.getResult<MemorySSAAnalysis>(F);
-
+  if(F.hasFnAttribute(Sanitize::HWAddress) && clDoNotOptimizeMemCpyOpt )
   bool MadeChange = runImpl(F, &TLI, AA, AC, DT, PDT, &MSSA->getMSSA());
   if (!MadeChange)
     return PreservedAnalyses::all();

@@ -503,7 +503,7 @@ bool HWAddressSanitizer::RewriteNewCall(CallBase *I) {
         (!typeName.empty() && typeName.find("union") != std::string::npos);
 
     if (isUnion) {
-      errs() << "\t\t[FSAN-REW] NOT TAGGING UNION " << *I << "\n";
+      // errs() << "\t\t[FSAN-REW] NOT TAGGING UNION " << *I << "\n";
       return true;
     }
 
@@ -1608,11 +1608,11 @@ Type *HWAddressSanitizer::extractTypeFromTypedAllocatorOrNew(CallBase *CI) {
     // stop when you find an arg called typeName
     auto argName = CI->getArgOperand(i)->getName();
     if (argName.find("typeName") != std::string::npos) {
-      errs() << "[FSAN] Found typeName arg: " << *arg << "\n";
+      // errs() << "[FSAN] Found typeName arg: " << *arg << "\n";
       if (ConstantDataArray *CDA = dyn_cast<ConstantDataArray>(arg)) {
         if (CDA->isString()) {
           auto typeName = CDA->getAsString();
-          errs() << "[FSAN] Extracted typeName: " << typeName << "\n";
+          // errs() << "[FSAN] Extracted typeName: " << typeName << "\n";
           typeName = typeName.substr(0, typeName.size() - 1);
           TY = StructType::getTypeByName(CI->getContext(), typeName);
         }
@@ -1769,7 +1769,7 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
     if (Name.find("coerce") != std::string::npos)
       isTypeCoerced = true;
     if (isSROA || isTypeCoerced)
-      return false;
+      return true;
   } // isVect
 
   bool isSROATypePunning = checkIfSROATypePunning(O, DL);
@@ -2397,6 +2397,7 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
     size_t AccessSizeIndex = TypeSizeToSizeIndex(O.TypeStoreSize);
     bool is = isVectorizedStoreOrLoad(O, DL);
     if (is) {
+      // TODO: these checks account for MAYBE 1% of the total. They are mostly generated when copying by value structs, or in presence of compiler-induced type coercion. Since it's on the compiler to prove safety for such operations, we delegate. In our configuration, vectorized checks are practically disabled. So, this should not be a blind spot of FSAN, we catch plenty of violations without it already. Future work about making FSAN more efficient could look into this.
       errs() << "[FSAN] INSTR  VECT: " << *O.getInsn() << "\n";
       VectorType *LoadedOrStoredValVecTy = nullptr;
       if (StoreInst *ST = dyn_cast<StoreInst>(O.getInsn())) {
@@ -2421,9 +2422,9 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
                               false));
         assert(checkFunc &&
                "Failed to get or insert function __hwasan_accessN_");
-        IRB.CreateCall(checkFunc, {IRB.CreatePointerCast(Addr, IntptrTy),
-                                   ConstantInt::get(Int64Ty, BaseElemSize),
-                                   ConstantInt::get(Int64Ty, NumElems)});
+        // IRB.CreateCall(checkFunc, {IRB.CreatePointerCast(Addr, IntptrTy),
+        //                            ConstantInt::get(Int64Ty, BaseElemSize),
+        //                            ConstantInt::get(Int64Ty, NumElems)});
       }
       // create call to __hwasan_accessN_
     } else {
