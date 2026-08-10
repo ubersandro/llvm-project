@@ -3313,6 +3313,10 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         uint64_t idx = -1;
         auto op2 = GEPI->getOperand(2);
         ConstantInt *CI = dyn_cast<ConstantInt>(op2);
+        if (!CI) {
+          errs() << "[FSAN] GEP with non-constant index: " << *GEPI << "\n";
+          return;
+        }
         idx = (uint64_t)CI->getZExtValue();
 
         uint64_t IdxModuloT_MAX = (idx + 1) % T_MAX;
