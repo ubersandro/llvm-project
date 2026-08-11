@@ -2397,7 +2397,13 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
     size_t AccessSizeIndex = TypeSizeToSizeIndex(O.TypeStoreSize);
     bool is = isVectorizedStoreOrLoad(O, DL);
     if (is) {
-      // TODO: these checks account for MAYBE 1% of the total. They are mostly generated when copying by value structs, or in presence of compiler-induced type coercion. Since it's on the compiler to prove safety for such operations, we delegate. In our configuration, vectorized checks are practically disabled. So, this should not be a blind spot of FSAN, we catch plenty of violations without it already. Future work about making FSAN more efficient could look into this.
+      // TODO: these checks account for MAYBE 1% of the total. They are mostly
+      // generated when copying by value structs, or in presence of
+      // compiler-induced type coercion. Since it's on the compiler to prove
+      // safety for such operations, we delegate. In our configuration,
+      // vectorized checks are practically disabled. So, this should not be a
+      // blind spot of FSAN, we catch plenty of violations without it already.
+      // Future work about making FSAN more efficient could look into this.
       errs() << "[FSAN] INSTR  VECT: " << *O.getInsn() << "\n";
       VectorType *LoadedOrStoredValVecTy = nullptr;
       if (StoreInst *ST = dyn_cast<StoreInst>(O.getInsn())) {
@@ -2667,15 +2673,15 @@ bool HWAddressSanitizer::instrumentStack(memtag::StackInfo &SInfo,
       auto *AILong = IRB.CreatePtrToInt(AI, IntptrTy);
       // LEVEL 0, T 0, R is set
       // TODO: restrict to array case
-      auto *TaggedAlloca = tagPointer(IRB, AI->getType(), AILong,
-                                      ConstantInt::get(IntptrTy, RPTag));
-      TaggedAlloca->setName(AI->getName() + ".tagged");
+      // auto *TaggedAlloca = tagPointer(IRB, AI->getType(), AILong,
+      //                                 ConstantInt::get(IntptrTy, RPTag));
+      // TaggedAlloca->setName(AI->getName() + ".tagged");
       ArraySize = 1;
-      AI->replaceUsesWithIf(TaggedAlloca, [AICast, AILong](const Use &U) {
-        auto *User = U.getUser();
-        return User != AILong && User != AICast &&
-               !isa<LifetimeIntrinsic>(User); // TODO: fix this when tagging
-      });
+      // AI->replaceUsesWithIf(TaggedAlloca, [AICast, AILong](const Use &U) {
+      //   auto *User = U.getUser();
+      //   return User != AILong && User != AICast &&
+      //          !isa<LifetimeIntrinsic>(User); // TODO: fix this when tagging
+      // });
     }
     // AllocaInst *NewAI = dyn_cast<AllocaInst>(TaggedAlloca);
     // assert(NewAI && "Tagged alloca must be an AllocaInst");
@@ -2857,9 +2863,6 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   if (ClFSAN_GEP) {
     for (auto &GEPI : GEPsToInstrument) {
-      if (ClFSAN_levels)
-        InstrumentGEP_L(GEPI);
-      else
         InstrumentGEP_NoL(GEPI);
     }
   }
@@ -3286,7 +3289,6 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
   bool SROA = false;
   if (GEPNAME.find(".sroa.") != std::string::npos &&
       GEPNAME.find(".sroa_idx") != std::string::npos) {
-    // errs() << "[FSAN] SROA GEP: " << *GEPI << "\n";
     taggedPointer = untagPointerIntrinsic(IRB, GEPI);
     endResultName = GEPNAME + ".fsan.untagged.sroa";
     SROA = true;
@@ -3335,18 +3337,18 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
       } // sonIsScalar
       else if (DstIsArray && getArrayDimension(DstType) > 1 &&
                !isArrayOfStructs(DstType)) {
-        // set bit 5 in the tag
-        // TODO: this might no longer be necessary in the future
         Value *untagged = maskPointerIntrinsic(IRB, GEPI, PTR_MASK);
         GEPLong = IRB.CreatePtrToInt(untagged, IntptrTy);
-        Value *TBits_CONST = ConstantInt::get(
-            IntptrTy,
-            (1ULL << (PointerTagShift +
-                      (TBits +
-                       LBits)))); // keep pointer to array tagged, otherwise
-                                  // checks shortcircuit to noop
-        Value *GEPLongWithT = IRB.CreateOr(GEPLong, TBits_CONST); // attach MSB
-        taggedPointer = IRB.CreateIntToPtr(GEPLongWithT, GEPI->getType());
+        // uint64_t TagPtrToArrayNoBoundsNarrowed = 0ULL;
+        // Value *TBits_CONST = ConstantInt::get(
+        //     IntptrTy, (TagPtrToArrayNoBoundsNarrowed << (PointerTagShift +
+        //     (TBits + LBits))));
+        // Value *GEPLongWithT = IRB.CreateOr(GEPLong, TBits_CONST);
+        // taggedPointer = IRB.CreateIntToPtr(GEPLongWithT, GEPI->getType());
+        taggedPointer = IRB.CreateIntToPtr(
+            GEPLong,
+            GEPI->getType()); // NOTE: these pointers are not tagged. They will
+                              // be when bounds are narrowed for the first time.
         endResultName = GEPNAME + ".fsan.array";
       }
     } // if tag
@@ -3402,6 +3404,8 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
 
         Value *RuntimeTagBit =
             IRB.CreateShl(Parity, BitPosition, GEPNAME + ".fsan.tagbit");
+        RuntimeTagBit = IRB.CreateOr(RuntimeTagBit, ConstantInt::get(IntPtrITy, 1ULL << (PointerTagShift + TBits + LBits)),
+                                   GEPNAME + ".fsan.tagbit.MSB"); // always set MSB to avoid short-circuiting at check time
 
         APInt ClearMask = APInt::getAllOnes(PointerBits);
         ClearMask.clearBit(static_cast<unsigned>(BitPosition));
@@ -3594,368 +3598,6 @@ bool HWAddressSanitizer::performChecksOnGEP(GetElementPtrInst *GEPI) {
   // coercion
   return tag;
 }
-
-void HWAddressSanitizer::InstrumentGEP_L(GetElementPtrInst *GEPI) {
-  // TODO: debug R checks
-  /**
-   * C++
-   * 1. detect calls to subclass constructors and increment L
-   * 2. force decay when calling constructor on arrays elements
-   * 3. constructors get inlined -> detect downcasts and increment L
-   */
-  auto nOperands = GEPI->getNumOperands();
-  Value *sonTag = nullptr;
-  Value *sonIdx = nullptr;
-  bool guard = false;
-  assert(nOperands <= 3);
-  // base info
-  auto SrcType = GEPI->getSourceElementType();
-  bool SrcIsStruct = SrcType->isStructTy();
-  bool SrcIsArray = SrcType->isArrayTy();
-  auto DstType = GEPI->getResultElementType();
-  bool DstIsStruct = DstType->isStructTy();
-  bool DstIsArrOfStructs = isArrayOfStructs(DstType);
-  bool IsIncDecGEP = GEPI->hasName() &&
-                     GEPI->getName().str().find("incdec") != std::string::npos;
-  bool IsAddPtrGEP = GEPI->hasName() &&
-                     GEPI->getName().str().find("add.ptr") != std::string::npos;
-  bool IsArrayIdxGEP = GEPI->hasName() && GEPI->getName().str().find(
-                                              "arrayidx") != std::string::npos;
-  bool IsArrayDecayGEP =
-      GEPI->hasName() &&
-      GEPI->getName().str().find("arraydecay") != std::string::npos;
-  auto PtrOp = GEPI->getPointerOperand();
-  auto GEPNAME = GEPI->hasName() ? GEPI->getName().str()
-                                 : "gep." + itostr(NumInstrumentedGEPs);
-  auto PTR_OP_NAME = GEPI->getPointerOperand()->hasName()
-                         ? GEPI->getPointerOperand()->getName().str()
-                         : "gep.ptr.op." + itostr(NumInstrumentedGEPs);
-
-  if (GEPI->getType()->isVectorTy()) {
-    assert(false && "This should not happen if loop opts are disabled");
-  }
-
-  IRBuilder<> IRB(GEPI->getNextNonDebugInstruction());
-  auto GEPLong = IRB.CreatePtrToInt(PtrOp, IntptrTy);
-  std::string endResultName = "";
-  Value *taggedPointer = nullptr;
-  uint64_t PTR_MASK = ((1ULL << PointerTagShift) - 1);
-
-  // SHIFTED MASKS TO PRESERVE SOME BITS IN THE PTR
-  uint64_t PRES_T_SUBMASK = (0b111ULL << (PointerTagShift));
-  uint64_t PRES_L_SUBMASK = (0b11ULL << (PointerTagShift + TBits));
-  uint64_t PRES_R_SUBMASK = (1ULL << (PointerTagShift + TBits + LBits));
-
-  uint64_t PRES_L_MASK =
-      PRES_L_SUBMASK | PTR_MASK; // remove R, preserve L, remove T
-  uint64_t PRES_R_MASK =
-      PRES_R_SUBMASK | PTR_MASK; // remove L, preserve R, remove T
-
-  uint64_t PRES_T_MASK =
-      PRES_T_SUBMASK | PTR_MASK; // remove L, preserve T, remove R
-  Value *FatherLevel = nullptr;
-
-  /**
-   * SROA GEPs -> %harqUlInfo.sroa.25.32.m_receptionStatus.i867.sroa_idx =
-   * getelementptr inbounds nuw i8, ptr %m_receptionStatus.i867.fsan.scalar, i64
-   * 4
-   */
-  bool SROA = false;
-  if (GEPI->getSourceElementType()->isIntegerTy(8) &&
-      GEPI->getNumOperands() == 3) {
-    // errs() << "[FSAN] SROA GEP: " << *GEPI << "\n";
-    taggedPointer = untagPointerIntrinsic(IRB, GEPI);
-    endResultName = GEPNAME + ".fsan.untagged.sroa";
-    SROA = true;
-  }
-  // CASE 1. GEP from a struct
-  if (SrcIsStruct && !SROA) {
-    StructType *ST = dyn_cast<StructType>(SrcType);
-    assert(ST && "GEP source type is struct but not a StructType?");
-    bool tag = true;
-
-    if (ST && !ST->hasName() && ClSkipUnnamedStructs)
-      tag = performChecksOnGEP(GEPI);
-
-    auto sonIsScalar =
-        !DstIsStruct && !DstType->isVectorTy() && !DstIsArrOfStructs;
-
-    if (tag) {
-      if (sonIsScalar) {
-        // NOTE: both native types fields and their arrays fall under this case
-        uint64_t idx = -1;
-        auto op2 = GEPI->getOperand(2);
-        uint64_t T = -1;
-        ConstantInt *CI = dyn_cast<ConstantInt>(op2);
-        idx = (uint64_t)CI->getZExtValue();
-        uint64_t IdxModuloT_MAX = (idx + 1) % T_MAX;
-        uint64_t IdxDivT_MAX = (idx + 1) / T_MAX;
-        T = (IdxModuloT_MAX + IdxDivT_MAX);
-        T = T % T_MAX;
-        if (T == 0)
-          T = 1;
-        // SET T, preserve L, remove R
-        sonTag = ConstantInt::get(IntptrTy, T);
-        Value *untagged = maskPointerIntrinsic(IRB, GEPI, PRES_L_MASK);
-        Value *untaggedLong = IRB.CreatePtrToInt(untagged, IntptrTy);
-        Value *TBits_CONST = ConstantInt::get(IntptrTy, T << (PointerTagShift));
-        Value *untaggedLongWithT = IRB.CreateOr(untaggedLong, TBits_CONST);
-        taggedPointer = IRB.CreateIntToPtr(untaggedLongWithT, GEPI->getType());
-        endResultName = GEPNAME + ".fsan.scalar";
-      } // sonIsScalar
-      else {
-        // if DstIsStruct, set R and L = L + 1, T unused -> this is handled
-        // elsewhere
-        if (DstIsArrOfStructs) {
-          // if DstIsAggregateOfStructs, set R and L = L+1, drop T
-          Value *RUnset = maskPointerIntrinsic(IRB, GEPI, PRES_L_MASK);
-          Value *Increment =
-              ConstantInt::get(IntptrTy, (1ULL << (TBits + PointerTagShift)));
-          Value *RUnsetLong = IRB.CreatePtrToInt(RUnset, IntptrTy);
-          Value *PtrLongIncremented =
-              IRB.CreateAdd(RUnsetLong, Increment); // L = L + 1
-          uint64_t SET_R_CONSTANT = (1ULL << (PointerTagShift + TBits + LBits));
-          Value *PtrLongIncWithRSet =
-              IRB.CreateOr(PtrLongIncremented,
-                           ConstantInt::get(IntptrTy, SET_R_CONSTANT)); // set R
-          PtrLongIncWithRSet->setName(GEPNAME + ".fsan.struct.array.inc.tmp");
-          taggedPointer =
-              IRB.CreateIntToPtr(PtrLongIncWithRSet, GEPI->getType());
-          endResultName = GEPNAME + ".fsan.struct.array";
-        }
-        // NOTE : the case of struct -> struct is case 2
-      } // else scalar
-    } // if tag
-
-    else {
-      // sometimes, we might not want to tag the GEP
-      taggedPointer = untagPointerIntrinsic(IRB, GEPI);
-      endResultName = GEPNAME + ".fsan.untagged";
-    } // else tag
-  } // FATHER IS STRUCT
-
-  // CASE 2. GEP to a struct
-  if (DstIsStruct && !SROA) {
-    if (IsIncDecGEP || IsAddPtrGEP) {
-      // when traversing array, no increment or tag change in general
-      return;
-    }
-
-    if (IsArrayIdxGEP) {
-      // HEUR1: if the pointer is a function argument, then it is already a
-      // pointer to a struct, DO NOT INCREMENT LEVEL
-      if (LoadInst *LI = dyn_cast<LoadInst>(PtrOp)) {
-        Value *LoadPtrOp = LI->getPointerOperand();
-        auto Loaded = getUnderlyingObject(LoadPtrOp);
-        // when passing arrays to a function, they are decayed to a pointer
-        // the struct. This guarantees they are incremented.
-        for (User *U : Loaded->users()) {
-          if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-            Value *StoredVal = SI->getValueOperand();
-            if (Argument *Arg = dyn_cast<Argument>(StoredVal)) {
-              return;
-            }
-          }
-        }
-      }
-
-      // HEUR2: within the same function, if the pointer operand of the GEP is a
-      // decay, DO NOT INCREMENT LEVEL
-      if (LoadInst *LI = dyn_cast<LoadInst>(PtrOp)) {
-        auto *LoadPtrOp = LI->getPointerOperand();
-        for (User *U : LoadPtrOp->users()) {
-          if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-            Value *StoredVal = SI->getValueOperand();
-            if (StoredVal->hasName() &&
-                StoredVal->getName().str().find("arraydecay") !=
-                    std::string::npos) {
-              return;
-            } else {
-              if (LoadInst *LI2 = dyn_cast<LoadInst>(StoredVal)) {
-                Value *LoadPtrOp2 = LI2->getPointerOperand();
-                auto Loaded2 = getUnderlyingObject(LoadPtrOp2);
-                // check whether Loaded2 is a function argument
-                for (User *U2 : Loaded2->users()) {
-                  if (StoreInst *SI2 = dyn_cast<StoreInst>(U2)) {
-                    Value *StoredVal2 = SI2->getValueOperand();
-                    if (Argument *Arg = dyn_cast<Argument>(StoredVal2)) {
-                      return;
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // HEUR4: if ptr is loaded from a global variable, then it is already a
-      // pointer to a struct, DO NOT INCREMENT LEVEL
-      if (LoadInst *LI = dyn_cast<LoadInst>(PtrOp)) {
-        Value *LoadPtrOp = LI->getPointerOperand();
-        auto Loaded = getUnderlyingObject(LoadPtrOp);
-        if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Loaded)) {
-          errs() << "[FSAN] HEURISTIC - GEP is arrayidx, pointer operand is "
-                    "loaded from a global variable, DO NOT INCREMENT LEVEL\n";
-          errs() << "\tGEP: " << *GEPI << "\n";
-          return;
-        }
-      }
-    } // IsArrayIdxGEP
-
-    // when computing a struct pointer from a struct or an array, we need to set
-    // R and increment L
-    Value *RUnset = maskPointerIntrinsic(IRB, GEPI, PRES_L_MASK | PRES_T_MASK);
-    Value *RUnsetLong = IRB.CreatePtrToInt(RUnset, IntptrTy);
-    uint64_t IncConst = 1ULL << (PointerTagShift + TBits);
-    uint64_t IncTConst = 1ULL << (PointerTagShift);
-    Value *Increment = nullptr;
-
-    if (IsArrayDecayGEP || (SrcIsStruct && nOperands == 3)) {
-      // DecayGEPs are incremented to spill the pointer already at the right
-      // level
-      Increment = ConstantInt::get(IntptrTy, IncConst);
-      if (IsArrayDecayGEP) {
-        RUnsetLong = IRB.CreateOr(
-            RUnsetLong,
-            ConstantInt::get(IntptrTy, IncTConst)); // set 1 bit of T
-      }
-
-      // TODO: this is ambiguous for matrices
-    } else {
-      // GEP inside a structure (src can be struct, or array)
-      Value *PresOnlyTMask =
-          ConstantInt::get(IntptrTy, PRES_T_SUBMASK); // ONLY T
-      Value *TBitsValue = IRB.CreateAnd(GEPLong, PresOnlyTMask);
-      Value *TBitsIsZero =
-          IRB.CreateICmpEQ(TBitsValue, ConstantInt::get(IntptrTy, 0));
-      Value *IncConstVal = ConstantInt::get(IntptrTy, IncConst);
-      Value *ZeroVal = ConstantInt::get(IntptrTy, 0);
-      Increment = IRB.CreateSelect(TBitsIsZero, IncConstVal, ZeroVal);
-    }
-    // TODO: make function
-    Value *PtrLongIncremented = IRB.CreateAdd(RUnsetLong, Increment);
-    uint64_t SET_R_CONSTANT = (1ULL << (PointerTagShift + TBits + LBits));
-    Value *PtrLongIncWithRSet =
-        IRB.CreateOr(PtrLongIncremented,
-                     ConstantInt::get(IntptrTy, SET_R_CONSTANT)); // set R
-    PtrLongIncWithRSet->setName(GEPNAME + ".fsan.struct.inc.tmp");
-    taggedPointer = IRB.CreateIntToPtr(PtrLongIncWithRSet, GEPI->getType());
-    endResultName = GEPNAME + ".fsan.struct";
-  } // CASE 2. GEP to a struct
-
-  // CASE 3. GEP from an array
-  if (SrcType->isArrayTy() && !SROA) {
-    if ((DstIsArrOfStructs)) {
-      auto DimOfSrcArray = getArrayDimension(SrcType);
-      auto DimOfDstArray = getArrayDimension(DstType);
-
-      // traversing == going down inside ARR[n][m] to get nested arrays
-      bool traversing = DimOfSrcArray > DimOfDstArray;
-
-      if (!traversing) {
-        // preserve R, L. T is unused
-        taggedPointer = GEPI;
-        endResultName = GEPNAME + (DstIsStruct ? ".struct" : ".array");
-      } // !traversing
-
-      else {
-        // traversing
-        // TODO : do I want to preserve T?
-        Value *RUnset = maskPointerIntrinsic(
-            IRB, GEPI,
-            PRES_L_MASK | PRES_T_MASK); // remove R, preserve L, preserve T
-        Value *RUnsetLong = IRB.CreatePtrToInt(RUnset, IntptrTy);
-        uint64_t IncConst = 1ULL << (PointerTagShift + TBits);
-        Value *Increment = nullptr;
-        Value *PresOnlyTMask =
-            ConstantInt::get(IntptrTy, PRES_T_SUBMASK); // ONLY T
-        Value *TBitsValue = IRB.CreateAnd(GEPLong, PresOnlyTMask);
-
-        Value *TBitsIsZero =
-            IRB.CreateICmpEQ(TBitsValue, ConstantInt::get(IntptrTy, 0));
-        Value *IncConstVal = ConstantInt::get(IntptrTy, IncConst);
-        Value *ZeroVal = ConstantInt::get(IntptrTy, 0);
-        Increment = IRB.CreateSelect(TBitsIsZero, IncConstVal, ZeroVal);
-
-        Value *PtrLongIncremented =
-            IRB.CreateAdd(RUnsetLong, Increment); // L = L + 1
-
-        uint64_t SET_R_CONST = (1ULL << (PointerTagShift + TBits + LBits));
-        Value *PtrLongIncWithRSet =
-            IRB.CreateOr(PtrLongIncremented,
-                         ConstantInt::get(IntptrTy, SET_R_CONST)); // set R
-        taggedPointer = IRB.CreateIntToPtr(PtrLongIncWithRSet, GEPI->getType());
-        endResultName = GEPNAME + ".fsan.struct.array.down";
-      } // traversing
-    } // GEP array-> array of structs
-
-    else if (!DstIsStruct) {
-      // L = L, R = 0, T = idx
-      // NOTE : these arrays must not have R set!
-      taggedPointer = GEPI;
-      endResultName = GEPNAME + ".fsan.scalar.array";
-    }
-
-  } // GEP from array type
-
-  if (!taggedPointer) {
-    return;
-  }
-
-  assert(taggedPointer->isPointerTy() &&
-         "Tagged pointer must be of pointer type");
-  taggedPointer->setName(endResultName);
-
-  GEPI->replaceUsesWithIf(
-      taggedPointer, [GEPI, DstType, GEPLong](const Use &U) {
-        auto *User = U.getUser();
-        if (User == GEPLong) {
-          return false;
-        }
-        // do not replace in these calls, they are used to remove tag
-        if (CallBase *CB = dyn_cast<CallBase>(User)) {
-          if (CB->getCalledFunction() && CB->getCalledFunction()->hasName() &&
-              CB->getCalledFunction()->getName().find("llvm.ptrmask") !=
-                  std::string::npos)
-            return false; // no repl
-        } // call to mask ptr
-
-        if (isa<LifetimeIntrinsic>(User))
-          return false; // no repl
-
-        bool safe = true;
-
-        // NOTE: do not tag pointers used to access vtable
-        // accesses to vtables mis-use tagged pointers
-        if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
-          if (SI->getPointerOperand() == GEPI) {
-            Value *storedVal = SI->getValueOperand();
-            if (GEPOperator *CE = dyn_cast<GEPOperator>(storedVal)) {
-              if (CE->isInBounds() && CE->getNumOperands() >= 3) {
-                if (GlobalVariable *GV =
-                        dyn_cast<GlobalVariable>(CE->getOperand(0))) {
-                  if (GV->hasName() &&
-                      demangle(GV->getName().str()).find("vtable for") == 0) {
-                    safe = false;
-                  }
-                }
-              }
-            } // if GEPOperator
-          }
-        } // store in VTable
-
-        if (!safe) {
-          if (ClFSAN_verbose) {
-            errs() << "[FSAN] NOT REPLACING USE IN USER: ";
-            User->print(errs());
-            errs() << "\n";
-          }
-        }
-        return safe;
-      });
-  NumInstrumentedGEPs++;
-} // InstrumentGEP_L
 
 void HWAddressSanitizer::InstrumentCMP(CmpInst *CI) {
   /** Instrumenting CMPs with no filters */
@@ -4230,14 +3872,14 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
     appendToCompilerUsed(M, Descriptor);
   }
   uint8_t Tag = 0;
-  if (!STType) {
-    Tag = RPTag; // NOTE: both structs and arrays of structs have RP set
+  // if (!STType) {
+  //   Tag = RPTag; // NOTE: both structs and arrays of structs have RP set
     // auto AdjDepth =
     //     (depth /*> 0 ? depth - 1 : 0*/) &
     //     (L_MAX); // depth is 0 for structs, 1 for arrays, 2 for matrices, etc
     // Tag |= (AdjDepth << TBits); // set L to struct aggregate depth IF
     // AGGREGATE Tag |= AdjDepth;
-  }
+  // }
   // errs() << "[FSAN] Instrumented GV: " << GV->getName()
   //        << " with tag: " << (int)Tag << ", type " << *GVType << "\n";
 
