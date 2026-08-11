@@ -2863,7 +2863,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
 
   if (ClFSAN_GEP) {
     for (auto &GEPI : GEPsToInstrument) {
-        InstrumentGEP_NoL(GEPI);
+      InstrumentGEP_NoL(GEPI);
     }
   }
 
@@ -3404,17 +3404,21 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
 
         Value *RuntimeTagBit =
             IRB.CreateShl(Parity, BitPosition, GEPNAME + ".fsan.tagbit");
-        RuntimeTagBit = IRB.CreateOr(RuntimeTagBit, ConstantInt::get(IntPtrITy, 1ULL << (PointerTagShift + TBits + LBits)),
-                                   GEPNAME + ".fsan.tagbit.MSB"); // always set MSB to avoid short-circuiting at check time
 
         APInt ClearMask = APInt::getAllOnes(PointerBits);
         ClearMask.clearBit(static_cast<unsigned>(BitPosition));
 
         GEPLong = IRB.CreatePtrToInt(GEPI, IntPtrITy, GEPNAME + ".fsan.ptrint");
+        auto GEPLongMsb = IRB.CreateOr(
+            GEPLong,
+            ConstantInt::get(IntPtrITy,
+                             1ULL << (PointerTagShift + TBits + LBits)),
+            GEPNAME + ".fsan.MSB"); // always set MSB to avoid
+                                    // short-circuiting at check time
 
         if (ThreeOpsGEP) {
           Value *PointerWithBitCleared =
-              IRB.CreateAnd(GEPLong, ConstantInt::get(IntPtrITy, ClearMask),
+              IRB.CreateAnd(GEPLongMsb, ConstantInt::get(IntPtrITy, ClearMask),
                             GEPNAME + ".fsan.clearbit");
           Value *TaggedInteger = IRB.CreateOr(
               PointerWithBitCleared, RuntimeTagBit, GEPNAME + ".fsan.setbit");
@@ -3425,7 +3429,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         } else if (TwoOpsGEP) {
           // because bits alternate in our pattern
           Value *TaggedInteger =
-              IRB.CreateXor(GEPLong, RuntimeTagBit, GEPNAME + ".fsan.XOR");
+              IRB.CreateXor(GEPLongMsb, RuntimeTagBit, GEPNAME + ".fsan.XOR");
 
           taggedPointer = IRB.CreateIntToPtr(TaggedInteger, GEPI->getType(),
                                              GEPNAME + ".fsan.tagged");
@@ -3874,11 +3878,11 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   uint8_t Tag = 0;
   // if (!STType) {
   //   Tag = RPTag; // NOTE: both structs and arrays of structs have RP set
-    // auto AdjDepth =
-    //     (depth /*> 0 ? depth - 1 : 0*/) &
-    //     (L_MAX); // depth is 0 for structs, 1 for arrays, 2 for matrices, etc
-    // Tag |= (AdjDepth << TBits); // set L to struct aggregate depth IF
-    // AGGREGATE Tag |= AdjDepth;
+  // auto AdjDepth =
+  //     (depth /*> 0 ? depth - 1 : 0*/) &
+  //     (L_MAX); // depth is 0 for structs, 1 for arrays, 2 for matrices, etc
+  // Tag |= (AdjDepth << TBits); // set L to struct aggregate depth IF
+  // AGGREGATE Tag |= AdjDepth;
   // }
   // errs() << "[FSAN] Instrumented GV: " << GV->getName()
   //        << " with tag: " << (int)Tag << ", type " << *GVType << "\n";
