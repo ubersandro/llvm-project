@@ -3793,6 +3793,12 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   // END of type check
   uint64_t SizeInBytes =
       M.getDataLayout().getTypeAllocSize(Initializer->getType());
+  if (SizeInBytes > 0xffffff) {
+    errs() << "[FSAN] WARNING: Global variable " << GV->getName()
+           << " is too large to be instrumented (size: " << SizeInBytes
+           << " bytes). Skipping instrumentation.\n";
+    return;
+  }
   auto *NewGV = new GlobalVariable(M, Initializer->getType(), GV->isConstant(),
                                    GlobalValue::ExternalLinkage, Initializer,
                                    GV->getName() + ".hwasan");
