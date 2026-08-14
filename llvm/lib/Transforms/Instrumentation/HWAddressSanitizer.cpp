@@ -3009,6 +3009,26 @@ bool HWAddressSanitizer::IsTypedNew(CallBase *CB) {
   // bool isOperatorNew = demangledName.find("operator new") == 0;
   // NOTE: the above does not work properly on C++
   bool isOperatorNew = demangledName.find("operator new") != std::string::npos;
+  bool TyFound = false;
+  if (isOperatorNew) {
+    // find a parameter whose name starts with typeName in the args. If not
+    // found, return false.
+    for (unsigned i = 0; i < CB->arg_size(); i++) {
+      auto *Arg = CB->getArgOperand(i);
+      if (Arg->hasName() && (Arg->getName().str().find("typeName") == 0 ||
+                             Arg->getName().str().find("PLACEMENT") == 0)) {
+        errs() << "\t found typeName param at index " << i << ": ";
+        Arg->print(errs());
+        errs() << "\n";
+        TyFound = true;
+      }
+    }
+  }
+  if (!TyFound && isOperatorNew) {
+    errs() << "\t [DBG] No typeName param found in operator new call: " << *CB
+           << "\n";
+    return false; // not ours
+  }
   bool AlignmentAware =
       demangledName.find("align_val_t") != std::string::npos && isOperatorNew;
   if (AlignmentAware) {
@@ -3375,8 +3395,8 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
 
     if (ST && !ST->hasName() && ClSkipUnnamedStructs)
       tag = performChecksOnGEP(GEPI);
-    if (!tag)
-      errs() << "CHECK ON " << *GEPI << "\n";
+    // if (!tag)
+    //   errs() << "CHECK ON " << *GEPI << "\n";
 
     auto sonIsScalar =
         !DstIsStruct && !DstType->isVectorTy() && !DstIsArrOfStructs &&
