@@ -1745,6 +1745,15 @@ bool HWAddressSanitizer::checkIfSROATypePunning(InterestingMemoryOperand &O,
   return ret;
 }
 
+int getArrayDepth(Type *T) {
+  int depth = 0;
+  while (T->isArrayTy()) {
+    depth++;
+    T = T->getArrayElementType();
+  }
+  return depth;
+}
+
 // IntraObjectSafetyAnalysis v0
 bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
                                       const DataLayout &DL) {
@@ -1845,26 +1854,87 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
   OS << '\n';
 
   bool isStructArray = BaseTY->isArrayTy() && isArrayOfStructs(BaseTY);
-
   bool isNDArrayOfScalars = BaseTY->isArrayTy() && !isStructArray;
-  // DO NOT SKIP THESE FOR NOW
-  if (isNDArrayOfScalars)
-    return false;
 
-  // if it's a struct, check if type coercion and other opts --> TODO: this is
-  // NOT working if (StructType *ST = dyn_cast<StructType>(BaseTY)) {
-  //   if (ST && !ST->hasName() && ClSkipUnnamedStructs) {
-  //     auto *GEP = dyn_cast<GetElementPtrInst>(O.getPtr());
-  //     bool tag = performChecksOnGEP(GEP);
-  //     if (!tag) {
-  //       errs() << "[FSAN] SKIP UNTAGGED GEP: " << *O.getInsn()
-  //              << "\n\tGEP: " << *GEP << "\n\tGEPChain: " << GEPChainStr
-  //              << "\n\tBaseTY: " << *BaseTY << "\n\tOP: " << *O.getPtr()
-  //              << "\n\tChainLen " << ChainLen << "\n";
-  //       return true;
-  //     }
-  //   }
-  // }
+  int depth = BaseTY->isArrayTy() ? getArrayDepth(BaseTY) : 0;
+  if (depth == 1 && !isStructArray) {
+    // NOTE: sometimes AccessedType and BaseTY are different -> somebody should
+    // investigate this. But that somebody is not me.
+    return true; // we dot not handle accesses to NON-NESTED 1-D arrays, they
+                 // are handled by ASAN already.
+  } // skip 1D scalar arrays, they are handled by ASAN already.
+
+  if (isNDArrayOfScalars) {
+    // H1: if all the indices in the GEP chain are statically known and they are
+    // in bounds at each and every step of the chain with respect to the size of
+    // the i-th array, then you can skip
+    bool allIndicesAreConstant = true;
+    bool allIndicesAreInBounds = true;
+    int i = 0;
+    int ND = depth;
+    // reverse the GEPChain to go from the base type to the accessed type
+    auto GEPChainReverse =
+        SmallVector<Value *, 4>(GEPChain.rbegin(), GEPChain.rend());
+    int nOperandsGEP = 0;
+    Type *ArrayTyTMP = BaseTY;
+    for (Value *GEP_ith_V : GEPChainReverse) {
+      auto *GEP_ith = dyn_cast<GetElementPtrInst>(GEP_ith_V);
+      // always look at idx 2, if some GEP has only 2 operands and not 3, DONT
+      // SKIP THE ACCESS FOR NOW. They are pointer arithmetic byproducts, they
+      // require some more sophisticated analysis.
+      // errs() << "[FSAN] GEP[" << i++ << "]: " << *GEP_ith_V << "\n";
+      nOperandsGEP = GEP_ith->getNumOperands();
+      if (nOperandsGEP < 3)
+        return false;                    // TODO
+      auto op2 = GEP_ith->getOperand(2); // idx
+      ConstantInt *CI = dyn_cast<ConstantInt>(op2);
+      if (!CI)
+        return false; // TODO more log later on
+      auto cardinalityOfNthArray =
+          dyn_cast<ArrayType>(ArrayTyTMP)->getNumElements();
+      auto idxVal = CI->getZExtValue();
+      if (0 <= idxVal && idxVal < cardinalityOfNthArray) {
+        ArrayTyTMP = dyn_cast<ArrayType>(ArrayTyTMP)->getElementType();
+        // if in bound, go on
+      } else {
+        errs() << "[FSAN] GEP[" << i - 1 << "] idx " << idxVal
+               << " is OOB for array of cardinality " << cardinalityOfNthArray
+               << ", BASE TY: " << *BaseTY << "\n";
+        return false; // this idx is OOB, we can't skip the check
+      }
+    }
+
+    // match the type in ArrayTyTmp with the type of load/store operations
+    if (LoadInst *LI = dyn_cast<LoadInst>(O.getInsn())) {
+      if (ArrayTyTMP != LI->getType()) {
+        errs() << "[FSAN] MISMATCH: ArrayTyTmp: " << *ArrayTyTMP
+               << " vs LoadInst type: " << *LI->getType() << "\n";
+        return false;
+      }
+    } else if (StoreInst *SI = dyn_cast<StoreInst>(O.getInsn())) {
+      if (ArrayTyTMP != SI->getValueOperand()->getType()) {
+        errs() << "[FSAN] MISMATCH: ArrayTyTmp: " << *ArrayTyTMP
+               << " vs StoreInst value type: "
+               << *SI->getValueOperand()->getType() << "\n";
+        return false;
+      }
+    } else {
+      // TODO
+      errs() << "[FSAN] Unexpected instruction type for memory access: "
+             << *O.getInsn() << "\n";
+      return false;
+    }
+
+    if (allIndicesAreConstant && allIndicesAreInBounds) {
+      // errs() << "[FSAN] SKIPPING INSTRUMENTATION OF ACCESS TO N-D SCALAR ARRAY "
+      //        << *O.getInsn() << "\n\tGEPChain: " << GEPChainStr
+      //        << "\n\tBaseTY: " << *BaseTY << "\n\tAccessedType: " << *BaseTY
+      //        << "\n\tMEMOP: " << *O.getInsn() << "\n";
+      return true;
+    }
+
+    return false; // DEBUG for now
+  } // end of acccess checking on ND arrays of scalars
 
   // TODO: potentially rule out all accesses on structs coerced.
   SmallVector<Value *, 4> ChainInReverse(GEPChain.rbegin(), GEPChain.rend());
@@ -3053,7 +3123,6 @@ PtrToIntInst *getBasePtrToInt(Value *V, int Depth = 0) {
       if (auto *Right = getBasePtrToInt(I->getOperand(1), Depth + 1))
         return Right;
       break;
-    // You can add logic for PHI nodes or Trunc/ZExt if needed
     default:
       break;
     }
@@ -3231,6 +3300,7 @@ uint64_t getArrayDimension(Type *AT) {
   }
   return Dim;
 }
+
 void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
   // TODO: if the pointer is null, do not instrument that GEP -> UB
   bool PtrOpIsNull = false;
@@ -3249,6 +3319,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
   bool DstIsArrOfStructs = isArrayOfStructs(DstType);
   bool DstIsArray = DstType->isArrayTy();
 
+  // UB that maybe will be removed later?
   auto PtrOp = GEPI->getPointerOperand();
   PtrOpIsNull = isa<ConstantPointerNull>(PtrOp);
   if (PtrOpIsNull) {
@@ -3256,15 +3327,18 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
     return;
   }
   PtrOpIsUndefOrPoison = isa<UndefValue>(PtrOp) || isa<PoisonValue>(PtrOp);
+
   if (PtrOpIsUndefOrPoison) {
-    errs() << "[FSAN] GEP with UNDEF/POISON PTROP: " << *GEPI << "\n";
+    // errs() << "[FSAN] GEP with UNDEF/POISON PTROP: " << *GEPI << "\n";
     return;
   }
+
   if (PtrOp->getType()->isVectorTy()) {
     errs() << "[FSAN] GEP with VECTOR PTROP: " << *GEPI << "\n";
     isVectorGEP = true;
-    return; // TODO
+    return; // TODO: handle these in future versions.
   }
+
   auto GEPNAME = GEPI->hasName() ? GEPI->getName().str()
                                  : "gep." + itostr(NumInstrumentedGEPs);
   auto PTR_OP_NAME = GEPI->getPointerOperand()->hasName()
@@ -3536,6 +3610,8 @@ bool HWAddressSanitizer::performChecksOnGEP(GetElementPtrInst *GEPI) {
         //        << "\n\t\tGEP instruction: " << *GEPI << "\n";
         tag = false;
       } // H1 -> different N of fields
+      // ADDENDUM: this is stale code, the above is handled by the layout check
+      // below. It could go :)
 
       /**
        * %"struct.std::__1::pair.21" = type { %struct.anon,
@@ -3558,44 +3634,18 @@ bool HWAddressSanitizer::performChecksOnGEP(GetElementPtrInst *GEPI) {
         }
         if (!layoutsMatch) {
           // H2: more precise, still overapproximation but less than H1
-          // errs() << "[FSAN] Presumably compiler-induced type punning "
-          //           "detected based on struct layout "
-          //           "mismatch\n\t\tAlloca struct type: "
-          //        << *AllocaST << "\n\t\tGEP struct type: " << *GEPST
-          //        << "\n\t\tGEP instruction: " << *GEPI << "\n";
           tag = false;
-          auto DebugLoc = GEPI->getDebugLoc();
-          if (DebugLoc) {
-            errs() << "\t\t at ";
-            DebugLoc.print(errs());
-            errs() << "\n";
-          }
         }
-        // TODO: can this open up to FNs?
       }
     } // AI->isStruct
-
   } // if ALLOCA
+
   else {
     if (GEPPtrOp->hasName() &&
         GEPPtrOp->getName().find("coerce.") != std::string::npos) {
-      // errs() << "[FSAN] HEURISTIC - GEP with coerce in name: " << *GEPI <<
-      // "\n";
       tag = false;
     } // HEUR 2
     tag = false; // BE CONSERVATIVE IN CASE OF ANON STRUCT GEP
-
-    // TODO: since some ptrs might tagged already, try and "revert" the
-    // tagging logic to revel the original pointer
-    // if PTR comes from LOAD -> conservatively untag GEP
-
-    // if PTR is alloca (pot. fsan-tagged), get base alloca and do checks
-    // on type
-
-    // if it's heap-alloc, try and get the type from call to fsan
-    // tagging function?
-
-    // if it's array idx, try and get type from GEP (it's a GEP)
   }
 
   // H: is pointers to a certain struct are used in extractvalue, type
