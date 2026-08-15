@@ -1865,6 +1865,9 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
   } // skip 1D scalar arrays, they are handled by ASAN already.
 
   if (isNDArrayOfScalars) {
+    errs() << "[FSAN] Checking access to N-D scalar array: " << *O.getInsn()
+           << "\n\tGEPChain: " << GEPChainStr
+           << "\n\tBaseTY: " << *BaseTY << "\n\tMEMOP "<< *O.getInsn() << "\n";
     // H1: if all the indices in the GEP chain are statically known and they are
     // in bounds at each and every step of the chain with respect to the size of
     // the i-th array, then you can skip
@@ -1882,7 +1885,7 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
       // always look at idx 2, if some GEP has only 2 operands and not 3, DONT
       // SKIP THE ACCESS FOR NOW. They are pointer arithmetic byproducts, they
       // require some more sophisticated analysis.
-      // errs() << "[FSAN] GEP[" << i++ << "]: " << *GEP_ith_V << "\n";
+      errs() << "[FSAN] GEP[" << i++ << "]: " << *GEP_ith_V << "\n";
       nOperandsGEP = GEP_ith->getNumOperands();
       if (nOperandsGEP < 3)
         return false;                    // TODO
@@ -1890,8 +1893,16 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
       ConstantInt *CI = dyn_cast<ConstantInt>(op2);
       if (!CI)
         return false; // TODO more log later on
-      auto cardinalityOfNthArray =
-          dyn_cast<ArrayType>(ArrayTyTMP)->getNumElements();
+      // auto cardinalityOfNthArray =
+      //     dyn_cast<ArrayType>(ArrayTyTMP)->getNumElements();
+      ArrayTyTMP = dyn_cast<ArrayType>(ArrayTyTMP);
+      if(!ArrayTyTMP){
+        errs() << "[FSAN] GEP[" << i - 1 << "] BaseTY: " << *BaseTY
+               << " is not an array type, but GEP has idx " << CI->getZExtValue()
+               << "\n";
+        return false; // type punning or similar
+      }
+      auto cardinalityOfNthArray = dyn_cast<ArrayType>(ArrayTyTMP)->getNumElements();
       auto idxVal = CI->getZExtValue();
       if (0 <= idxVal && idxVal < cardinalityOfNthArray) {
         ArrayTyTMP = dyn_cast<ArrayType>(ArrayTyTMP)->getElementType();
@@ -1903,19 +1914,21 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
         return false; // this idx is OOB, we can't skip the check
       }
     }
-
+    errs() << "[FSAN] GEPChain: " << GEPChainStr
+           << "\n\tBaseTY: " << *BaseTY << "\n\tAccessedType: " << *ArrayTyTMP
+           << "\n\tMEMOP: " << *O.getInsn() << "\n";
     // match the type in ArrayTyTmp with the type of load/store operations
     if (LoadInst *LI = dyn_cast<LoadInst>(O.getInsn())) {
       if (ArrayTyTMP != LI->getType()) {
-        errs() << "[FSAN] MISMATCH: ArrayTyTmp: " << *ArrayTyTMP
-               << " vs LoadInst type: " << *LI->getType() << "\n";
+        // errs() << "[FSAN] MISMATCH: ArrayTyTmp: " << *ArrayTyTMP
+        //        << " vs LoadInst type: " << *LI->getType() << "\n";
         return false;
       }
     } else if (StoreInst *SI = dyn_cast<StoreInst>(O.getInsn())) {
       if (ArrayTyTMP != SI->getValueOperand()->getType()) {
-        errs() << "[FSAN] MISMATCH: ArrayTyTmp: " << *ArrayTyTMP
-               << " vs StoreInst value type: "
-               << *SI->getValueOperand()->getType() << "\n";
+        // errs() << "[FSAN] MISMATCH: ArrayTyTmp: " << *ArrayTyTMP
+        //        << " vs StoreInst value type: "
+              //  << *SI->getValueOperand()->getType() << "\n";
         return false;
       }
     } else {
