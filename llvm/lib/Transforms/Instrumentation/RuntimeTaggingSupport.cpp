@@ -75,6 +75,9 @@ __attribute__((noinline)) void createTagVector(Type *TY, Module &M, int depth) {
         // TODO: add support for selectively blocklisting specific fields using
         // indexes, not names
         while (std::getline(BlocklistFile, Line)) {
+          // if it's emtpy line, skip
+          if (Line.empty())
+            continue;
           // NOTE: we want to match struct.sockaddr, but not struct.sockaddr_in
           bool containsAsterisk = Line.find('*') != std::string::npos;
           if (containsAsterisk) {
