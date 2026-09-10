@@ -197,16 +197,11 @@ private:
     Value *MemTag = nullptr;
   };
 
-// FieldArmor addenda
-#if defined(__aarch64__)
-  // TODO
-#else
-  uint64_t LBits = 2ULL;
-  uint64_t TBits = 3ULL;
-#endif
-  uint64_t L_MAX = (1ULL << LBits);
-  uint64_t T_MAX = (1ULL << TBits);
-  u_int64_t RPTag = 0x1UL << (TBits + LBits);
+  uint64_t TAG_SPACE =
+      6ULL; // prototype uses fixed space for ARM TBI and x86_64 LAM57
+  uint64_t T_MAX =
+      (1ULL << (TAG_SPACE - 1ULL)); // last bit is reserved for RP tag
+  u_int64_t RPTag = 0x1UL << (TAG_SPACE - 1ULL);
   bool isAccessToScalar(InterestingMemoryOperand &O, const DataLayout &DL);
   Type *extractTypeFromTypedAllocatorOrNew(CallBase *CI);
   Type *extractUnderlyingMemType(Value *I, const DataLayout &DL);
@@ -243,7 +238,7 @@ private:
   void initializeModule();
   void createHwasanCtorComdat();
   bool checkIfSROATypePunning(InterestingMemoryOperand &O,
-                                                  const DataLayout &DL);
+                              const DataLayout &DL);
   void initializeCallbacks(Module &M);
 
   Value *getOpaqueNoopCast(IRBuilder<> &IRB,
@@ -290,11 +285,8 @@ private:
                        const PostDominatorTree &PDT, const LoopInfo &LI,
                        const DataLayout &DL);
   Value *extractLevelFromPointer(IRBuilder<> &IRB, Value *Ptr);
-  Value *zeroOutLevelBits(IRBuilder<> &IRB, Value *Ptr);
   Value *maskPointerIntrinsic(IRBuilder<> &IRB, Value *Ptr, uint64_t Mask);
 
-  Value *AddOneModuloSomething(IRBuilder<> &IRB, Value *Addendum,
-                               uint64_t Mask);
   Value *MaskFuckingPointer(IRBuilder<> &IRB, Value *Ptr, uint64_t Mask);
   bool instrumentLandingPads(SmallVectorImpl<Instruction *> &RetVec);
   Value *getNextTagWithCall(IRBuilder<> &IRB); // not sure I still need this
@@ -368,53 +360,53 @@ private:
     bool withFrameRecord() const { return WithFrameRecord; };
   };
 
-    ShadowMapping Mapping;
+  ShadowMapping Mapping;
 
-    Type *VoidTy = Type::getVoidTy(M.getContext());
-    Type *IntptrTy = M.getDataLayout().getIntPtrType(M.getContext());
-    PointerType *PtrTy = PointerType::getUnqual(M.getContext());
-    Type *Int8Ty = Type::getInt8Ty(M.getContext());
-    Type *Int32Ty = Type::getInt32Ty(M.getContext());
-    Type *Int64Ty = Type::getInt64Ty(M.getContext());
+  Type *VoidTy = Type::getVoidTy(M.getContext());
+  Type *IntptrTy = M.getDataLayout().getIntPtrType(M.getContext());
+  PointerType *PtrTy = PointerType::getUnqual(M.getContext());
+  Type *Int8Ty = Type::getInt8Ty(M.getContext());
+  Type *Int32Ty = Type::getInt32Ty(M.getContext());
+  Type *Int64Ty = Type::getInt64Ty(M.getContext());
 
-    bool CompileKernel;
-    bool OutlinedChecks;
-    bool InlineFastPath;
-    bool InstrumentLandingPads;
-    bool InstrumentWithCalls;
-    bool InstrumentStack;
-    bool InstrumentGlobals;
-    bool UseMatchAllCallback;
+  bool CompileKernel;
+  bool OutlinedChecks;
+  bool InlineFastPath;
+  bool InstrumentLandingPads;
+  bool InstrumentWithCalls;
+  bool InstrumentStack;
+  bool InstrumentGlobals;
+  bool UseMatchAllCallback;
 
-    std::optional<uint8_t> MatchAllTag;
+  std::optional<uint8_t> MatchAllTag;
 
-    unsigned PointerTagShift;
-    unsigned LevelShift;
-    uint64_t LMask;
-    uint64_t TMask;
-    uint64_t RMask;
+  unsigned PointerTagShift;
+  unsigned LevelShift;
+  uint64_t LMask;
+  uint64_t TMask;
+  uint64_t RMask;
 
-    uint64_t TagMaskByte;
+  uint64_t TagMaskByte;
 
-    Function *HwasanCtorFunction;
+  Function *HwasanCtorFunction;
 
-    FunctionCallee HwasanMemoryAccessCallback[2][kNumberOfAccessSizes];
-    FunctionCallee HwasanMemoryAccessCallbackSized[2];
+  FunctionCallee HwasanMemoryAccessCallback[2][kNumberOfAccessSizes];
+  FunctionCallee HwasanMemoryAccessCallbackSized[2];
 
-    FunctionCallee HwasanMemmove, HwasanMemcpy, HwasanMemset;
-    FunctionCallee HwasanHandleVfork;
+  FunctionCallee HwasanMemmove, HwasanMemcpy, HwasanMemset;
+  FunctionCallee HwasanHandleVfork;
 
-    FunctionCallee HwasanTagMemoryFunc;
-    FunctionCallee HwasanGenerateTagFunc;
-    FunctionCallee HwasanRecordFrameRecordFunc;
+  FunctionCallee HwasanTagMemoryFunc;
+  FunctionCallee HwasanGenerateTagFunc;
+  FunctionCallee HwasanRecordFrameRecordFunc;
 
-    Constant *ShadowGlobal;
+  Constant *ShadowGlobal;
 
-    Value *ShadowBase = nullptr;
+  Value *ShadowBase = nullptr;
 
-    Value *CachedFP = nullptr;
-    GlobalValue *ThreadPtrGlobal = nullptr;
-  };
+  Value *CachedFP = nullptr;
+  GlobalValue *ThreadPtrGlobal = nullptr;
+};
 
 } // end anonymous namespace
 } // namespace llvm

@@ -106,11 +106,11 @@ static cl::opt<bool>
 
 static cl::opt<bool> ClFSAN_BOP("fsan-instrument-bops",
                                 cl::desc("instrument binary op instructions"),
-                                cl::Hidden, cl::init(true));
+                                cl::Hidden, cl::init(false));
 
 static cl::opt<bool> ClFSAN_CMP("fsan-instrument-cmp",
                                 cl::desc("instrument compare instructions"),
-                                cl::Hidden, cl::init(true));
+                                cl::Hidden, cl::init(false));
 
 static cl::opt<bool>
     ClFSAN_levels("fsan-levels",
@@ -1024,15 +1024,6 @@ void HWAddressSanitizer::initializeModule() {
   }
 
   PointerTagShift = IsX86_64 ? 57 : 56;
-  TBits = IsX86_64 ? 3 : 5;
-  LBits = 2;
-  L_MAX = (1UL << LBits) - 1;
-
-  LMask = ((1UL << LBits) - 1);
-  TMask = ((1UL << TBits) - 1);
-  RMask = ((1UL << (TBits + LBits)) - 1);
-
-  LevelShift = IsX86_64 ? 3 : 5;
   TagMaskByte = IsX86_64 ? 0x3F : 0xFF;
   Mapping.init(TargetTriple, InstrumentWithCalls, CompileKernel);
 
@@ -3290,19 +3281,6 @@ bool HWAddressSanitizer::isArrayOfStructs(llvm::Type *T) {
   return T->isStructTy();
 }
 
-Value *HWAddressSanitizer::zeroOutLevelBits(IRBuilder<> &IRB, Value *Ptr) {
-  // ZERO level bits
-  Type *PtrTy = Ptr->getType();
-  unsigned PtrBits = M.getDataLayout().getPointerTypeSizeInBits(PtrTy);
-  Type *MaskTy = IntegerType::get(M.getContext(), PtrBits);
-  uint64_t PtrMaskForLevel = LMask << (PointerTagShift + TBits);
-  Value *MaskVal = ConstantInt::get(MaskTy, ~PtrMaskForLevel);
-  Function *PtrMaskFcn =
-      Intrinsic::getDeclaration(&M, Intrinsic::ptrmask, {PtrTy, MaskTy});
-  Value *PointerWithNoLevel = IRB.CreateCall(PtrMaskFcn, {Ptr, MaskVal});
-  return PointerWithNoLevel;
-}
-
 Value *HWAddressSanitizer::maskPointerIntrinsic(IRBuilder<> &IRB, Value *Ptr,
                                                 uint64_t MASK) {
   Type *PtrTy = Ptr->getType();
@@ -3315,15 +3293,6 @@ Value *HWAddressSanitizer::maskPointerIntrinsic(IRBuilder<> &IRB, Value *Ptr,
   return MaskedPtr;
 }
 
-Value *HWAddressSanitizer::AddOneModuloSomething(IRBuilder<> &IRB,
-                                                 Value *Addendum,
-                                                 uint64_t Mask) {
-  Value *PlusOne =
-      IRB.CreateAdd(Addendum, ConstantInt::get(Addendum->getType(), 1));
-  PlusOne = IRB.CreateAnd(PlusOne, ConstantInt::get(PlusOne->getType(),
-                                                    LMask)); // % LEVEL MAX
-  return PlusOne;
-}
 
 uint64_t getArrayDimension(Type *AT) {
   uint64_t Dim = 0;
@@ -3446,12 +3415,6 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
                !isArrayOfStructs(DstType)) {
         Value *untagged = maskPointerIntrinsic(IRB, GEPI, PTR_MASK);
         GEPLong = IRB.CreatePtrToInt(untagged, IntptrTy);
-        // uint64_t TagPtrToArrayNoBoundsNarrowed = 0ULL;
-        // Value *TBits_CONST = ConstantInt::get(
-        //     IntptrTy, (TagPtrToArrayNoBoundsNarrowed << (PointerTagShift +
-        //     (TBits + LBits))));
-        // Value *GEPLongWithT = IRB.CreateOr(GEPLong, TBits_CONST);
-        // taggedPointer = IRB.CreateIntToPtr(GEPLongWithT, GEPI->getType());
         taggedPointer = IRB.CreateIntToPtr(
             GEPLong,
             GEPI->getType()); // NOTE: these pointers are not tagged. They will
@@ -3485,7 +3448,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         // flattening the uppermost level
         const uint64_t SHIFT = NSrc - ShiftAdjustment;
 
-        if (SHIFT >= TBits + LBits)
+        if (SHIFT >= (TAG_SPACE-1))
           return;
 
         const unsigned IndexOperand = TwoOpsGEP ? 1U : 2U;
@@ -3519,7 +3482,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         auto GEPLongMsb = IRB.CreateOr(
             GEPLong,
             ConstantInt::get(IntPtrITy,
-                             1ULL << (PointerTagShift + TBits + LBits)),
+                             1ULL << (PointerTagShift + (TAG_SPACE-1))),
             GEPNAME + ".fsan.MSB"); // always set MSB to avoid
                                     // short-circuiting at check time
 

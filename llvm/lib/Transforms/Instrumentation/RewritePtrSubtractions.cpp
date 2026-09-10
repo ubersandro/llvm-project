@@ -90,7 +90,7 @@ bool RewritePtrSubtractionsPass::InstrumentBOP(BinaryOperator *BOP, Module &M) {
             auto *NewPtrNeg = untagPointerIntrinsic(IRBNeg, PtrNeg, M);
             PTINeg->setOperand(0, NewPtrNeg);
 
-            errs() << "[FSAN] Instrumented BOP with negation: " << *BOP << "\n";
+            // errs() << "[FSAN] Instrumented BOP with negation: " << *BOP << "\n";
             return true;
           }
         }
@@ -102,8 +102,8 @@ bool RewritePtrSubtractionsPass::InstrumentBOP(BinaryOperator *BOP, Module &M) {
   BothPtr = dyn_cast<PtrToIntInst>(OP0) && dyn_cast<PtrToIntInst>(OP1);
   if (!BothPtr)
     return false;
-  errs() << "[==] Instrumenting BinaryOperator: " << *BOP
-         << "  FUNC = " << BOP->getFunction()->getName() << "\n";
+  // errs() << "[==] Instrumenting BinaryOperator: " << *BOP
+  //        << "  FUNC = " << BOP->getFunction()->getName() << "\n";
   processOperand(BOP, OP0, 0, TagMaskByte, PointerTagShift, M);
   processOperand(BOP, OP1, 1, TagMaskByte, PointerTagShift, M);
   return true;
@@ -131,8 +131,8 @@ bool RewritePtrSubtractionsPass::InstrumentCMP(CmpInst *CI, Module &M) {
   auto cmpType = op1->getType();
   auto op2 = CI->getOperand(1);
   if (cmpType->isPointerTy()) {
-    errs() << "[==] Instrumenting CmpInst: " << *CI
-           << ", FUNC = " << CI->getFunction()->getName() << "\n";
+    // errs() << "[==] Instrumenting CmpInst: " << *CI
+    //        << ", FUNC = " << CI->getFunction()->getName() << "\n";
     IRBuilder<> IRB(CI);
     Value *untaggedPtr1 = untagPointerIntrinsic(IRB, op1, M);
     CI->replaceUsesOfWith(op1, untaggedPtr1);

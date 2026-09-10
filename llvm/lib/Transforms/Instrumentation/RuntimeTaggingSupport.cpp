@@ -25,14 +25,8 @@ static cl::opt<bool> clFSAN_DEPTH_AWARE_TAGGING(
     cl::desc("Enable depth-aware tagging for nested structures"), cl::Hidden,
     cl::init(false));
 namespace RuntimeTaggingSupport {
-#if defined(__x86_64__)
-uint64_t TBits = 3;
-uint64_t LBits = 2;
-#else
-// TODO
-#endif
-uint64_t L_MAX = (1ULL << LBits);
-uint64_t T_MAX = (1ULL << TBits); // 0b100000
+uint64_t TAG_SPACE = 6ULL;
+uint64_t T_MAX = (1ULL << (TAG_SPACE-1ULL)); // 0b100000
 
 __attribute__((noinline)) void createTagVector(Type *TY, Module &M, int depth) {
   auto *Int8Ty = Type::getInt8Ty(M.getContext());
@@ -76,7 +70,11 @@ __attribute__((noinline)) void createTagVector(Type *TY, Module &M, int depth) {
         // indexes, not names
         while (std::getline(BlocklistFile, Line)) {
           // if it's emtpy line, skip
+
           if (Line.empty())
+            continue;
+          // if line len <= 1 skip
+          if (Line.length() <= 1)
             continue;
           // NOTE: we want to match struct.sockaddr, but not struct.sockaddr_in
           bool containsAsterisk = Line.find('*') != std::string::npos;
@@ -244,7 +242,6 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
   auto FieldsOffsets = DL.getStructLayout(Ty)->getMemberOffsets();
 
   uint8_t fatherT = 0; /* unused */
-  // int fatherL = (depth & (L_MAX - 1)); // modulo L_MAX --> level-aware
   int fatherL = 0; // NO L
   uint64_t sonIdx = 1;
   // NOTE: 2^^16 max number of fields
@@ -308,7 +305,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
                 CurFieldIsBlockListedStruct = true;
                 break;
               }
-            } else if (demangledTypeName.find(Line) == 0) {
+            } else if (demangledTypeName.find(Line) == 0 && Line.length() > 1) {
               errs() << "[FSAN - TAG] NULL TAG ON STRUCT "
                      << *CurFieldStructType
                      << " (matched blocklist line: " << Line << ")\n";
@@ -330,7 +327,6 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
       auto ContainedSubTypes = CurFieldStructType->getNumElements();
       size_t CurContainedSubTy = 0;
       // for struct types, we go one level deeper
-      // auto NextL = (fatherL + 1) & (L_MAX - 1); // modulo L_MAX
       auto NextL = 0; // NO L
 
       for (Type *SSty : llvm::reverse(CurFieldType->subtypes())) {
@@ -358,8 +354,6 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         Elements *= CurArrayType->getNumElements();
         ArrayDims++;
       }
-      int OverallDepth = (ArrayDims + fatherL) &
-                         (L_MAX - 1); // as a struct member, level is already +1
       // check type
       if (ElemType->isStructTy()) {
         // retrieve or create tag vector for struct type
@@ -367,9 +361,8 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         assert(ElemStructType &&
                "Element type of array must be struct for this case.");
         size_t ElemStructSize = DL.getTypeAllocSize(ElemStructType);
-        OverallDepth = 0; // NO L
         auto *TagVector =
-            RetrieveOrCreateTagVector(ElemStructType, M, OverallDepth + 1);
+            RetrieveOrCreateTagVector(ElemStructType, M, /*DUMMY*/1);
         assert(TagVector && "Failed to retrieve or create tag vector for "
                             "struct element type.");
         GlobalVariable *TVGV = dyn_cast<GlobalVariable>(TagVector);
@@ -393,7 +386,6 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         uint64_t IdxDivT_MAX = sonIdx / T_MAX;
         uint64_t T = (IdxModuloT_MAX + IdxDivT_MAX);
         T = T % T_MAX;
-        uint64_t TAG_BITS = 5ULL; // TODO put elsewhere
         if (T == 0) {
           T = 1;
         }
@@ -463,7 +455,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         }
         uint8_t Tag = T;
 
-        uint8_t CurFieldTag = Tag | (fatherL << TBits);
+        uint8_t CurFieldTag = Tag;
         int CurFieldSize = DL.getTypeAllocSize(CurFieldType);
         memset(&Tags[CurFieldOffset], CurFieldTag, CurFieldSize);
       }
