@@ -286,6 +286,10 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
         if (BlocklistFile.is_open()) {
           std::string Line;
           while (std::getline(BlocklistFile, Line)) {
+            if(Line.empty())
+              continue;
+            if(Line.length() <= 1)
+              continue;
             // NOTE: we want to match struct.sockaddr, but not
             // struct.sockaddr_in
             bool containsAsterisk = Line.find('*') != std::string::npos;
@@ -305,7 +309,7 @@ __attribute__((noinline)) u_int8_t *ComputeTags(StructType *Ty, Module &M,
                 CurFieldIsBlockListedStruct = true;
                 break;
               }
-            } else if (demangledTypeName.find(Line) == 0 && Line.length() > 1) {
+            } else if (demangledTypeName.find(Line) == 0) {
               errs() << "[FSAN - TAG] NULL TAG ON STRUCT "
                      << *CurFieldStructType
                      << " (matched blocklist line: " << Line << ")\n";
