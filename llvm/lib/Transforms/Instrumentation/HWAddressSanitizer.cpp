@@ -1857,8 +1857,8 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
 
   if (isNDArrayOfScalars) {
     errs() << "[FSAN] Checking access to N-D scalar array: " << *O.getInsn()
-           << "\n\tGEPChain: " << GEPChainStr
-           << "\n\tBaseTY: " << *BaseTY << "\n\tMEMOP "<< *O.getInsn() << "\n";
+           << "\n\tGEPChain: " << GEPChainStr << "\n\tBaseTY: " << *BaseTY
+           << "\n\tMEMOP " << *O.getInsn() << "\n";
     // H1: if all the indices in the GEP chain are statically known and they are
     // in bounds at each and every step of the chain with respect to the size of
     // the i-th array, then you can skip
@@ -1887,13 +1887,14 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
       // auto cardinalityOfNthArray =
       //     dyn_cast<ArrayType>(ArrayTyTMP)->getNumElements();
       ArrayTyTMP = dyn_cast<ArrayType>(ArrayTyTMP);
-      if(!ArrayTyTMP){
+      if (!ArrayTyTMP) {
         errs() << "[FSAN] GEP[" << i - 1 << "] BaseTY: " << *BaseTY
-               << " is not an array type, but GEP has idx " << CI->getZExtValue()
-               << "\n";
+               << " is not an array type, but GEP has idx "
+               << CI->getZExtValue() << "\n";
         return false; // type punning or similar
       }
-      auto cardinalityOfNthArray = dyn_cast<ArrayType>(ArrayTyTMP)->getNumElements();
+      auto cardinalityOfNthArray =
+          dyn_cast<ArrayType>(ArrayTyTMP)->getNumElements();
       auto idxVal = CI->getZExtValue();
       if (0 <= idxVal && idxVal < cardinalityOfNthArray) {
         ArrayTyTMP = dyn_cast<ArrayType>(ArrayTyTMP)->getElementType();
@@ -1905,8 +1906,8 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
         return false; // this idx is OOB, we can't skip the check
       }
     }
-    errs() << "[FSAN] GEPChain: " << GEPChainStr
-           << "\n\tBaseTY: " << *BaseTY << "\n\tAccessedType: " << *ArrayTyTMP
+    errs() << "[FSAN] GEPChain: " << GEPChainStr << "\n\tBaseTY: " << *BaseTY
+           << "\n\tAccessedType: " << *ArrayTyTMP
            << "\n\tMEMOP: " << *O.getInsn() << "\n";
     // match the type in ArrayTyTmp with the type of load/store operations
     if (LoadInst *LI = dyn_cast<LoadInst>(O.getInsn())) {
@@ -1919,7 +1920,7 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
       if (ArrayTyTMP != SI->getValueOperand()->getType()) {
         // errs() << "[FSAN] MISMATCH: ArrayTyTmp: " << *ArrayTyTMP
         //        << " vs StoreInst value type: "
-              //  << *SI->getValueOperand()->getType() << "\n";
+        //  << *SI->getValueOperand()->getType() << "\n";
         return false;
       }
     } else {
@@ -1930,7 +1931,8 @@ bool HWAddressSanitizer::canBeSkipped(InterestingMemoryOperand &O,
     }
 
     if (allIndicesAreConstant && allIndicesAreInBounds) {
-      // errs() << "[FSAN] SKIPPING INSTRUMENTATION OF ACCESS TO N-D SCALAR ARRAY "
+      // errs() << "[FSAN] SKIPPING INSTRUMENTATION OF ACCESS TO N-D SCALAR
+      // ARRAY "
       //        << *O.getInsn() << "\n\tGEPChain: " << GEPChainStr
       //        << "\n\tBaseTY: " << *BaseTY << "\n\tAccessedType: " << *BaseTY
       //        << "\n\tMEMOP: " << *O.getInsn() << "\n";
@@ -2633,7 +2635,6 @@ inline Value *HWAddressSanitizer::untagPointerIntrinsic(IRBuilder<> &IRB,
   bool cond = MaskedPtr->getType() == Ptr->getType() &&
               (MaskedPtr->getType()->getPointerAddressSpace() ==
                Ptr->getType()->getPointerAddressSpace());
-  assert(cond && "PTRMASK FUCKED UP");
   MaskedPtr->setName(Ptr->getName() + ".untagged");
   return MaskedPtr;
 }
@@ -3293,7 +3294,6 @@ Value *HWAddressSanitizer::maskPointerIntrinsic(IRBuilder<> &IRB, Value *Ptr,
   return MaskedPtr;
 }
 
-
 uint64_t getArrayDimension(Type *AT) {
   uint64_t Dim = 0;
   while (AT && AT->isArrayTy()) {
@@ -3448,7 +3448,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         // flattening the uppermost level
         const uint64_t SHIFT = NSrc - ShiftAdjustment;
 
-        if (SHIFT >= (TAG_SPACE-1))
+        if (SHIFT >= (TAG_SPACE - 1))
           return;
 
         const unsigned IndexOperand = TwoOpsGEP ? 1U : 2U;
@@ -3482,7 +3482,7 @@ void HWAddressSanitizer::InstrumentGEP_NoL(GetElementPtrInst *GEPI) {
         auto GEPLongMsb = IRB.CreateOr(
             GEPLong,
             ConstantInt::get(IntPtrITy,
-                             1ULL << (PointerTagShift + (TAG_SPACE-1))),
+                             1ULL << (PointerTagShift + (TAG_SPACE - 1))),
             GEPNAME + ".fsan.MSB"); // always set MSB to avoid
                                     // short-circuiting at check time
 
@@ -3776,19 +3776,15 @@ StructType *HWAddressSanitizer::getStructTypeFromDbgInfo(GlobalVariable *GV,
 void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   auto NAME = GV->hasName() ? GV->getName().str() : "unnamed";
   if (NAME.find("_kwtuple") != std::string::npos) {
-    errs() << "FUCK 710 PYTHON " << NAME << "\n";
+    errs() << "IGNORING TYPE ERROR IN 710 PYTHON " << NAME << "\n";
     return;
   }
   if (NAME.find("SNGL_SCAN") != std::string::npos ||
       NAME.find("INIT_FLD") != std::string::npos) {
-    errs() << "FUCK 525 SPEC " << NAME << "\n";
+    errs() << "IGNORING TYPE ERROR IN 525 SPEC " << NAME << "\n";
     return;
   }
-  // if (NAME.find("days_in_month") != std::string::npos) {
-  //   errs() << "FUCK 500 SPEC " << NAME << "\n";
-  //   return;
-  // TODO: was this real? I don't recall, but it does not trigger...
-  // }
+
   Constant *Initializer = GV->getInitializer();
   Type *GVType = GV->getValueType();
   StructType *STType = nullptr;
@@ -3955,6 +3951,72 @@ void HWAddressSanitizer::instrumentGlobal(GlobalVariable *GV) {
   NumInstrumentedGlobals++;
 } // instrumentGlobal
 
+bool operandPointsToGlobalArrayOfNonStructs(Constant *Op) {
+  // also if it's a GEP!!!
+  bool isGEP = isa<GEPOperator>(Op);
+  if(!isGEP) return false;
+  auto pointee = isGEP ? dyn_cast<GEPOperator>(Op)->getPointerOperand() : Op;
+  if (GlobalVariable *GV = dyn_cast<GlobalVariable>(pointee)) {
+    Type *GVType = GV->getValueType();
+    if (GVType->isArrayTy()) {
+      Type *InTY = dyn_cast<ArrayType>(GVType)->getElementType();
+      if (!InTY->isStructTy() && InTY->isArrayTy()) {
+        // mark GV as no-instrument
+        auto*C = &GV->getContext();
+        auto Int32Ty = Type::getInt32Ty(*C);
+        auto *MD_node =
+            MDNode::get(*C, ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 1)));
+        GV->setMetadata("fsan.noinstrument.pointer", MD_node);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool doCheckOnStructInitializer(ConstantStruct *CS) {
+  for (unsigned i = 0; i < CS->getNumOperands(); i++) {
+    Constant *Op = CS->getOperand(i);
+    if (operandPointsToGlobalArrayOfNonStructs(Op)) {
+      errs() << "[FSAN] WARNING: Global variable initializer contains a "
+                "pointer to a global array of non-structs: "
+             << *Op << "\n";
+      return true;
+    }
+  }
+  return false;
+}
+
+bool identifyAndUninstrumentPtrsGV(GlobalVariable *GV) {
+  // take the initializer
+  Constant *Initializer = GV->getInitializer();
+  if (!Initializer)
+    return false; // no initializer, nothing to do
+  if (isa<ConstantPointerNull>(Initializer))
+    return false; // null pointer, nothing to do
+  if (isa<ConstantAggregateZero>(Initializer))
+    return false; // zero aggregate, nothing to do
+  if (isa<ConstantDataArray>(Initializer))
+    return false; // data array, nothing to do
+
+  // specifically check on constant initializers that are structs or arrays of
+  // structs
+  if (ConstantStruct *CS = dyn_cast<ConstantStruct>(Initializer)) {
+    doCheckOnStructInitializer(CS);
+  } else if (ConstantArray *CA = dyn_cast<ConstantArray>(Initializer)) {
+    for (unsigned i = 0; i < CA->getNumOperands(); i++) {
+      Constant *Op = CA->getOperand(i);
+      // is it constant struct?
+      if (isa<ConstantStruct>(Op)) {
+        ConstantStruct *CS = dyn_cast<ConstantStruct>(Op);
+        (doCheckOnStructInitializer(CS));
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
 void HWAddressSanitizer::instrumentGlobals() {
   std::vector<GlobalVariable *> Globals;
   for (GlobalVariable &GV : M.globals()) {
@@ -3970,8 +4032,8 @@ void HWAddressSanitizer::instrumentGlobals() {
     // tagged.
     if (GV.hasCommonLinkage())
       continue;
-    /** NOTE: FSAN does not instrument tag vectors, they are special globals for
-     * tagging */
+    /** NOTE: FSAN does not instrument tag vectors, they are special globals
+     * for tagging */
     if (GV.getName().contains("tagvec"))
       continue;
 
@@ -4017,11 +4079,24 @@ void HWAddressSanitizer::instrumentGlobals() {
     } else if (!GV.getValueType()->isStructTy()) {
       continue;
     }
-
+    // at this point, do one last check
     Globals.push_back(&GV);
   }
   // NOTE: I am assuming all the above checks are necessary.
+  // filter our based on all the initializers. If they contain pointers to
+  // globals that are arrays of NON-structs, blacklist the pointee.
+  bool res = false;
   for (GlobalVariable *GV : Globals) {
+    res = identifyAndUninstrumentPtrsGV(GV); // ignore ret
+  }
+  bool MarkedForNoInstrument = false;
+  for (GlobalVariable *GV : Globals) {
+    MarkedForNoInstrument = GV->getMetadata("fsan.noinstrument.pointer") !=
+                         nullptr;
+    if (MarkedForNoInstrument) {
+      errs() << "[FSAN] WARNING: Global variable " << GV->getName() << " is MARKED FOR NO INSTRUMENT"<< "\n";
+      continue;
+    }
     instrumentGlobal(GV);
   } // for global var
 } // instrumentGlobals
