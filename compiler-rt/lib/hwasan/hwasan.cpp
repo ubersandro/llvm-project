@@ -538,9 +538,9 @@ void __sanitizer_unaligned_store64(uu64* p, u64 x) { *p = x; }
 void __hwasan_loadN(uptr p, uptr sz) {
   CheckAddressSized<ErrorAction::Abort, AccessType::Load>(p, sz);
 }
-void __hwasan_accessN_SLP(uptr p, uint64_t N, uint8_t size){
-  CheckAddressVector<ErrorAction::Abort, AccessType::Load>(p, N, size);
-}
+// void __hwasan_accessN_SLP(uptr p, uint64_t N, uint8_t size){
+//   CheckAddressVector<ErrorAction::Abort, AccessType::Load>(p, N, size);
+// }
 
 
 // convencience function defined for debugging memory checking inline

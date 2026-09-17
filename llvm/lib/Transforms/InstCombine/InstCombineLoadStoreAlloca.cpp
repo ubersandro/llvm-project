@@ -31,7 +31,7 @@ using namespace PatternMatch;
 STATISTIC(NumDeadStore, "Number of dead stores eliminated");
 STATISTIC(NumGlobalCopies, "Number of allocas copied from constant global");
 static cl::opt<bool> InstCombineDoNotTouchLoadStoreAlloca (
-    "instcombine-disable-load-store-alloca", cl::init(false),
+    "instcombine-disable-load-store-alloca", cl::init(true),
     cl::desc("Do not touch optimize load/store to alloca in instcombine"),
     cl::Hidden);
 static cl::opt<unsigned> MaxCopiedFromConstantUsers(

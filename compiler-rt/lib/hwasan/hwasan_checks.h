@@ -152,64 +152,31 @@ PossiblyShortTagMatches(tag_t mem_tag, uptr ptr, uptr sz) {
   return *(u8*)(ptr | (kShadowAlignment - 1)) == ptr_tag;
 }
 
-#if defined(__aarch64__)
-#  define T_BITS 5UL
-#  define L_BITS 2UL
-#  define L_MASK (0b11U << T_BITS)
-#else
-#  define T_BITS 3UL
-#  define L_BITS 2UL
-#  define L_MASK (0b11UL << T_BITS)
-#endif
-#define R_MASK (1UL << (T_BITS + L_BITS))
-#define getT(tag) (tag & ((1UL << T_BITS) - 1))
-#define getL(tag) ((tag & L_MASK) >> T_BITS)
-#define getR(tag) ((tag & R_MASK) >> (T_BITS + L_BITS))
+// NOTE: same number of bits for both ARM and x86
+#define TAG_BITS 6  // TOTAL number of bits used for tagging
 
-// This mask preserves the bits on which we do checks
-// #define CHECK_TAG_MASK ((1ULL << (T_BITS + L_BITS)) - 1)
-#define CHECK_TAG_MASK ((1ULL << (T_BITS + L_BITS)) - 1)
+#define getT(tag)                    \
+  (tag & ((1ULL << (TAG_BITS - 1)) - \
+          1))  // AND-mask to retrieve the T bits, without the R bit
+#define getR(tag) ((tag) >> (TAG_BITS - 1))  // retrieve the R bit
 
-// TODO: double check on overflows on tagging bytes -> shadow byte == 0xff means
-// padding
-#define PADDING_BYTE 0xff
-// TODO: how to detect a byte exactly equal to 0xff inside a 64 bit value
-// efficiently?
-// HEURISTIC: only checking on the last byte for now
+// AND-mask preserving ALL TAG bits -> NOTE: this is no longer necessary, here
+// just for reference (stale)
+#define PTR_TAG_MASK ((1ULL << (TAG_BITS)) - 1)
+#define MEM_TAG_MASK \
+  ((1ULL << (8ULL)) - 1)  //  SHADOW MEMORY is byte granular. To detect padding
+                          //  bytes accesses we must also check the bits that
+                          //  are not used for tagging pointers (top 2).
 
-template <ErrorAction EA, AccessType AT>
-__attribute__((always_inline, nodebug)) static void CheckAddressVector(
-    uptr p, uint64_t N, uint64_t size) {
-  unsigned char* untagged_ptr = (unsigned char*)(p & ~kAddressTagMask);
-  tag_t ptr_tag = GetTagFromPointer(p);
-  // when ptr tag is 0, we skip checks
-
-  if (UNLIKELY(ptr_tag == 0)) {
-    return;
-  }  // ptr tag is 0
-
-  uptr baseShadow = MemToShadow((uptr)untagged_ptr);
-  uint8_t mem_tag = *((uint8_t*)baseShadow);
-  // bool memIsNull = (mem_tag & CHECK_TAG_MASK) == 0;
-  bool memIsNull = (mem_tag) == 0;  // TODO: change back
-  // NOTE: do check on first byte, catch the smallest read possible
-
-  if (UNLIKELY(memIsNull)) {
-    return;
-  }  // memtag is 0
-  auto BaseTag = ptr_tag & CHECK_TAG_MASK;
-  // for each one of the N elements, extend BaseTag to size bytes because that
-  // is the size of each element of the vectorized operation and then match then
-  // 1 by 1 incrementing BaseTag according to the increment formula established
-  // in the tagging routine.
-  // VPrintf(2, "[CheckAddressVector] ptr=%p sz=%lu N=%lu\n", (void*)p, size,
-  // N);
-  // TODO
-}  // CheckAddressVector
+// PADDING BYTES carry this tag. It cannot clash with any tag because
+// PADDING_BYTE is 0xff and the maximum tag value is 0x3f (6 bits).
+#define PADDING_BYTE 0xff  // just for reference
 
 template <ErrorAction EA, AccessType AT>
 __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
                                                                       uptr sz) {
+  if (sz == 0)
+    return;
   unsigned char* untagged_ptr = (unsigned char*)(p & ~kAddressTagMask);
   tag_t ptr_tag = GetTagFromPointer(p);
   // when ptr tag is 0, we skip checks
@@ -229,7 +196,7 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
 
   uptr baseShadow = MemToShadow((uptr)untagged_ptr);
   uint8_t mem_tag = *((uint8_t*)baseShadow);
-  bool memIsNull = (mem_tag) == 0;  // TODO: change back
+  bool memIsNull = (mem_tag) == 0;
   // NOTE: do check on first byte, catch the smallest read possible
   if (UNLIKELY(memIsNull)) {
 #ifdef PERFORMANCE_DEBUGGING
@@ -241,63 +208,39 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
     }
 #endif
     // check that ALL the bytes in the access are zero. If not, raise error.
-    // TODO: vectorize in the future.
     for (unsigned int i = 0; i < sz; i++) {
       uint8_t ShadowTagByte = *(uint8_t*)(baseShadow + i);
       if (UNLIKELY(ShadowTagByte != 0)) {
         VPrintf(
-            0,
-            "[check-null] Tag mismatch detected at address %p: ptr "
-            "tag=%02x mem tag=%02x \n\t PL=%02x ML=%02x \n\t PT=%02x MT=%02x\n",
-            (void*)p, ptr_tag, ShadowTagByte, getL(ptr_tag),
-            getL(ShadowTagByte), getT(ptr_tag), getT(ShadowTagByte));
+            0, "[check-null] Tag mismatch detected at address %p: ptr "
+               "tag=%02x mem tag=%02x\n",
+            (void*)(p + i), ptr_tag, ShadowTagByte);
         SigTrap<EA, AT>(p, sz);
       }
     }
     return;
   }  // memtag is 0
 
-  bool RSet = getR(ptr_tag);
-  if (RSet) {
-    // TODO: CheckAddressSized with MSB set could be used for some type of error
+  if (getR(ptr_tag) != 0)
+    // NOTE: mem* intrinsics call over pointers with R set are no-ops in this
+    // design. This removes FPs, at the price of NOT catching some bugs over
+    // base pointers to structs.
     return;
-  }  // RSet
 
-  unsigned int size = (unsigned int)sz;
-  if (size == 0)
-    return;  // no access, so no check needed
+  // vectorize check as much as possible
+  unsigned int chunks8B = sz / 8;
+  unsigned int remainder = sz % 8;
 
-  unsigned int chunks8B = size / 8;
-  unsigned int remainder = size % 8;
-
-  uint8_t ptr_L = getL(ptr_tag);
-  uint8_t mem_L = getL(mem_tag);
   uint64_t extension_mask = 0x0101010101010101ULL;
-
   uint64_t ptr_T_8B = ptr_tag * (extension_mask);
-  uint64_t extendedMask = CHECK_TAG_MASK * extension_mask;
-  ptr_T_8B = ptr_T_8B & extendedMask;  // only get bits you want
-
   uint64_t mem_T_8B = -1LL;
 
   for (unsigned int i = 0; i < chunks8B; i++) {
-    mem_T_8B = (*(uint64_t*)(baseShadow + i * 8)) &
-               (CHECK_TAG_MASK * extension_mask);  // only get bits you want
+    mem_T_8B = (*(uint64_t*)(baseShadow + i * 8));
 
-    // TODO: detect padding since, in case of 8B access where tag is 0x7 on ptr
-    // and 0xff on memory, we have a FN
-    // NOTE: masking & checking for padding bytes are tricky to implement
-    // together. If masking out the bits telling that is a padding byte, you
-    // could have FPs when the tag has the T LSBs set
-
-    if (UNLIKELY((mem_T_8B != ptr_T_8B) ||
-                 (((*(uint8_t*)(baseShadow + i * 8 + 7))) == PADDING_BYTE))) {
-      // TODO: this can be made better. The disambiguation is a best effort.
-      VPrintf(
-          0,
-          "[CheckAddressSized-pre] Tag mismatch detected at address %p: ptr "
-          "tag=%016lx mem tag=%016lx\n",
-          (void*)(p + i * 8), ptr_T_8B, mem_T_8B);
+    if (UNLIKELY((mem_T_8B != ptr_T_8B))) {
+      VPrintf(0, "[CAS-8B] TAG MISMATCH at %p: ptr tag=%016lx mem tag=%016lx\n",
+              (void*)(p + i * 8), ptr_T_8B, mem_T_8B);
       SigTrap<EA, AT>(p, sz);
       if (EA == ErrorAction::Abort)
         __builtin_unreachable();
@@ -305,24 +248,19 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
   }  // for
 
   // BYTE-granular tail checks
-  uint64_t ptr_T_B = ptr_tag & CHECK_TAG_MASK;  // only get bits you want
+  uint64_t ptr_T_B = ptr_tag;
   uptr curShadow = baseShadow + chunks8B * 8;
   for (unsigned int i = 0; i < remainder; i++) {
-    tag_t mem_T_B = (*(tag_t*)(curShadow + i)) & CHECK_TAG_MASK;
-    // NOTE: memtag can become 0 at some point if a) going out of bounds on
-    // the current object b) flexible array member. We tolerate a), but have
-    // to be lenient on b)
-    if (UNLIKELY((mem_T_B != ptr_T_B) || mem_T_B == PADDING_BYTE)) {
-      VPrintf(0,
-              "[CheckAddressSized-tail] Tag mismatch detected at address %p: "
-              "ptr tag=%02lx "
-              "mem tag=%02lx, ptrL=%02x, memL=%02x\n",
-              (void*)(p + i), ptr_T_B, mem_T_B, ptr_L, mem_L);
+    tag_t mem_T_B = (*(tag_t*)(curShadow + i));
+    if (UNLIKELY((mem_T_B != ptr_T_B))) {
+      VPrintf(0, "[CAS-B] TAG MISMATCH at %p: ptr tag=%016lx mem tag=%016lx\n",
+              (void*)(p + i), ptr_T_B, mem_T_B);
       SigTrap<EA, AT>(p, sz);
       if (EA == ErrorAction::Abort)
         __builtin_unreachable();
     }
   }  // for
+
 #ifdef PERFORMANCE_DEBUGGING
   atomic_fetch_add(&total_checks, 1ULL, memory_order_relaxed);
   if (atomic_load(&total_checks, memory_order_relaxed) == 0) {
@@ -334,9 +272,6 @@ __attribute__((always_inline, nodebug)) static void CheckAddressSized(uptr p,
 
 template <ErrorAction EA, AccessType AT, unsigned LogSize>
 __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
-  // NOTE: levels are masked for now, but they could be removed to make this
-  // check even faster
-
   uint8_t tag = GetTagFromPointer(p);
   uptr untagged_ptr = UntagAddr(p);
   uptr shadow_addr = MemToShadow(untagged_ptr);
@@ -344,23 +279,6 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
 
   // DEBUG
   if (UNLIKELY(GetTagFromPointer(p) == 0)) {
-    // if(UNLIKELY(ShadowTag != 0 && getT(ShadowTag) != 1)) {
-    //   VPrintf(
-    //       0,
-    //       "[check-null] Tag mismatch detected at address %p: ptr "
-    //       "tag=%02x mem tag=%02x \n\t PL=%02x ML=%02x \n\t PT=%02x
-    //       MT=%02x\n", (void*)p, tag, ShadowTag, getL(tag), getL(ShadowTag),
-    //       getT(tag), getT(ShadowTag));
-    //   SigTrap<EA, AT, LogSize>(p);
-    // }
-    // VPrintf(2, "[CheckAddress] untagged ptr detected at address %p\n",
-    // (void*)p); atomic_fetch_add(&checks_on_untagged_ptr, 1ULL,
-    // memory_order_relaxed); if (atomic_load(&checks_on_untagged_ptr,
-    // memory_order_relaxed) == 0) {
-    //   // overflow detected
-    //   atomic_fetch_add(&overflows_on_untagged_ptr_checks, 1ULL,
-    //                    memory_order_relaxed);
-    // }
     return;
   }
 
@@ -375,147 +293,96 @@ __attribute__((always_inline, nodebug)) static void CheckAddress(uptr p) {
     //                    memory_order_relaxed);
     // }
     // check that ALL the bytes in the access are zero. If not, raise error.
+
     for (unsigned int i = 0; i < (1 << LogSize); i++) {
       uint8_t ShadowTagByte = *(uint8_t*)(shadow_addr + i);
       if (UNLIKELY(ShadowTagByte != 0)) {
-        VPrintf(
-            0,
-            "[check-null] Tag mismatch detected at address %p: ptr "
-            "tag=%02x mem tag=%02x \n\t PL=%02x ML=%02x \n\t PT=%02x MT=%02x\n",
-            (void*)p, tag, ShadowTagByte, getL(tag), getL(ShadowTagByte),
-            getT(tag), getT(ShadowTagByte));
+        VPrintf(0,
+                "[check-null] Tag mismatch detected at address %p: ptr "
+                "tag=%02x mem tag=%02x\n",
+                (void*)p, tag, ShadowTagByte);
         SigTrap<EA, AT, LogSize>(p);
       }
     }
     return;
   }
 
-  auto ptr_L = getL(tag);
-  auto mem_L = getL(ShadowTag);
+  uint8_t ShadowTagByte = *(uint8_t*)shadow_addr;
+  uint8_t PtrTagByte = tag;
 
-  uint8_t ShadowTagByte = 0;
-  uint8_t TagByte = tag;
-  uint8_t MaskTagByte = (uint8_t)CHECK_TAG_MASK;
-
-  uint16_t TagShort = 0;
+  uint16_t PtrTagShort = 0;
   uint16_t ShadowTagShort = 0;
-  uint16_t MaskTagShort = (uint16_t)CHECK_TAG_MASK * 0x0101U;
 
-  uint32_t TagInt = 0;
+  uint32_t PtrTagInt = 0;
   uint32_t ShadowTagInt = 0;
-  uint32_t MaskTagInt = (uint32_t)CHECK_TAG_MASK * 0x01010101U;
 
-  uint64_t TagLong = 0;
+  uint64_t PtrTagLong = 0;
   uint64_t ShadowTagLong = 0;
-  uint64_t MaskTagLong = (uint64_t)CHECK_TAG_MASK * 0x0101010101010101ULL;
-
   switch (LogSize) {
     case 0: /*byte*/
-      ShadowTagByte = *(uint8_t*)shadow_addr & MaskTagByte;
-      TagByte = TagByte & MaskTagByte;
-      if (UNLIKELY(/*TagByte && ShadowTagByte && */ TagByte != ShadowTagByte ||
-                   (/*TagByte && ShadowTagByte &&*/
-                    (*(uint8_t*)shadow_addr == PADDING_BYTE)))) {
-        VPrintf(
-            0,
-            "[check-byte] Tag mismatch detected at address %p: ptr "
-            "tag=%02x mem tag=%02x \n\t PL=%02x ML=%02x \n\t PT=%02x MT=%02x\n",
-            (void*)p, TagByte, ShadowTagByte, ptr_L, mem_L, getT(tag),
-            getT(ShadowTag));
+      ShadowTagByte = *(uint8_t*)shadow_addr;
+      PtrTagByte = tag;
+      if (UNLIKELY(PtrTagByte != ShadowTagByte)) {
+        VPrintf(0,
+                "[CHK-B] Tag mismatch detected at address %p: ptr tag=%02x mem "
+                "tag=%02x\n",
+                (void*)p, PtrTagByte, ShadowTagByte);
         SigTrap<EA, AT, LogSize>(p);
       }
       break;
     case 1: /*2 bytes*/
-      TagShort = (TagByte << 8) ^ TagByte;
-      TagShort = TagShort & MaskTagShort;
+      PtrTagShort = PtrTagByte * 0x0101U;
       ShadowTagShort = *(uint16_t*)shadow_addr;
-      ShadowTagShort = ShadowTagShort & MaskTagShort;
-      if (UNLIKELY(
-              /*TagShort && ShadowTagShort && */ (TagShort != ShadowTagShort) ||
-              (/*TagShort && ShadowTagShort &&*/
-               (((*(uint16_t*)shadow_addr >> 8)) == PADDING_BYTE)))) {
+      if (UNLIKELY((PtrTagShort != ShadowTagShort))) {
         VPrintf(0,
-                "[check-short] Tag mismatch detected at address %p: ptr "
-                "tag=%04x mem tag=%04x, PL=%02x ML=%02x\n\t PT=%02x MT=%02x\n",
-                (void*)p, TagShort, ShadowTagShort, ptr_L, mem_L, getT(tag),
-                getT(ShadowTag));
+                "[CHK-S] Tag mismatch detected at address %p: ptr tag=%04x mem "
+                "tag=%04x\n",
+                (void*)p, PtrTagShort, ShadowTagShort);
         SigTrap<EA, AT, LogSize>(p);
       }
       break;
 
     case 2: /*4 bytes*/
-      TagInt = (TagByte << 24) ^ (TagByte << 16) ^ (TagByte << 8) ^ TagByte;
-      TagInt = TagInt & MaskTagInt;
+      PtrTagInt = PtrTagByte * 0x01010101U;
       ShadowTagInt = *(uint32_t*)shadow_addr;
-      ShadowTagInt = ShadowTagInt & MaskTagInt;
-      if (UNLIKELY(/*TagInt && ShadowTagInt && */ (TagInt != ShadowTagInt) ||
-                   (/*TagInt && ShadowTagInt &&*/
-                    (((*(uint32_t*)shadow_addr >> 24)) == PADDING_BYTE)))) {
+      if (UNLIKELY(PtrTagInt != ShadowTagInt)) {
         VPrintf(0,
-                "[check-int] Tag mismatch detected at address %p: ptr "
-                "tag=%04lx mem tag=%04lx\n\t PL=%02x ML=%02x \n\t PT=%02x "
-                "MT=%02x\n",
-                (void*)p, TagInt, ShadowTagInt, ptr_L, mem_L, getT(tag),
-                getT(ShadowTag));
+                "[CHK-I] Tag mismatch detected at address %p: ptr tag=%08x mem "
+                "tag=%08x\n",
+                (void*)p, PtrTagInt, ShadowTagInt);
         SigTrap<EA, AT, LogSize>(p);
       }
 
       break;
     case 3: /*8 bytes*/
-      TagLong = ((uint64_t)TagByte << 56) ^ ((uint64_t)TagByte << 48) ^
-                ((uint64_t)TagByte << 40) ^ ((uint64_t)TagByte << 32) ^
-                ((uint64_t)TagByte << 24) ^ ((uint64_t)TagByte << 16) ^
-                ((uint64_t)TagByte << 8) ^ (uint64_t)TagByte;
-      TagLong = TagLong & MaskTagLong;
+      PtrTagLong = PtrTagByte * 0x0101010101010101ULL;
       ShadowTagLong = *(uint64_t*)shadow_addr;
-      ShadowTagLong = ShadowTagLong & MaskTagLong;
-      if (UNLIKELY(
-              /*TagLong && ShadowTagLong && */ (TagLong != ShadowTagLong) ||
-              (/*TagLong && ShadowTagLong &&*/
-               (((*(uint64_t*)shadow_addr >> 56)) == PADDING_BYTE)))) {
+      if (UNLIKELY(PtrTagLong != ShadowTagLong)) {
         VPrintf(0,
-                "[check-long] Tag mismatch detected at address %p: ptr "
-                "tag=%016lx mem tag=%016lx, \n\t PL=%02x ML=%02x\n\t PT=%02x "
-                "MT=%02x\n",
-                (void*)p, TagLong, ShadowTagLong, ptr_L, mem_L, getT(tag),
-                getT(ShadowTag));
+                "[CHK-L] Tag mismatch detected at address %p: ptr tag=%016lx "
+                "mem tag=%016lx\n",
+                (void*)p, PtrTagLong, ShadowTagLong);
         SigTrap<EA, AT, LogSize>(p);
       }
       break;
     case 4: /*16 bytes*/
-      TagLong = ((uint64_t)TagByte << 56) ^ ((uint64_t)TagByte << 48) ^
-                ((uint64_t)TagByte << 40) ^ ((uint64_t)TagByte << 32) ^
-                ((uint64_t)TagByte << 24) ^ ((uint64_t)TagByte << 16) ^
-                ((uint64_t)TagByte << 8) ^ (uint64_t)TagByte;
+      PtrTagLong = PtrTagByte * 0x0101010101010101ULL;
       ShadowTagLong = *(uint64_t*)shadow_addr;
-      TagLong = TagLong & MaskTagLong;
-      ShadowTagLong = ShadowTagLong & MaskTagLong;
-      if (UNLIKELY(
-              /*TagLong && ShadowTagLong && */ (TagLong != ShadowTagLong) ||
-              (/*TagLong && ShadowTagLong &&*/
-               (((*(uint64_t*)shadow_addr >> 56)) == PADDING_BYTE)))) {
+      if (UNLIKELY(PtrTagLong != ShadowTagLong)) {
         VPrintf(0,
-                "[check-16B] Tag mismatch detected at address %p: ptr "
-                "tag=%016lx mem tag=%016lx \n\t PL=%02x ML=%02x \n\t PT=%02x "
-                "MT=%02x\n",
-                (void*)(p), TagLong, ShadowTagLong, ptr_L, mem_L, getT(tag),
-                getT(ShadowTag));
+                "[CHK-16B] Tag mismatch detected at address %p: ptr tag=%016lx "
+                "mem tag=%016lx\n",
+                (void*)p, PtrTagLong, ShadowTagLong);
         SigTrap<EA, AT, LogSize>(p);
       }
 
       else {
         ShadowTagLong = *(uint64_t*)(shadow_addr + 8);
-        ShadowTagLong = ShadowTagLong & MaskTagLong;
-        if (UNLIKELY(
-                /*TagLong && ShadowTagLong &&*/ (TagLong != ShadowTagLong) ||
-                (/*TagLong && ShadowTagLong &&*/
-                 (((*(uint64_t*)(shadow_addr + 8) >> 56)) == PADDING_BYTE)))) {
+        if (UNLIKELY(PtrTagLong != ShadowTagLong)) {
           VPrintf(0,
-                  "[check-16B] Tag mismatch detected at address %p: ptr "
-                  "tag=%016lx mem tag=%016lx, PL=%02x ML=%02x\n\t PT=%02x "
-                  "MT=%02x\n",
-                  (void*)(p + 8), TagLong, ShadowTagLong, ptr_L, mem_L,
-                  getT(tag), getT(ShadowTag));
+                  "[CHK-16B] Tag mismatch detected at address %p: ptr "
+                  "tag=%016lx mem tag=%016lx\n",
+                  (void*)p, PtrTagLong, ShadowTagLong);
           SigTrap<EA, AT, LogSize>(p);
         }
       }

@@ -126,7 +126,7 @@ static cl::opt<bool> ClInstrumentAtomics(
 static cl::opt<bool> ClInstrumentByval("hwasan-instrument-byval",
                                        cl::desc("instrument byval arguments"),
                                        cl::Hidden,
-                                       cl::init(true)); // TODO: look into this
+                                       cl::init(false)); // TODO: look into this
 
 static cl::opt<bool> ClRecover(
     "hwasan-recover", cl::desc("Enable recovery mode (continue-after-error)."),
@@ -2497,13 +2497,14 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
         errs() << "[FSAN]  VECT: BaseElemTy: " << *BaseElemTy
                << ", BaseElemSize: " << BaseElemSize
                << ", NumElems: " << NumElems << "\n";
+        // TODO: remove/comment
         // call this function __hwasan_accessN_
-        FunctionCallee checkFunc = M.getOrInsertFunction(
-            "__hwasan_accessN_SLP",
-            FunctionType::get(IRB.getVoidTy(), {IntptrTy, Int64Ty, Int64Ty},
-                              false));
-        assert(checkFunc &&
-               "Failed to get or insert function __hwasan_accessN_");
+        // FunctionCallee checkFunc = M.getOrInsertFunction(
+        //     "__hwasan_accessN_SLP",
+        //     FunctionType::get(IRB.getVoidTy(), {IntptrTy, Int64Ty, Int64Ty},
+        //                       false));
+        // assert(checkFunc &&
+        //        "Failed to get or insert function __hwasan_accessN_");
         // IRB.CreateCall(checkFunc, {IRB.CreatePointerCast(Addr, IntptrTy),
         //                            ConstantInt::get(Int64Ty, BaseElemSize),
         //                            ConstantInt::get(Int64Ty, NumElems)});
@@ -2515,8 +2516,10 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
         IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
                        Args);
       } else {
-        instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, I, DTU, LI);
-        NumMemAccessesInlined++;
+        assert(false && "Inline instrumentation of memory accesses is not yet implemented.");
+        exit(1);
+        // instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, I, DTU, LI);
+        // NumMemAccessesInlined++;
       }
     } // NOT
 

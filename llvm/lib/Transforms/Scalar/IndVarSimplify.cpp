@@ -89,7 +89,7 @@ STATISTIC(NumLFTR        , "Number of loop exit tests replaced");
 STATISTIC(NumElimExt     , "Number of IV sign/zero extends eliminated");
 STATISTIC(NumElimIV      , "Number of congruent IVs eliminated");
 static cl::opt<bool> clFSAN_disableIndVarSimplify(
-    "fsan-disable-indvarsimplify", cl::init(false), cl::Hidden,
+    "fsan-disable-indvarsimplify", cl::init(true), cl::Hidden,
     cl::desc("Disable induction variable simplification for FSAN.")
 );
 

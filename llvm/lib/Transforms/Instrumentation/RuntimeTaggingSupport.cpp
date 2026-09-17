@@ -14,11 +14,6 @@ static cl::opt<std::string> clFSAN_BLOCKLIST_TAG_FILEPATH(
     cl::desc("Path to the blocklist tag file, which contains struct names to "
              "blocklist from tagging"),
     cl::Hidden, cl::init(""));
-static cl::opt<bool> clFSAN_SKIP_ANON_STRUCTS(
-    "fsan-skip-anon-structs",
-    cl::desc("Skip tagging anonymous structs and classes (i.e., those whose "
-             "name starts with struct.anon or class.anon)"),
-    cl::Hidden, cl::init(false));
 
 static cl::opt<bool> clFSAN_DEPTH_AWARE_TAGGING(
     "fsan-depth-aware-tagging",
@@ -54,7 +49,7 @@ __attribute__((noinline)) void createTagVector(Type *TY, Module &M, int depth) {
         !isLiteral && ST->getName().str().find("union.") != std::string::npos;
     auto isAnonStructOrClass = ST->getName().str().find("struct.anon") == 0 ||
                                ST->getName().str().find("class.anon") == 0;
-    bool SkipAnonStruct = isAnonStructOrClass && clFSAN_SKIP_ANON_STRUCTS;
+    bool SkipAnonStruct = isAnonStructOrClass;
     if (SkipAnonStruct)
       errs() << "[FSAN - TAG] Skipping anonymous struct " << *ST << "\n";
     auto demangledTypeName = demangle(ST->getStructName().str());
